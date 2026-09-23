@@ -2615,6 +2615,12 @@ async fn execute_subagent_tool(
                     None,
                     provider_override,
                     model_override,
+                    // No per-reply usage accounting on this path: the MCP
+                    // bridge does not carry the turn's accumulator (it does
+                    // not carry the run token budget either). Subagents
+                    // spawned from an ACP provider's tool call therefore do
+                    // not show up in that reply's token stats.
+                    None,
                 )
                 .map_err(|e| format!("subagent spawn failed: {e}"))?;
 

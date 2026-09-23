@@ -166,9 +166,47 @@ pub fn usage_from(chunk: &serde_json::Value) -> Option<LlmUsage> {
     })
 }
 
+/// Handle one parsed chunk of an OpenAI-compatible SSE stream.
+///
+/// The terminal chunk carries `usage` with an empty `choices` array, so the
+/// usage is collected *before* the delta lookup — otherwise a parser that
+/// bails out on a missing `choices[0]` throws the usage away with it.
+/// Returns the chunk's `delta` object when there is one.
+pub fn chunk_delta<'a>(
+    chunk: &'a serde_json::Value,
+    usage: &mut Option<LlmUsage>,
+) -> Option<&'a serde_json::Value> {
+    if let Some(u) = usage_from(chunk) {
+        *usage = Some(u);
+    }
+    let choice = chunk["choices"].get(0)?;
+    Some(&choice["delta"])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usage_only_chunk_captures_usage_and_yields_no_delta() {
+        let mut usage = None;
+        let chunk = serde_json::json!({
+            "choices": [],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15}
+        });
+        assert!(chunk_delta(&chunk, &mut usage).is_none());
+        let u = usage.expect("terminal usage chunk must be captured");
+        assert_eq!((u.prompt_tokens, u.completion_tokens), (12, 3));
+    }
+
+    #[test]
+    fn content_chunk_returns_delta_and_leaves_usage_untouched() {
+        let mut usage = None;
+        let chunk = serde_json::json!({"choices": [{"delta": {"content": "hi"}}]});
+        let delta = chunk_delta(&chunk, &mut usage).expect("content chunk has a delta");
+        assert_eq!(delta_events(delta), vec![DeltaEvent::Text("hi".into())]);
+        assert!(usage.is_none());
+    }
 
     #[test]
     fn lines_split_across_chunks_are_reassembled() {

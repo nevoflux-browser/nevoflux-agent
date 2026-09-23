@@ -1108,6 +1108,11 @@ pub(crate) fn build_deepseek_request_body(
         }
     }
 
+    if stream {
+        // Without this the stream reports no token usage at all.
+        body["stream_options"] = serde_json::json!({"include_usage": true});
+    }
+
     body
 }
 
@@ -2850,11 +2855,13 @@ async fn stream_qwen(
         }
     }
 
-    // Build request JSON with optional tools
+    // Build request JSON with optional tools. `include_usage` makes the
+    // terminal chunk carry token counts; without it Qwen reports nothing.
     let mut body = serde_json::json!({
         "model": model,
         "messages": qwen_messages,
         "stream": true,
+        "stream_options": {"include_usage": true},
     });
     if let Some(tools) = &request.tools {
         if !tools.is_empty() {
@@ -2906,6 +2913,8 @@ async fn stream_qwen(
     let mut line_buf = SseLineBuffer::default();
     // Accumulate streaming tool call deltas (arguments come in fragments).
     let mut accumulated_tool_calls = ToolCallAccumulator::default();
+    // Token usage, reported on the terminal chunk.
+    let mut final_usage: Option<LlmUsage> = None;
 
     while let Some(result) = byte_stream.next().await {
         match result {
@@ -2916,11 +2925,11 @@ async fn stream_qwen(
                         Err(_) => continue,
                     };
 
-                    let choice = match chunk["choices"].get(0) {
-                        Some(c) => c,
+                    let delta = match crate::wasm::openai_sse::chunk_delta(&chunk, &mut final_usage)
+                    {
+                        Some(d) => d,
                         None => continue,
                     };
-                    let delta = &choice["delta"];
 
                     for event in delta_events(delta) {
                         match event {
@@ -2975,10 +2984,10 @@ async fn stream_qwen(
             .await;
     }
 
-    // Send final done chunk
+    // Send final done chunk, carrying the terminal usage chunk's counts.
     let _ = tx
         .send(LlmStreamChunk {
-            usage: None,
+            usage: final_usage,
             text: None,
             tool_calls: vec![],
             done: true,
@@ -3047,6 +3056,8 @@ async fn stream_deepseek_raw(
 
     // Accumulate streaming tool call deltas (arguments come in fragments).
     let mut accumulated_tool_calls = ToolCallAccumulator::default();
+    // Token usage, reported on the terminal chunk.
+    let mut final_usage: Option<LlmUsage> = None;
 
     // SSE lines may be split across byte chunks — buffer until we see a newline.
     let mut byte_stream = response.bytes_stream();
@@ -3060,11 +3071,11 @@ async fn stream_deepseek_raw(
                         Ok(v) => v,
                         Err(_) => continue,
                     };
-                    let choice = match chunk["choices"].get(0) {
-                        Some(c) => c,
+                    let delta = match crate::wasm::openai_sse::chunk_delta(&chunk, &mut final_usage)
+                    {
+                        Some(d) => d,
                         None => continue,
                     };
-                    let delta = &choice["delta"];
 
                     for event in delta_events(delta) {
                         match event {
@@ -3122,7 +3133,7 @@ async fn stream_deepseek_raw(
 
     let _ = tx
         .send(LlmStreamChunk {
-            usage: None,
+            usage: final_usage,
             text: None,
             tool_calls: vec![],
             done: true,
@@ -3132,6 +3143,48 @@ async fn stream_deepseek_raw(
         .await;
 
     Ok(())
+}
+
+/// Collects token usage from an Anthropic event stream.
+///
+/// `message_start` carries the input count plus a placeholder output count;
+/// `message_delta` carries the final output count.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct AnthropicUsageAcc {
+    input: Option<u64>,
+    output: Option<u64>,
+}
+
+impl AnthropicUsageAcc {
+    /// Absorb one event, taking whichever fields it happens to carry.
+    fn apply(&mut self, event: &serde_json::Value) {
+        let Some(usage) = event
+            .pointer("/message/usage")
+            .or_else(|| event.get("usage"))
+        else {
+            return;
+        };
+        if let Some(v) = usage["input_tokens"].as_u64() {
+            self.input = Some(v);
+        }
+        if let Some(v) = usage["output_tokens"].as_u64() {
+            self.output = Some(v);
+        }
+    }
+
+    /// Only counts as usage when at least one field arrived.
+    fn into_usage(self) -> Option<LlmUsage> {
+        if self.input.is_none() && self.output.is_none() {
+            return None;
+        }
+        let prompt = self.input.unwrap_or(0) as u32;
+        let completion = self.output.unwrap_or(0) as u32;
+        Some(LlmUsage {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            total_tokens: prompt + completion,
+        })
+    }
 }
 
 /// Stream from MiMo's Anthropic-compat endpoint using raw HTTP + Anthropic
@@ -3210,6 +3263,8 @@ async fn stream_anthropic_raw(
         partial_input: String,
     }
     let mut tool_uses: HashMap<i64, ToolUseAccum> = HashMap::new();
+    // Token usage, spread across message_start and message_delta.
+    let mut usage_acc = AnthropicUsageAcc::default();
 
     let mut byte_stream = response.bytes_stream();
     let mut line_buf = String::new();
@@ -3238,6 +3293,7 @@ async fn stream_anthropic_raw(
                         Err(_) => continue,
                     };
                     let event_type = event["type"].as_str().unwrap_or("");
+                    usage_acc.apply(&event);
 
                     match event_type {
                         "content_block_start" => {
@@ -3358,7 +3414,7 @@ async fn stream_anthropic_raw(
 
     let _ = tx
         .send(LlmStreamChunk {
-            usage: None,
+            usage: usage_acc.into_usage(),
             text: None,
             tool_calls: vec![],
             done: true,
@@ -3635,6 +3691,9 @@ async fn stream_kimi_agent(
 
     // Receive wire events and emit stream chunks
     let mut tool_calls = Vec::new();
+    // kimi-agent reports running totals on StatusUpdate; the last one seen is
+    // this turn's usage.
+    let mut kimi_usage: Option<LlmUsage> = None;
     while let Some(event) = event_rx.recv().await {
         match event {
             WireEvent::ContentPart { text } => {
@@ -3660,6 +3719,16 @@ async fn stream_kimi_agent(
                     name,
                     arguments,
                     signature: None,
+                });
+            }
+            WireEvent::StatusUpdate {
+                input_tokens,
+                output_tokens,
+            } => {
+                kimi_usage = Some(LlmUsage {
+                    prompt_tokens: input_tokens as u32,
+                    completion_tokens: output_tokens as u32,
+                    total_tokens: (input_tokens + output_tokens) as u32,
                 });
             }
             WireEvent::TurnEnd => break,
@@ -3690,16 +3759,16 @@ async fn stream_kimi_agent(
                 break;
             }
             // Skip informational events: TurnBegin, StepBegin,
-            // StatusUpdate, ToolCall (built-in), ToolCallPart, ToolResult,
+            // ToolCall (built-in), ToolCallPart, ToolResult,
             // CompactionBegin/End, SubagentEvent, Unknown
             _ => {}
         }
     }
 
-    // Send final done chunk with any tool calls
+    // Send final done chunk with any tool calls and the reported usage
     let _ = tx
         .send(LlmStreamChunk {
-            usage: None,
+            usage: kimi_usage,
             text: None,
             tool_calls,
             done: true,
@@ -6168,6 +6237,51 @@ mod tests {
         crate::local::latch::set(true);
         let r = acp_oneshot(ProviderType::ClaudeCode, "m", "hi").await;
         assert!(matches!(r, Err(DaemonError::PermissionDenied(_))));
+    }
+
+    #[test]
+    fn anthropic_usage_reads_message_start_then_message_delta() {
+        let mut acc = AnthropicUsageAcc::default();
+        acc.apply(&serde_json::json!({
+            "type": "message_start",
+            "message": {"usage": {"input_tokens": 2456, "output_tokens": 1}}
+        }));
+        acc.apply(&serde_json::json!({
+            "type": "message_delta",
+            "usage": {"output_tokens": 312}
+        }));
+        let u = acc.into_usage().expect("usage present");
+        assert_eq!((u.prompt_tokens, u.completion_tokens), (2456, 312));
+    }
+
+    #[test]
+    fn anthropic_usage_is_absent_when_no_event_carried_it() {
+        let mut acc = AnthropicUsageAcc::default();
+        acc.apply(&serde_json::json!({"type": "content_block_delta"}));
+        assert!(acc.into_usage().is_none());
+    }
+
+    #[test]
+    fn deepseek_streaming_body_requests_usage() {
+        let request = LlmChatRequest {
+            messages: vec![LlmMessage::user("hi")],
+            ..Default::default()
+        };
+        let body = build_deepseek_request_body("deepseek-chat", &request, true);
+        assert_eq!(
+            body["stream_options"],
+            serde_json::json!({"include_usage": true})
+        );
+    }
+
+    #[test]
+    fn deepseek_non_streaming_body_has_no_stream_options() {
+        let request = LlmChatRequest {
+            messages: vec![LlmMessage::user("hi")],
+            ..Default::default()
+        };
+        let body = build_deepseek_request_body("deepseek-chat", &request, false);
+        assert!(body.get("stream_options").is_none());
     }
 
     #[test]

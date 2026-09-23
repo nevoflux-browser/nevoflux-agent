@@ -519,6 +519,64 @@ pub struct StreamMetadata {
     pub model: Option<String>,
 }
 
+/// Skip `false` when serializing so wire frames only carry meaningful flags.
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// Token accounting for one party (main agent or subagents) within a single
+/// assistant reply.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct UsageBucket {
+    /// Input tokens summed over this party's LLM calls.
+    pub input: u64,
+    /// Output tokens summed over this party's LLM calls.
+    pub output: u64,
+    /// Number of LLM calls, streaming and non-streaming alike.
+    pub calls: u32,
+    /// True when at least one call's numbers came from estimation.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub estimated: bool,
+}
+
+/// Token usage snapshot for one assistant reply.
+///
+/// Carries raw facts only — tok/s is derived by the sidebar as
+/// `main.output / decode_ms` — so changing how stats are displayed never
+/// requires migrating persisted records.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct TurnUsage {
+    /// The main agent's accounting.
+    pub main: UsageBucket,
+    /// Subagent accounting, absent when no subagent ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent: Option<UsageBucket>,
+    /// Input of the main agent's last call, i.e. the current context size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_input: Option<u64>,
+    /// Generation time summed over the main agent's streaming calls, in ms.
+    /// `None` means no usable generation window, and the sidebar then hides
+    /// tok/s rather than dividing by tool-execution time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_ms: Option<u64>,
+    /// Request-to-first-chunk latency of the main agent's first streaming
+    /// call, in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_token_ms: Option<u64>,
+    /// Wall-clock duration of the reply in milliseconds, tool time included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_ms: Option<u64>,
+    /// Model used by the main agent's last call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The provider runs its own agent loop (ClaudeCode, GeminiCli, OpenClaw,
+    /// Antigravity, KimiAgent). One "stream" from those wraps their internal
+    /// tool execution, so generation time cannot be isolated and the sidebar
+    /// hides tok/s.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub external_agent: bool,
+}
+
 /// Account information
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountInfo {
@@ -1153,5 +1211,75 @@ mod tool_result_tests {
         ] {
             assert_eq!(serde_json::to_string(&action).unwrap(), format!("\"{expected}\""));
         }
+    }
+}
+
+#[cfg(test)]
+mod turn_usage_tests {
+    use super::*;
+
+    #[test]
+    fn absent_optional_fields_are_omitted_from_json() {
+        let usage = TurnUsage {
+            main: UsageBucket {
+                input: 10,
+                output: 5,
+                calls: 1,
+                estimated: false,
+            },
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&usage).unwrap();
+        assert_eq!(v["main"]["input"], 10);
+        assert_eq!(v["main"]["calls"], 1);
+        assert!(v.get("subagent").is_none(), "subagent must be omitted: {v}");
+        assert!(
+            v.get("decode_ms").is_none(),
+            "decode_ms must be omitted: {v}"
+        );
+        assert!(
+            v.get("external_agent").is_none(),
+            "false flag must be omitted: {v}"
+        );
+        assert!(
+            v["main"].get("estimated").is_none(),
+            "false flag must be omitted: {v}"
+        );
+    }
+
+    #[test]
+    fn full_payload_round_trips() {
+        let usage = TurnUsage {
+            main: UsageBucket {
+                input: 8329,
+                output: 646,
+                calls: 5,
+                estimated: false,
+            },
+            subagent: Some(UsageBucket {
+                input: 4102,
+                output: 210,
+                calls: 3,
+                estimated: true,
+            }),
+            last_input: Some(3204),
+            decode_ms: Some(15300),
+            first_token_ms: Some(1200),
+            total_ms: Some(28400),
+            model: Some("claude-sonnet-5".into()),
+            external_agent: false,
+        };
+        let json = serde_json::to_string(&usage).unwrap();
+        assert_eq!(serde_json::from_str::<TurnUsage>(&json).unwrap(), usage);
+    }
+
+    #[test]
+    fn missing_fields_deserialize_to_defaults() {
+        let usage: TurnUsage =
+            serde_json::from_str(r#"{"main":{"input":1,"output":2,"calls":1}}"#).unwrap();
+        assert_eq!(usage.main.input, 1);
+        assert!(usage.subagent.is_none());
+        assert!(!usage.external_agent);
+        assert!(!usage.main.estimated);
     }
 }

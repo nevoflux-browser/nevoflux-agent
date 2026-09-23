@@ -334,6 +334,7 @@ impl SubagentExecutor {
         tools_config: Option<nevoflux_protocol::subagent::ToolsConfig>,
         provider_override: Option<String>,
         model_override: Option<String>,
+        turn_stats: Option<std::sync::Arc<crate::turn_stats::TurnStats>>,
     ) -> Result<SubagentHandle, String> {
         // Prune completed handles when the map grows too large to prevent
         // unbounded memory growth. We keep a generous threshold so callers
@@ -401,6 +402,7 @@ impl SubagentExecutor {
                 Duration::from_secs(timeout_secs),
                 executor_handle.clone(),
                 sidebar_tx,
+                turn_stats,
             )
             .await;
 
@@ -445,6 +447,7 @@ impl SubagentExecutor {
         sidebar_stream_tx: Option<
             tokio::sync::mpsc::UnboundedSender<crate::agent_host::SidebarStreamChunk>,
         >,
+        turn_stats: Option<std::sync::Arc<crate::turn_stats::TurnStats>>,
     ) -> Result<AgentOutput, String> {
         let execution = Self::run_subagent_inner(
             id,
@@ -459,6 +462,7 @@ impl SubagentExecutor {
             config,
             handle.clone(),
             sidebar_stream_tx,
+            turn_stats,
         );
 
         match timeout(timeout_duration, execution).await {
@@ -488,6 +492,7 @@ impl SubagentExecutor {
         sidebar_stream_tx: Option<
             tokio::sync::mpsc::UnboundedSender<crate::agent_host::SidebarStreamChunk>,
         >,
+        turn_stats: Option<std::sync::Arc<crate::turn_stats::TurnStats>>,
     ) -> Result<AgentOutput, String> {
         use crate::agent_host::DaemonHostFunctions;
         use nevoflux_builtin_wasm::{Agent, AgentConfig as WasmAgentConfig};
@@ -509,6 +514,12 @@ impl SubagentExecutor {
         // Pipe subagent stream to parent's sidebar
         if let Some(tx) = sidebar_stream_tx {
             host = host.with_sidebar_stream(tx);
+        }
+
+        // Same reply, same accounting: what a subagent spends is part of what
+        // the reply the user is looking at cost.
+        if let Some(stats) = turn_stats {
+            host = host.with_turn_stats(stats);
         }
 
         // Apply provider/model override if specified (filtered through the
@@ -861,5 +872,35 @@ mod tests {
         let cloned = handle.clone();
 
         assert_eq!(handle.spawn_time, cloned.spawn_time);
+    }
+}
+
+#[cfg(test)]
+mod turn_stats_propagation_tests {
+    /// The accumulator is shared, so what a subagent records shows up in the
+    /// parent's snapshot — in the subagent bucket, and without polluting the
+    /// decode window that tok/s divides by.
+    #[test]
+    fn subagent_usage_lands_in_the_parent_turn_bucket() {
+        let stats = crate::turn_stats::TurnStats::new();
+        let passed_to_subagent = stats.clone();
+        passed_to_subagent.record(crate::turn_stats::CallStats {
+            is_subagent: true,
+            external_agent: false,
+            reported_input: Some(40),
+            reported_output: Some(9),
+            estimated_input: 0,
+            estimated_output: 0,
+            decode_ms: Some(700),
+            first_token_ms: Some(100),
+            model: "sub-model".into(),
+        });
+        let snapshot = stats.snapshot().expect("subagent call recorded");
+        let sub = snapshot.subagent.expect("subagent bucket present");
+        assert_eq!((sub.input, sub.output, sub.calls), (40, 9, 1));
+        assert!(
+            snapshot.decode_ms.is_none(),
+            "a subagent's generation time must not become the tok/s denominator"
+        );
     }
 }
