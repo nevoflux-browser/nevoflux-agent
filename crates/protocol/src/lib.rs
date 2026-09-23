@@ -101,7 +101,7 @@ pub use common::{
     PermissionScope, PickFilesError, PickFilesRequest, PickFilesResponse, PickerMode, PlanInfo,
     PlanType, PluginAction, QuotaInfo, ReadResult, Requester, RequesterType, ResourceAction,
     ResourceType, StepInfo, StreamFormat, StreamMetadata, SystemError, ToolInfo, ToolStatus,
-    UsageQuota,
+    TurnUsage, UsageBucket, UsageQuota,
 };
 
 /// Protocol version
