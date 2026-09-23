@@ -157,6 +157,98 @@ struct StreamBudgetData {
     usage_total_tokens: Option<u64>,
 }
 
+/// Per-stream usage accounting for the sidebar's per-reply stats.
+///
+/// Created in `llm_stream_start` only when the host carries a
+/// [`crate::turn_stats::TurnStats`]; updated as chunks pass through
+/// `llm_stream_next`; settled exactly once — on the `done` chunk, or in
+/// `llm_stream_close` for streams that never delivered one. Settling removes
+/// the entry, so whichever runs first wins and the other is a no-op.
+struct StreamStatsData {
+    /// When the request was dispatched, for first-token latency.
+    requested_at: std::time::Instant,
+    /// When the first chunk carrying content arrived.
+    first_chunk_at: Option<std::time::Instant>,
+    /// When the last chunk carrying content arrived.
+    last_chunk_at: Option<std::time::Instant>,
+    /// Estimated prompt size, including system prompt and tool schemas.
+    estimated_input: u64,
+    /// Everything streamed back: text, reasoning and tool-call arguments.
+    /// Only used to estimate output when the provider reports none.
+    output_chars: String,
+    /// Usage reported by the provider, when it reported any.
+    reported: Option<crate::wasm::llm::LlmUsage>,
+    /// Provider that served the stream.
+    provider: String,
+    /// Model that served the stream.
+    model: String,
+}
+
+/// Whether a provider runs its own agent loop.
+///
+/// One "stream" from these wraps the agent's own tool execution, so a decode
+/// window measured across it would silently include tool time. The sidebar
+/// hides tok/s for them. Parsed through `FromStr` rather than compared as
+/// literals so aliases like `claude_code` are covered automatically.
+fn is_external_agent_provider(provider: &str) -> bool {
+    use nevoflux_llm::factory::ProviderType;
+    matches!(
+        provider.parse::<ProviderType>(),
+        Ok(ProviderType::ClaudeCode
+            | ProviderType::GeminiCli
+            | ProviderType::OpenClaw
+            | ProviderType::Antigravity
+            | ProviderType::KimiAgent)
+    )
+}
+
+/// Build the estimate source for a guest request: every message body (the
+/// system prompt is one of them), the reasoning and tool-call arguments echoed
+/// back, and the tool schemas.
+///
+/// The tool schemas matter — they are a large share of the prompt, and the
+/// budget module's estimate (which counts message content only) undercounts
+/// badly without them.
+fn estimate_request_input(request: &nevoflux_builtin_wasm::LlmRequest) -> u64 {
+    let mut source = String::new();
+    for message in &request.messages {
+        source.push_str(&message.content);
+        if let Some(reasoning) = &message.reasoning {
+            source.push_str(reasoning);
+        }
+        for tc in &message.tool_calls {
+            source.push_str(&tc.arguments.to_string());
+        }
+    }
+    source.push_str(&serde_json::to_string(&request.tools).unwrap_or_default());
+    crate::turn_stats::estimate_tokens(&source)
+}
+
+/// Settle a finished stream into one call record.
+fn stream_stats_to_call(
+    data: StreamStatsData,
+    is_subagent: bool,
+) -> crate::turn_stats::CallStats {
+    let decode_ms = match (data.first_chunk_at, data.last_chunk_at) {
+        (Some(first), Some(last)) => Some(last.saturating_duration_since(first).as_millis() as u64),
+        _ => None,
+    };
+    let first_token_ms = data
+        .first_chunk_at
+        .map(|first| first.saturating_duration_since(data.requested_at).as_millis() as u64);
+    crate::turn_stats::CallStats {
+        is_subagent,
+        external_agent: is_external_agent_provider(&data.provider),
+        reported_input: data.reported.as_ref().map(|u| u.prompt_tokens as u64),
+        reported_output: data.reported.as_ref().map(|u| u.completion_tokens as u64),
+        estimated_input: data.estimated_input,
+        estimated_output: crate::turn_stats::estimate_tokens(&data.output_chars),
+        decode_ms,
+        first_token_ms,
+        model: data.model,
+    }
+}
+
 /// Approximate token count from character counts, used only when the provider
 /// reported no usage for a call. Heuristic: ~4 chars per token, which is the
 /// common rule of thumb for English text; CJK-heavy content will be
@@ -286,6 +378,13 @@ pub struct DaemonHostFunctions {
     /// `None` for interactive hosts — zero behavior change when unset. See
     /// [`crate::agent_exec::TokenBudget`].
     token_budget: Option<Arc<crate::agent_exec::TokenBudget>>,
+    /// Per-reply token accounting, shared with subagents and proxy hosts so
+    /// one reply reports one set of numbers. `None` for hosts whose caller
+    /// does not display usage (zero behavior change when unset).
+    turn_stats: Option<Arc<crate::turn_stats::TurnStats>>,
+    /// Usage accounting for in-flight streams, keyed by stream_id.
+    /// Only populated when [`Self::turn_stats`] is `Some`.
+    stream_stats_data: Arc<Mutex<HashMap<u64, StreamStatsData>>>,
     // Note: always_allowed_tools is on HostServices (shared across requests),
     // not here (per-request DaemonHostFunctions).
 }
@@ -332,6 +431,8 @@ impl DaemonHostFunctions {
             last_response_at: Mutex::new(None),
             canvas_video_service: None,
             token_budget: None,
+            turn_stats: None,
+            stream_stats_data: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -457,6 +558,21 @@ impl DaemonHostFunctions {
     pub fn with_token_budget(mut self, budget: Arc<crate::agent_exec::TokenBudget>) -> Self {
         self.token_budget = Some(budget);
         self
+    }
+
+    /// Wire the per-reply [`crate::turn_stats::TurnStats`] accumulator.
+    ///
+    /// Every LLM call this host makes is recorded there, and subagents spawned
+    /// from it inherit the same accumulator, so the sidebar can show what one
+    /// reply cost. Leave unset for hosts nobody reads stats from.
+    pub fn with_turn_stats(mut self, stats: Arc<crate::turn_stats::TurnStats>) -> Self {
+        self.turn_stats = Some(stats);
+        self
+    }
+
+    /// The per-reply accumulator, for passing down to spawned subagents.
+    pub(crate) fn turn_stats(&self) -> Option<Arc<crate::turn_stats::TurnStats>> {
+        self.turn_stats.clone()
     }
 
     /// Set provider/model override for this host instance.
@@ -2346,6 +2462,31 @@ impl HostFunctions for DaemonHostFunctions {
                     }
                 }
 
+                // Per-reply usage accounting. A non-streaming call has no
+                // decode window, so it contributes tokens but never tok/s.
+                if let Some(stats) = &self.turn_stats {
+                    let mut output_chars = response.content.clone();
+                    if let Some(tool_calls) = &response.tool_calls {
+                        for tc in tool_calls {
+                            output_chars.push_str(&tc.arguments.to_string());
+                        }
+                    }
+                    stats.record(crate::turn_stats::CallStats {
+                        is_subagent: self.is_subagent,
+                        external_agent: is_external_agent_provider(&provider_name),
+                        reported_input: response.usage.as_ref().map(|u| u.prompt_tokens as u64),
+                        reported_output: response
+                            .usage
+                            .as_ref()
+                            .map(|u| u.completion_tokens as u64),
+                        estimated_input: estimate_request_input(&request),
+                        estimated_output: crate::turn_stats::estimate_tokens(&output_chars),
+                        decode_ms: None,
+                        first_token_ms: None,
+                        model: model.clone(),
+                    });
+                }
+
                 // Session event log: one assistant/message per successful
                 // response, with the provider's own usage numbers when it
                 // reported them (design spec §3.2).
@@ -2763,6 +2904,24 @@ impl HostFunctions for DaemonHostFunctions {
             );
         }
 
+        // Open per-reply usage accounting for this stream. Settles on the
+        // terminal chunk, or in `llm_stream_close` if one never arrives.
+        if self.turn_stats.is_some() {
+            self.stream_stats_data.lock().unwrap().insert(
+                stream_id,
+                StreamStatsData {
+                    requested_at: std::time::Instant::now(),
+                    first_chunk_at: None,
+                    last_chunk_at: None,
+                    estimated_input: estimate_request_input(&request),
+                    output_chars: String::new(),
+                    reported: None,
+                    provider: provider_name.clone(),
+                    model: model.clone(),
+                },
+            );
+        }
+
         debug!("llm_stream_start: stream_id={}", stream_id);
         Ok(stream_id)
     }
@@ -2825,6 +2984,45 @@ impl HostFunctions for DaemonHostFunctions {
                     }
                     if let Some(data) = settle {
                         self.settle_stream_budget(stream_id, data);
+                    }
+                }
+
+                // Per-reply usage accounting: track the decode window and
+                // accumulate what streamed back, in case the provider reports
+                // no usage and the numbers have to be estimated.
+                if self.turn_stats.is_some() {
+                    let mut settle: Option<StreamStatsData> = None;
+                    if let Ok(mut map) = self.stream_stats_data.lock() {
+                        if let Some(data) = map.get_mut(&stream_id) {
+                            let has_content = chunk.text.is_some()
+                                || chunk.reasoning.is_some()
+                                || !chunk.tool_calls.is_empty();
+                            if has_content {
+                                let now = std::time::Instant::now();
+                                if data.first_chunk_at.is_none() {
+                                    data.first_chunk_at = Some(now);
+                                }
+                                data.last_chunk_at = Some(now);
+                            }
+                            if let Some(ref text) = chunk.text {
+                                data.output_chars.push_str(text);
+                            }
+                            if let Some(ref reasoning) = chunk.reasoning {
+                                data.output_chars.push_str(reasoning);
+                            }
+                            for tc in &chunk.tool_calls {
+                                data.output_chars.push_str(&tc.arguments.to_string());
+                            }
+                            if let Some(ref usage) = chunk.usage {
+                                data.reported = Some(usage.clone());
+                            }
+                        }
+                        if chunk.done {
+                            settle = map.remove(&stream_id);
+                        }
+                    }
+                    if let (Some(data), Some(stats)) = (settle, &self.turn_stats) {
+                        stats.record(stream_stats_to_call(data, self.is_subagent));
                     }
                 }
 
@@ -2907,6 +3105,15 @@ impl HostFunctions for DaemonHostFunctions {
             let leftover = self.stream_budget_data.lock().unwrap().remove(&stream_id);
             if let Some(data) = leftover {
                 self.settle_stream_budget(stream_id, data);
+            }
+        }
+
+        // Same for per-reply usage: a stream that ended without a `done` chunk
+        // (interrupt/abort) still settles exactly once, here.
+        if self.turn_stats.is_some() {
+            let leftover = self.stream_stats_data.lock().unwrap().remove(&stream_id);
+            if let (Some(data), Some(stats)) = (leftover, &self.turn_stats) {
+                stats.record(stream_stats_to_call(data, self.is_subagent));
             }
         }
 
@@ -7563,6 +7770,10 @@ impl DaemonHostFunctions {
             // dispatches must accrue against (and be gated by) the parent's
             // budget, not run unmetered.
             token_budget: self.token_budget.clone(),
+            // Same reply, same stats: a nested dispatch's LLM calls belong to
+            // the reply the user is looking at.
+            turn_stats: self.turn_stats.clone(),
+            stream_stats_data: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -8598,6 +8809,79 @@ mod tests {
     // prompt -- spec 4.3.2 lists deactivation as one of the three ways a
     // replacement ends.
     // ------------------------------------------------------------------
+
+    #[test]
+    fn acp_and_kimi_providers_are_external_agents() {
+        for p in [
+            "claude-code",
+            "claude_code",
+            "gemini-cli",
+            "openclaw",
+            "antigravity",
+            "kimi-agent",
+            "kimi",
+        ] {
+            assert!(super::is_external_agent_provider(p), "{p} should be external");
+        }
+    }
+
+    #[test]
+    fn api_providers_are_not_external_agents() {
+        for p in ["anthropic", "openai", "deepseek", "qwen", "local", "not-a-provider"] {
+            assert!(
+                !super::is_external_agent_provider(p),
+                "{p} should not be external"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_stats_prefer_reported_usage_and_measure_the_decode_window() {
+        let start = std::time::Instant::now();
+        let data = super::StreamStatsData {
+            requested_at: start,
+            first_chunk_at: Some(start + std::time::Duration::from_millis(200)),
+            last_chunk_at: Some(start + std::time::Duration::from_millis(1200)),
+            estimated_input: 500,
+            output_chars: "hello".to_string(),
+            reported: Some(crate::wasm::llm::LlmUsage {
+                prompt_tokens: 480,
+                completion_tokens: 12,
+                total_tokens: 492,
+            }),
+            provider: "anthropic".into(),
+            model: "claude-sonnet-5".into(),
+        };
+        let call = super::stream_stats_to_call(data, false);
+        assert_eq!(call.reported_input, Some(480));
+        assert_eq!(call.reported_output, Some(12));
+        assert_eq!(call.estimated_input, 500);
+        assert_eq!(call.decode_ms, Some(1000));
+        assert_eq!(call.first_token_ms, Some(200));
+        assert!(!call.external_agent);
+        assert!(!call.is_subagent);
+    }
+
+    #[test]
+    fn stream_stats_without_content_chunks_have_no_decode_window() {
+        let start = std::time::Instant::now();
+        let data = super::StreamStatsData {
+            requested_at: start,
+            first_chunk_at: None,
+            last_chunk_at: None,
+            estimated_input: 10,
+            output_chars: String::new(),
+            reported: None,
+            provider: "claude-code".into(),
+            model: "sonnet".into(),
+        };
+        let call = super::stream_stats_to_call(data, true);
+        assert!(call.decode_ms.is_none());
+        assert!(call.first_token_ms.is_none());
+        assert!(call.external_agent, "claude-code runs its own agent loop");
+        assert!(call.is_subagent);
+        assert_eq!(call.estimated_output, 0);
+    }
 
     fn host_with_prompt_held_by(pack: &str) -> super::DaemonHostFunctions {
         let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
