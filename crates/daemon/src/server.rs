@@ -5837,6 +5837,35 @@ pub const CONTAINER_METADATA_KEY: &str = "container";
 ///
 /// The persona key is omitted when no soul is active, so messages from an unbound
 /// chat look exactly like every message written before souls existed.
+/// Attach a reply's usage snapshot to a `stream_chunk` frame.
+///
+/// Only called on the final frame. Without a snapshot (no LLM call ran, or
+/// the reply was cancelled) the field is left off entirely and the sidebar
+/// shows no stats rather than zeros.
+fn attach_usage(payload: &mut serde_json::Value, usage: Option<&nevoflux_protocol::TurnUsage>) {
+    let Some(usage) = usage else { return };
+    let Some(p) = payload.get_mut("payload") else {
+        return;
+    };
+    p["usage"] = serde_json::to_value(usage).unwrap_or_default();
+}
+
+/// Metadata seed carrying the reply's usage snapshot, for persistence.
+///
+/// Feeds [`stamp_message_metadata`] so the stored message carries exactly the
+/// snapshot the live frame carried — one set of numbers, one code path.
+fn usage_metadata(
+    stats: &crate::turn_stats::TurnStats,
+) -> Option<std::collections::HashMap<String, serde_json::Value>> {
+    let usage = stats.snapshot()?;
+    let mut map = std::collections::HashMap::new();
+    map.insert(
+        "usage".to_string(),
+        serde_json::to_value(usage).unwrap_or_default(),
+    );
+    Some(map)
+}
+
 fn stamp_message_metadata(
     existing: Option<std::collections::HashMap<String, serde_json::Value>>,
     container: &str,
@@ -6715,10 +6744,15 @@ async fn handle_chat_message_streaming(
     // so activating a pack mid-chat is visible to the re-run.
     let session_services = services_with_context.clone();
 
+    // Per-reply token accounting. Shared with subagents and read twice: once
+    // when the done frame goes out, once when the reply is stored.
+    let turn_stats = crate::turn_stats::TurnStats::new();
+
     let mut host = DaemonHostFunctions::new(config.clone(), runtime.clone())
         .with_active_soul(active_soul.clone())
         .with_active_container(&container)
         .with_services(services_with_context)
+        .with_turn_stats(turn_stats.clone())
         .with_sidebar_stream(stream_tx)
         .with_session_id(session_id.clone())
         .with_trace_collector(trace_collector.clone())
@@ -6893,6 +6927,8 @@ async fn handle_chat_message_streaming(
     let stream_session_id = session_id.clone();
     let stream_title = generated_title.clone();
     let forwarder_cancellation = cancellation_token.clone();
+    // The forwarder reads the reply's usage when it sends the final frame.
+    let stream_turn_stats = turn_stats.clone();
 
     // 语音旁路:开了语音的 session,把流出的回答逐句合成。**只发不等**,而且
     // 发失败也只是没有声音 —— 这条路径绝不能影响文字回答的转发,那是产品里最
@@ -7048,6 +7084,9 @@ async fn handle_chat_message_streaming(
                         chunk_payload["payload"]["session_title"] =
                             serde_json::Value::String(title.clone());
                     }
+                }
+                if $done {
+                    attach_usage(&mut chunk_payload, stream_turn_stats.snapshot().as_ref());
                 }
                 let response = DaemonEnvelope::new(&stream_proxy_id, stream_channel, chunk_payload)
                     .with_request_id(&stream_request_id);
@@ -7394,8 +7433,12 @@ async fn handle_chat_message_streaming(
                         let rerun_services = session_services
                             .clone()
                             .with_client_context(identity.clone(), proxy_id.clone());
+                        // A regenerated reply gets its own accounting: the
+                        // stats describe this run, not the discarded one.
+                        let rerun_turn_stats = crate::turn_stats::TurnStats::new();
                         let rerun_host = DaemonHostFunctions::new(config.clone(), runtime.clone())
                             .with_services(rerun_services)
+                            .with_turn_stats(rerun_turn_stats.clone())
                             .with_sidebar_stream(rerun_stream_tx)
                             .with_session_id(session_id.clone())
                             .with_trace_collector(trace_collector.clone())
@@ -7460,6 +7503,7 @@ async fn handle_chat_message_streaming(
 
                         // Remote gateways scope by session; this task needs its own clone.
                         let rerun_session_id = session_id.clone();
+                        let rerun_stream_stats = rerun_turn_stats.clone();
                         let rerun_forwarder = tokio::spawn(async move {
                             let mut rerun_accumulated = String::new();
                             let mut buffer = String::new();
@@ -7552,6 +7596,12 @@ async fn handle_chat_message_streaming(
                                                                 serde_json::to_value(thinking).unwrap_or_default();
                                                         }
                                                     }
+                                                    if chunk.done {
+                                                        attach_usage(
+                                                            &mut chunk_payload,
+                                                            rerun_stream_stats.snapshot().as_ref(),
+                                                        );
+                                                    }
                                                     let response = DaemonEnvelope::new(
                                                         &rerun_proxy_id,
                                                         rerun_channel,
@@ -7572,7 +7622,7 @@ async fn handle_chat_message_streaming(
                                                     buffer.push_str(&chunk.text);
                                                     let final_text = std::mem::take(&mut buffer);
                                                     rerun_accumulated.push_str(&final_text);
-                                                    let chunk_payload = serde_json::json!({
+                                                    let mut chunk_payload = serde_json::json!({
                                                         "type": "stream_chunk",
                                                         "payload": {
                                                             "session_id": rerun_session_id.as_str(),
@@ -7580,6 +7630,10 @@ async fn handle_chat_message_streaming(
                                                             "done": true
                                                         }
                                                     });
+                                                    attach_usage(
+                                                        &mut chunk_payload,
+                                                        rerun_stream_stats.snapshot().as_ref(),
+                                                    );
                                                     let response = DaemonEnvelope::new(
                                                         &rerun_proxy_id,
                                                         rerun_channel,
@@ -7654,10 +7708,11 @@ async fn handle_chat_message_streaming(
 
                                 if !final_text.is_empty() {
                                     if let Err(e) = session_manager
-                                        .add_message(
+                                        .add_message_with_metadata(
                                             &session_id,
                                             MessageRole::Assistant,
                                             &final_text,
+                                            usage_metadata(&rerun_turn_stats),
                                         )
                                         .await
                                     {
@@ -7848,7 +7903,11 @@ async fn handle_chat_message_streaming(
                         &session_id,
                         MessageRole::Assistant,
                         &final_text,
-                        stamp_message_metadata(None, &container, active_soul.as_deref()),
+                        stamp_message_metadata(
+                            usage_metadata(&turn_stats),
+                            &container,
+                            active_soul.as_deref(),
+                        ),
                     )
                     .await
                 {
@@ -8584,9 +8643,14 @@ async fn handle_chat_message(
             // streaming handler above -- this is the other way a conversation
             // starts, and sharing the template's would leak both across every
             // chat in the process.
+            // Per-reply token accounting; this path has no stream, so the
+            // snapshot is only read when the reply is stored.
+            let turn_stats = crate::turn_stats::TurnStats::new();
+
             let mut host = DaemonHostFunctions::new(config.clone(), runtime)
                 .with_active_soul(active_soul.clone())
                 .with_active_container(&container)
+                .with_turn_stats(turn_stats.clone())
                 .with_services(services.clone().with_own_session_state())
                 .with_session_id(session_id.clone())
                 .with_canvas_video_service(canvas_video_service.clone());
@@ -8655,7 +8719,11 @@ async fn handle_chat_message(
                                 &session_id,
                                 MessageRole::Assistant,
                                 &final_text,
-                                stamp_message_metadata(None, &container, active_soul.as_deref()),
+                                stamp_message_metadata(
+                                    usage_metadata(&turn_stats),
+                                    &container,
+                                    active_soul.as_deref(),
+                                ),
                             )
                             .await
                         {
@@ -14195,6 +14263,67 @@ mod soul_binding_tests {
             serde_json::Value::String(String::new()),
         );
         assert_eq!(message_persona(&msg), None);
+    }
+}
+
+#[cfg(test)]
+mod usage_frame_tests {
+    use super::*;
+
+    fn done_frame() -> serde_json::Value {
+        serde_json::json!({
+            "type": "stream_chunk",
+            "payload": {"session_id": "s1", "content": "", "done": true}
+        })
+    }
+
+    #[test]
+    fn attach_usage_adds_the_snapshot_to_the_done_payload() {
+        let mut payload = done_frame();
+        let usage = nevoflux_protocol::TurnUsage {
+            main: nevoflux_protocol::UsageBucket {
+                input: 10,
+                output: 4,
+                calls: 1,
+                estimated: false,
+            },
+            ..Default::default()
+        };
+        attach_usage(&mut payload, Some(&usage));
+        assert_eq!(payload["payload"]["usage"]["main"]["input"], 10);
+        assert_eq!(payload["payload"]["done"], true);
+    }
+
+    #[test]
+    fn attach_usage_leaves_the_payload_alone_without_a_snapshot() {
+        let mut payload = done_frame();
+        attach_usage(&mut payload, None);
+        assert!(payload["payload"].get("usage").is_none());
+    }
+
+    #[test]
+    fn usage_metadata_carries_the_same_snapshot_under_a_usage_key() {
+        let stats = crate::turn_stats::TurnStats::new();
+        stats.record(crate::turn_stats::CallStats {
+            is_subagent: false,
+            external_agent: false,
+            reported_input: Some(120),
+            reported_output: Some(30),
+            estimated_input: 0,
+            estimated_output: 0,
+            decode_ms: Some(1000),
+            first_token_ms: Some(200),
+            model: "m".into(),
+        });
+        let meta = usage_metadata(&stats).expect("a recorded call produces metadata");
+        assert_eq!(meta["usage"]["main"]["input"], 120);
+        assert_eq!(meta["usage"]["decode_ms"], 1000);
+    }
+
+    #[test]
+    fn usage_metadata_is_absent_when_no_llm_call_ran() {
+        let stats = crate::turn_stats::TurnStats::new();
+        assert!(usage_metadata(&stats).is_none());
     }
 }
 
