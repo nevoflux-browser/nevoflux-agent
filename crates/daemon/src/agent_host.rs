@@ -5848,6 +5848,7 @@ impl HostFunctions for DaemonHostFunctions {
                         None,
                         None,
                         None,
+                        self.turn_stats(),
                     )
                     .map_err(|e| HostError {
                         code: 500,
@@ -5875,6 +5876,7 @@ impl HostFunctions for DaemonHostFunctions {
             None,
             self.sidebar_stream_tx.clone(),
             self.token_budget.clone(),
+            self.turn_stats(),
         )
     }
 
@@ -8314,6 +8316,7 @@ impl DaemonHostFunctions {
                         final_tools_config.clone(),
                         final_provider.clone(),
                         final_model.clone(),
+                        self.turn_stats(),
                     )
                     .map_err(|e| HostError {
                         code: 500,
@@ -8341,6 +8344,7 @@ impl DaemonHostFunctions {
             final_model,
             self.sidebar_stream_tx.clone(),
             self.token_budget.clone(),
+            self.turn_stats(),
         )
     }
 
@@ -8364,6 +8368,7 @@ impl DaemonHostFunctions {
         model_override: Option<String>,
         sidebar_stream_tx: Option<tokio::sync::mpsc::UnboundedSender<SidebarStreamChunk>>,
         token_budget: Option<Arc<crate::agent_exec::TokenBudget>>,
+        turn_stats: Option<Arc<crate::turn_stats::TurnStats>>,
     ) -> HostResult<u64> {
         let id = subagent_registry.allocate_id();
         let task_str = task.to_string();
@@ -8412,6 +8417,11 @@ impl DaemonHostFunctions {
                 // boundary enforces the same shared ceiling.
                 if let Some(budget) = token_budget {
                     host = host.with_token_budget(budget);
+                }
+                // Same reply, same accounting: a subagent's spend is part of
+                // what the reply the user is looking at cost.
+                if let Some(stats) = turn_stats {
+                    host = host.with_turn_stats(stats);
                 }
                 if let Some(svc) = services {
                     host = host.with_services(svc);
@@ -9400,6 +9410,7 @@ message = "not here"
             None,
             None,
             Some(budget),
+            None,
         )
         .expect("spawn registers the subagent");
 
