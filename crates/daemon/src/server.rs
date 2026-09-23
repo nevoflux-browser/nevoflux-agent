@@ -8770,6 +8770,9 @@ async fn handle_chat_message(
                         response["payload"]["session_title"] = serde_json::Value::String(title);
                     }
 
+                    // Same stats the stored message carries.
+                    attach_usage(&mut response, turn_stats.snapshot().as_ref());
+
                     response
                 }
                 Err(e) => {
