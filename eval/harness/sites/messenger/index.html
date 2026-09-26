@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>ChatLine</title>
+<script src="../_lib/beacon.js"></script>
+<style>
+  #app { display: flex; gap: 16px; }
+  #contacts li { cursor: pointer; }
+  #contacts li[aria-selected="true"] { font-weight: bold; }
+</style>
+<h1>ChatLine</h1>
+<div id="app">
+  <ul id="contacts" role="listbox" aria-label="Contacts"></ul>
+  <section>
+    <h2 id="chat-title">Select a contact</h2>
+    <ol id="history"></ol>
+    <form id="compose">
+      <input id="text" aria-label="Message" placeholder="Type a message" disabled>
+      <button type="submit" id="send" disabled>Send</button>
+    </form>
+  </section>
+</div>
+<script src="messenger.js"></script>
+</html>

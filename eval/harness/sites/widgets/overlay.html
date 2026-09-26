@@ -1,0 +1,16 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Widgets — overlay</title>
+<script src="../_lib/beacon.js"></script>
+<style>
+  #cookie-banner { position: fixed; inset: 0; background: rgba(0,0,0,.6);
+    display: flex; align-items: center; justify-content: center; }
+  #cookie-banner .box { background: #fff; padding: 24px; }
+</style>
+<h1>Account settings</h1>
+<button id="target">Save settings</button>
+<p id="status"></p>
+<div id="cookie-banner">
+  <div class="box">We use cookies. <button id="accept">Accept</button></div>
+</div>
+<script src="overlay.js"></script>

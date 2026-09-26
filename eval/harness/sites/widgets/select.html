@@ -1,0 +1,19 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Widgets — order options</title>
+<script src="../_lib/beacon.js"></script>
+<h1>T-shirt order</h1>
+<form id="f">
+  <label>Size <select id="size" name="size">
+    <option value="S">S</option><option value="M" selected>M</option>
+    <option value="L">L</option><option value="XL">XL</option>
+  </select></label>
+  <p><label><input type="checkbox" id="gift" name="gift"> Gift wrap</label></p>
+  <fieldset><legend>Shipping</legend>
+    <label><input type="radio" name="ship" value="std" checked> Standard</label>
+    <label><input type="radio" name="ship" value="express"> Express</label>
+  </fieldset>
+  <button type="submit">Place order</button>
+</form>
+<p id="status"></p>
+<script src="select.js"></script>

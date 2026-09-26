@@ -106,3 +106,17 @@ class SiteServer:
         if self._httpd:
             self._httpd.shutdown()
             self._httpd.server_close()
+
+
+if __name__ == "__main__":
+    # Manual browsing: python -m eval.harness.siteserver [port]
+    import sys
+
+    s = SiteServer(pathlib.Path(__file__).resolve().parent / "sites",
+                   int(sys.argv[1]) if len(sys.argv) > 1 else 18080)
+    s.set_trial("manual")
+    print(f"serving http://127.0.0.1:{s.start()}/  (events: /__events)")
+    try:
+        threading.Event().wait()
+    except KeyboardInterrupt:
+        s.stop()
