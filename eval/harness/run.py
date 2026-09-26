@@ -78,7 +78,8 @@ def main(argv=None):
     summary = {"score": statistics.mean(per_task.values()) if per_task else 0.0,
                "per_rep": per_rep, "per_task": per_task,
                "harness_errors": sum(r["status"] == "harness_error" for r in rows),
-               "timeouts": sum(r.get("timed_out", False) for r in rows)}
+               "timeouts": sum(r.get("timed_out", False) for r in rows),
+               "provider_errors": sum(r["status"] == "provider_error" for r in rows)}
     (out / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=1), encoding="utf-8")
     print(json.dumps(summary, ensure_ascii=False, indent=1))
     return 0

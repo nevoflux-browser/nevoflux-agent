@@ -30,6 +30,12 @@ class CalibrateTest(unittest.TestCase):
         self.assertEqual(s["cost"]["input"], 400)
         self.assertAlmostEqual(s["cost"]["estimated_share"], 0.5)
 
+    def test_provider_errors_count_as_missing(self):
+        rows = [row(0, "a", False, status="provider_error")] + [row(0, str(i), True) for i in range(4)]
+        s = summarize(rows)
+        self.assertAlmostEqual(s["missing_rate"], 0.2)
+        self.assertTrue(s["eval_invalid"])
+
 
 if __name__ == "__main__":
     unittest.main()

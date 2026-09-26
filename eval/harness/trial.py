@@ -2,6 +2,7 @@
 
 import dataclasses
 import pathlib
+import re
 import shutil
 import tempfile
 import time
@@ -20,6 +21,22 @@ class TrialConfig:
     overrides: dict
     work_root: pathlib.Path
     keep_dirs: bool = False
+
+
+_PROVIDER_ERROR = re.compile(r"^\s*\[Error: ProviderError")
+
+
+def classify_status(last: dict, timed_out: bool) -> str:
+    """Trial status. A provider failure (the daemon reports it as a
+    'succeeded' task whose output is the error text) is not an agent result:
+    it is a missing trial, counted against eval validity, not against the
+    agent."""
+    if timed_out:
+        return "timeout"
+    texts = [last.get("output") or ""] + list(last.get("turn_outputs") or [])
+    if any(_PROVIDER_ERROR.match(t) for t in texts):
+        return "provider_error"
+    return last.get("status") or "unknown"
 
 
 def _delays(spec) -> int:
@@ -61,7 +78,7 @@ def run_trial(spec, site, cfg: TrialConfig, trial_id: str) -> dict:
         sid = last.get("session_id")
         jsonl = tdir / "session.jsonl"
         exported = bool(sid) and d.export_session(sid, jsonl)
-        result = {"status": "timeout" if timed_out else last.get("status"),
+        result = {"status": classify_status(last, timed_out),
                   "turn_outputs": last.get("turn_outputs") or [],
                   "output": last.get("output"), "events": site.events(), "trial": trial_id}
         g = grade(spec, result)

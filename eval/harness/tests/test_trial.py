@@ -57,5 +57,24 @@ class RenderTest(unittest.TestCase):
         self.assertEqual(r.followups[0]["message"], "http://127.0.0.1:9/shop/cart.html")
 
 
+class StatusTest(unittest.TestCase):
+    def test_provider_error_output_is_not_an_agent_result(self):
+        from eval.harness.trial import classify_status
+        last = {"status": "succeeded",
+                "output": " [Error: ProviderError: Invalid status code 500 Internal Server Error ...]"}
+        self.assertEqual(classify_status(last, timed_out=False), "provider_error")
+
+    def test_provider_error_in_any_turn(self):
+        from eval.harness.trial import classify_status
+        last = {"status": "succeeded", "output": "fine",
+                "turn_outputs": ["[Error: ProviderError: 429 ...]", "fine"]}
+        self.assertEqual(classify_status(last, timed_out=False), "provider_error")
+
+    def test_timeout_and_normal_status(self):
+        from eval.harness.trial import classify_status
+        self.assertEqual(classify_status({"status": "running"}, timed_out=True), "timeout")
+        self.assertEqual(classify_status({"status": "failed", "output": "no"}, timed_out=False), "failed")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -7,7 +7,7 @@ import json
 import statistics
 import sys
 
-MISSING = {"harness_error", "timeout"}
+MISSING = {"harness_error", "timeout", "provider_error"}
 
 
 def summarize(rows) -> dict:
