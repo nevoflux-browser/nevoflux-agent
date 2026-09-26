@@ -44,6 +44,7 @@ fn queued(id: &str) -> TaskResponse {
         output: None,
         error: None,
         artifacts: Vec::new(),
+        session_id: None,
     }
 }
 
@@ -181,6 +182,7 @@ mod tests {
                     output: Some("ok".into()),
                     error: None,
                     artifacts: vec![],
+                    ..Default::default()
                 }
             })
         });
@@ -216,6 +218,7 @@ mod tests {
                     output: Some("完成".into()),
                     error: None,
                     artifacts: vec![],
+                    ..Default::default()
                 }
             })
         });
@@ -246,6 +249,7 @@ mod tests {
                     output: None,
                     error: None,
                     artifacts: vec![],
+                    ..Default::default()
                 }
             })
         });

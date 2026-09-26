@@ -1034,6 +1034,7 @@ mod tests {
                     output: Some("ok".into()),
                     error: None,
                     artifacts: vec![],
+                    ..Default::default()
                 }
             })
         });

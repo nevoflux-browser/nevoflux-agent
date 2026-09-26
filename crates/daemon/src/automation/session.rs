@@ -56,7 +56,7 @@ fn should_soft_reset(runs_script_backend: bool, env_val: Option<&str>) -> bool {
 }
 
 /// Result of one attempt at a task.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AttemptOutcome {
     /// Whether the attempt completed the task.
     pub success: bool,
@@ -66,10 +66,12 @@ pub struct AttemptOutcome {
     pub output: Option<String>,
     /// Error detail, if failed.
     pub error: Option<String>,
+    /// Session id the attempt ran under (what `session export` takes).
+    pub session_id: Option<String>,
 }
 
 /// Terminal result of a task after retries.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SessionOutcome {
     /// Final status.
     pub status: TaskStatus,
@@ -79,6 +81,15 @@ pub struct SessionOutcome {
     pub output: Option<String>,
     /// Final error, if failed.
     pub error: Option<String>,
+    /// Session id of the last attempt.
+    pub session_id: Option<String>,
+}
+
+/// Session id for one attempt of one headless task. Carries the task id so
+/// events from different tasks never pile up under the same id in
+/// `session_events` (they used to share `automation-1`).
+pub fn automation_session_id(task_id: &str, attempt: u32) -> String {
+    format!("automation-{task_id}-{attempt}")
 }
 
 /// Drive a task with taint-gated retry (≤3, untainted-only; `idempotent`
@@ -102,6 +113,7 @@ where
                 attempts: attempt,
                 output: outcome.output,
                 error: None,
+                session_id: outcome.session_id,
             };
         }
         if retry_decision(attempt, outcome.tainted, policy) {
@@ -112,6 +124,7 @@ where
             attempts: attempt,
             output: outcome.output,
             error: outcome.error,
+            session_id: outcome.session_id,
         };
     }
 }
@@ -146,6 +159,7 @@ pub async fn execute_task_attempt(
             tainted: false,
             output: None,
             error: Some("no agent_config on services".into()),
+            ..Default::default()
         };
     };
     let Some(runtime_handle) = services_template.runtime_handle.clone() else {
@@ -154,6 +168,7 @@ pub async fn execute_task_attempt(
             tainted: false,
             output: None,
             error: Some("no runtime_handle on services".into()),
+            ..Default::default()
         };
     };
 
@@ -233,6 +248,7 @@ pub async fn execute_task_attempt(
                 tainted,
                 output: Some(out.text),
                 error: None,
+                ..Default::default()
             }
         }
         Ok(Err(e)) => AttemptOutcome {
@@ -240,12 +256,14 @@ pub async fn execute_task_attempt(
             tainted: true,
             output: None,
             error: Some(e.message),
+            ..Default::default()
         },
         Err(e) => AttemptOutcome {
             success: false,
             tainted: true,
             output: None,
             error: Some(format!("agent task panicked: {e}")),
+            ..Default::default()
         },
     }
 }
@@ -274,6 +292,7 @@ fn run_headless_script(
                 error: Some(format!(
                     "headless script mode: cannot read NEVOFLUX_HEADLESS_SCRIPT '{script_path}': {e}"
                 )),
+                ..Default::default()
             };
         }
     };
@@ -283,6 +302,7 @@ fn run_headless_script(
             tainted: false,
             output: None,
             error: Some("headless script mode: no bound browser context".into()),
+            ..Default::default()
         };
     };
 
@@ -344,6 +364,7 @@ fn run_headless_script(
             tainted: true,
             output: Some(text),
             error: None,
+            ..Default::default()
         }
     } else {
         let message = result
@@ -370,6 +391,7 @@ fn run_headless_script(
             tainted: true,
             output: None,
             error: Some(message),
+            ..Default::default()
         }
     }
 }
@@ -424,6 +446,8 @@ pub struct AutomationDeps {
     /// Non-empty only on the A2A path, where a `contextId` makes several tasks
     /// one conversation. Everywhere else a task is a fresh run.
     pub history: Vec<crate::http::types::HistoryTurn>,
+    /// Queue id of the task (`task-N`); part of the session id.
+    pub task_id: String,
 }
 
 /// The binding for a call served in this process: none at all.
@@ -569,6 +593,7 @@ pub async fn execute_full_task(
                         tainted: false,
                         output: None,
                         error: Some("this task needs a browser; set NEVOFLUX_BROWSER_BIN".into()),
+                        ..Default::default()
                     };
                 };
                 let clone = match deps.profile_mgr.clone_base(&deps.profile) {
@@ -579,6 +604,7 @@ pub async fn execute_full_task(
                             tainted: false,
                             output: None,
                             error: Some(format!("profile clone failed: {e}")),
+                            ..Default::default()
                         }
                     }
                 };
@@ -599,27 +625,32 @@ pub async fn execute_full_task(
                             tainted: false, // browser never started ⇒ untainted (retryable)
                             output: None,
                             error: Some(format!("browser launch failed: {e}")),
+                            ..Default::default()
                         },
                         Ok(mut handle) => {
                             let outcome = match deps.registry.single() {
                                 Ok(browser) => {
-                                    execute_task_attempt(
+                                    let sid = automation_session_id(&deps.task_id, attempt);
+                                    let mut out = execute_task_attempt(
                                         deps.services_template.clone(),
                                         &browser,
                                         policy,
                                         task,
                                         deps.mode,
-                                        format!("automation-{attempt}"),
+                                        sid.clone(),
                                         &deps.history,
                                         deps.script_call.as_ref(),
                                     )
-                                    .await
+                                    .await;
+                                    out.session_id = Some(sid);
+                                    out
                                 }
                                 Err(e) => AttemptOutcome {
                                     success: false,
                                     tainted: false,
                                     output: None,
                                     error: Some(format!("binding failed: {e}")),
+                                    ..Default::default()
                                 },
                             };
                             // Reap the launcher child for this attempt.
@@ -711,6 +742,7 @@ fn failed(msg: String) -> SessionOutcome {
         attempts: 1,
         output: None,
         error: Some(msg),
+        ..Default::default()
     }
 }
 
@@ -845,6 +877,7 @@ pub async fn execute_session_task(
                     tainted: false,
                     output: None,
                     error: Some(format!("binding failed: {e}")),
+                    ..Default::default()
                 }
             }
         };
@@ -1069,6 +1102,7 @@ mod tests {
             tainted,
             output: None,
             error: Some("boom".into()),
+            ..Default::default()
         }
     }
 
@@ -1078,6 +1112,7 @@ mod tests {
             tainted: false,
             output: Some("done".into()),
             error: None,
+            ..Default::default()
         }
     }
 
@@ -1167,5 +1202,18 @@ mod tests {
         assert!(!out.success);
         assert!(!out.tainted, "setup failure must be untainted (retryable)");
         assert!(out.error.unwrap().contains("agent_config"));
+    }
+
+    #[test]
+    fn automation_session_id_is_unique_per_task_and_attempt() {
+        assert_eq!(automation_session_id("task-3", 1), "automation-task-3-1");
+        assert_ne!(
+            automation_session_id("task-3", 1),
+            automation_session_id("task-4", 1)
+        );
+        assert_ne!(
+            automation_session_id("task-3", 1),
+            automation_session_id("task-3", 2)
+        );
     }
 }

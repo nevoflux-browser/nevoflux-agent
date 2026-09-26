@@ -210,6 +210,12 @@ pub enum TaskStatus {
     Canceled,
 }
 
+impl Default for TaskStatus {
+    fn default() -> Self {
+        TaskStatus::Queued
+    }
+}
+
 impl TaskStatus {
     /// Whether this is a terminal state. Polling and SSE both use it to decide
     /// when to stop.
@@ -222,7 +228,7 @@ impl TaskStatus {
 }
 
 /// Task result / status snapshot.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct TaskResponse {
     /// Task id.
     pub id: String,
@@ -238,6 +244,9 @@ pub struct TaskResponse {
     pub error: Option<String>,
     /// Drained artifact paths (relative to the task workspace).
     pub artifacts: Vec<String>,
+    /// Session id of the (last) attempt, for `session export`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -305,6 +314,7 @@ mod tests {
             output: None,
             error: Some("cancelled".into()),
             artifacts: vec![],
+            ..Default::default()
         };
         let s = serde_json::to_string(&r).unwrap();
         assert!(s.contains(r#""status":"canceled""#), "got {s}");
@@ -335,11 +345,30 @@ mod tests {
             output: None,
             error: None,
             artifacts: vec![],
+            ..Default::default()
         };
         let s = serde_json::to_string(&r).unwrap();
         assert!(s.contains(r#""status":"running""#));
         assert!(s.contains(r#""id":"t1""#));
         // output/error omitted when None
         assert!(!s.contains("output"));
+    }
+
+    #[test]
+    fn task_response_serializes_session_id_only_when_present() {
+        let mut r = TaskResponse {
+            id: "task-1".into(),
+            status: TaskStatus::Succeeded,
+            attempts: 1,
+            output: None,
+            error: None,
+            artifacts: vec![],
+            session_id: None,
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        assert!(v.get("session_id").is_none());
+        r.session_id = Some("automation-task-1-1".into());
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["session_id"], "automation-task-1-1");
     }
 }
