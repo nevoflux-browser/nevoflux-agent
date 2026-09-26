@@ -1,0 +1,23 @@
+{
+ "id": "j20-zh-checkout",
+ "set": "j20",
+ "lang": "zh",
+ "site": "zh-shop",
+ "task": "在 {base}/product.html?sku=Z-3 购买这件商品，收货人“李雷”，地址“测试路1号”，选择快递配送。",
+ "checks": [
+  {
+   "type": "event",
+   "kind": "order",
+   "where": {
+    "name": "李雷",
+    "ship": "express"
+   }
+  }
+ ],
+ "tags": [
+  "j20",
+  "shop",
+  "write"
+ ],
+ "timeout_secs": 300
+}

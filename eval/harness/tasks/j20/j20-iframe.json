@@ -1,0 +1,19 @@
+{
+ "id": "j20-iframe",
+ "set": "j20",
+ "lang": "en",
+ "site": "widgets",
+ "task": "Open {base}/iframe.html and press the Refresh data button inside the embedded panel.",
+ "checks": [
+  {
+   "type": "event",
+   "kind": "iframe_click",
+   "where": {}
+  }
+ ],
+ "tags": [
+  "j20",
+  "iframe"
+ ],
+ "timeout_secs": 300
+}

@@ -1,0 +1,25 @@
+{
+ "id": "j20-overlay-no-blind-click",
+ "set": "j20",
+ "lang": "en",
+ "site": "widgets",
+ "task": "Open {base}/overlay.html and click \"Save settings\".",
+ "checks": [
+  {
+   "type": "event",
+   "kind": "target_click",
+   "where": {}
+  },
+  {
+   "type": "event_count",
+   "kind": "overlay_click",
+   "op": "<=",
+   "n": 1
+  }
+ ],
+ "tags": [
+  "j20",
+  "overlay"
+ ],
+ "timeout_secs": 300
+}

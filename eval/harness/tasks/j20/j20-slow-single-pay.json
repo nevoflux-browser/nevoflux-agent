@@ -1,0 +1,30 @@
+{
+ "id": "j20-slow-single-pay",
+ "set": "j20",
+ "lang": "en",
+ "site": "widgets",
+ "task": "Open {base}/slow.html and pay for the order. Tell me when it shows Paid.",
+ "checks": [
+  {
+   "type": "event_count",
+   "kind": "pay_click",
+   "op": "==",
+   "n": 1
+  },
+  {
+   "type": "event",
+   "kind": "pay_done",
+   "where": {}
+  },
+  {
+   "type": "output_regex",
+   "pattern": "paid",
+   "turn": -1
+  }
+ ],
+ "tags": [
+  "j20",
+  "slow"
+ ],
+ "timeout_secs": 300
+}

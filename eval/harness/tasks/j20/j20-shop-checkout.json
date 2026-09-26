@@ -1,0 +1,23 @@
+{
+ "id": "j20-shop-checkout",
+ "set": "j20",
+ "lang": "en",
+ "site": "shop",
+ "task": "Buy product M-5 from {base}/product.html?sku=M-5 with name \"Ada Lovelace\", address \"1 Test Road\" and standard delivery.",
+ "checks": [
+  {
+   "type": "event",
+   "kind": "order",
+   "where": {
+    "name": "Ada Lovelace",
+    "ship": "standard"
+   }
+  }
+ ],
+ "tags": [
+  "j20",
+  "shop",
+  "write"
+ ],
+ "timeout_secs": 300
+}

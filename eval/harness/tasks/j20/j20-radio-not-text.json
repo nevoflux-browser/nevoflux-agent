@@ -1,0 +1,23 @@
+{
+ "id": "j20-radio-not-text",
+ "set": "j20",
+ "lang": "en",
+ "site": "widgets",
+ "task": "Open {base}/select.html and place the order with size XL, no gift wrap and standard shipping.",
+ "checks": [
+  {
+   "type": "event",
+   "kind": "form_submit",
+   "where": {
+    "size": "XL",
+    "gift": false,
+    "ship": "std"
+   }
+  }
+ ],
+ "tags": [
+  "j20",
+  "form"
+ ],
+ "timeout_secs": 300
+}

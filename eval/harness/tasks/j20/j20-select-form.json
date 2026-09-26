@@ -1,0 +1,23 @@
+{
+ "id": "j20-select-form",
+ "set": "j20",
+ "lang": "en",
+ "site": "widgets",
+ "task": "Open {base}/select.html, choose size L, tick gift wrap, choose express shipping and place the order.",
+ "checks": [
+  {
+   "type": "event",
+   "kind": "form_submit",
+   "where": {
+    "size": "L",
+    "gift": true,
+    "ship": "express"
+   }
+  }
+ ],
+ "tags": [
+  "j20",
+  "form"
+ ],
+ "timeout_secs": 300
+}

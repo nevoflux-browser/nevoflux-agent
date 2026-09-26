@@ -1,0 +1,19 @@
+{
+ "id": "j20-scroll-find",
+ "set": "j20",
+ "lang": "en",
+ "site": "widgets",
+ "task": "Open {base}/scroll.html and find the secret code in the list.",
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "ZETA-7731",
+   "turn": -1
+  }
+ ],
+ "tags": [
+  "j20",
+  "scroll"
+ ],
+ "timeout_secs": 300
+}
