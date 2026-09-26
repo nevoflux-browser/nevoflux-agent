@@ -53,5 +53,11 @@ Then `POST /tasks` and poll `GET /tasks/<id>`.
 
 ## Known gaps
 
+- Agent-loop tasks have no deadline on the daemon side: `wall_clock_secs`
+  bounds only the script backend, and `DELETE /tasks/:id` only marks the task
+  cancelled in the queue while the agent keeps running. The harness's poll
+  timeout (task timeout + follow-up delays + 60s) plus killing the daemon is
+  the real bound.
+
 - `/v1/chat/completions` still reports zero usage on the agent-loop route
   (`FinishPayload` carries no usage); the harness uses `/tasks`, which does.

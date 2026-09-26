@@ -1,0 +1,14 @@
+{
+ "id": "smoke-title",
+ "set": "smoke",
+ "lang": "en",
+ "site": "smoke",
+ "task": "Open {base}/index.html and tell me the exact page title.",
+ "followups": [{"message": "What title did you just report? Answer with the title only.", "delay_secs": 0}],
+ "checks": [
+  {"type": "output_regex", "pattern": "NF Smoke 42", "turn": 0},
+  {"type": "output_regex", "pattern": "NF Smoke 42", "turn": 1}
+ ],
+ "tags": ["smoke", "multi"],
+ "timeout_secs": 240
+}

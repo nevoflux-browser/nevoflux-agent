@@ -62,8 +62,12 @@ class Daemon:
         for sub in ("data", "base-profiles", "profiles"):
             (self.dir / sub).mkdir(parents=True, exist_ok=True)
         self._log = open(self.dir / "daemon.stdout.log", "wb")
+        # Without --port the daemon binds the fixed 19500 the desktop NevoFlux
+        # uses; the proxy finds whichever port via daemon.port in the data dir.
+        self.internal_port = free_port()
         self.proc = subprocess.Popen(
-            [str(self.exe), "--daemon", "--headless", "--http-addr", f"127.0.0.1:{self.port}"],
+            [str(self.exe), "--daemon", "--headless", "--http-addr", f"127.0.0.1:{self.port}",
+             "--port", str(self.internal_port)],
             env=self.env, stdout=self._log, stderr=subprocess.STDOUT,
             creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
         deadline = time.monotonic() + ready_timeout
