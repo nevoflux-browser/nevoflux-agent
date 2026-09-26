@@ -98,6 +98,7 @@ pub async fn prewarm_session_browser() {
         registry: registry.clone(),
         services_template: template.clone(),
         task_id: "prewarm".to_string(),
+        followups: Vec::new(),
         browser_bin: Some(PathBuf::from(browser_bin)),
         display: std::env::var("DISPLAY").ok(),
         mode: nevoflux_builtin_wasm::AgentMode::Chat,
@@ -199,6 +200,7 @@ pub fn build_headless_runner(
                     engine,
                     history: req.history.clone(),
                     task_id: id.clone(),
+                    followups: req.followups.clone(),
                 };
                 let policy = req.to_policy();
                 // A2A drives task-flow from its own `contextId`, so it must not
@@ -250,6 +252,11 @@ pub fn build_headless_runner(
                     artifacts: crate::http::artifacts::list_artifacts(&artifacts_dir),
                     session_id: outcome.session_id.clone(),
                     usage: outcome.usage.clone(),
+                    turn_outputs: if req.followups.is_empty() {
+                        Vec::new()
+                    } else {
+                        outcome.turn_outputs.clone()
+                    },
                 }
             })
         },

@@ -70,6 +70,8 @@ pub struct AttemptOutcome {
     pub session_id: Option<String>,
     /// Per-turn LLM accounting (M3); one entry per turn that called the LLM.
     pub usage: Vec<nevoflux_protocol::TurnUsage>,
+    /// Final text of each turn, in order (see [`run_turns`]).
+    pub turn_outputs: Vec<String>,
 }
 
 /// Terminal result of a task after retries.
@@ -87,6 +89,57 @@ pub struct SessionOutcome {
     pub session_id: Option<String>,
     /// Per-turn usage of the last attempt.
     pub usage: Vec<nevoflux_protocol::TurnUsage>,
+    /// Per-turn outputs of the last attempt.
+    pub turn_outputs: Vec<String>,
+}
+
+/// Run the first message and each follow-up as consecutive turns of one
+/// conversation. History is the plain text of earlier turns — the same thing
+/// a chat carries across turns when Jev is off. Stops at the first failed
+/// turn; later turns would be answering a conversation that went wrong.
+pub(crate) async fn run_turns<F, Fut, S>(
+    first: &str,
+    followups: &[crate::http::types::Followup],
+    sleep: S,
+    mut run: F,
+) -> AttemptOutcome
+where
+    F: FnMut(String, Vec<crate::http::types::HistoryTurn>) -> Fut,
+    Fut: Future<Output = AttemptOutcome>,
+    S: Fn(u64) -> futures::future::BoxFuture<'static, ()>,
+{
+    use crate::http::types::HistoryTurn;
+    let mut history: Vec<HistoryTurn> = Vec::new();
+    let mut acc = AttemptOutcome::default();
+    let messages = std::iter::once((first.to_string(), 0u64))
+        .chain(followups.iter().map(|f| (f.message.clone(), f.delay_secs)));
+    for (msg, delay) in messages {
+        if delay > 0 {
+            sleep(delay).await;
+        }
+        let turn = run(msg.clone(), history.clone()).await;
+        acc.tainted |= turn.tainted;
+        acc.usage.extend(turn.usage);
+        acc.session_id = turn.session_id.or(acc.session_id);
+        let text = turn.output.clone().unwrap_or_default();
+        acc.turn_outputs.push(text.clone());
+        acc.output = turn.output;
+        if !turn.success {
+            acc.success = false;
+            acc.error = turn.error;
+            return acc;
+        }
+        history.push(HistoryTurn {
+            role: "user".into(),
+            content: msg,
+        });
+        history.push(HistoryTurn {
+            role: "assistant".into(),
+            content: text,
+        });
+        acc.success = true;
+    }
+    acc
 }
 
 /// Session id for one attempt of one headless task. Carries the task id so
@@ -119,6 +172,7 @@ where
                 error: None,
                 session_id: outcome.session_id,
                 usage: outcome.usage,
+                turn_outputs: outcome.turn_outputs,
             };
         }
         if retry_decision(attempt, outcome.tainted, policy) {
@@ -131,6 +185,7 @@ where
             error: outcome.error,
             session_id: outcome.session_id,
             usage: outcome.usage,
+            turn_outputs: outcome.turn_outputs,
         };
     }
 }
@@ -157,6 +212,7 @@ pub async fn execute_task_attempt(
     mode: nevoflux_builtin_wasm::AgentMode,
     session_id: String,
     history: &[crate::http::types::HistoryTurn],
+    followups: &[crate::http::types::Followup],
     script_call: Option<&ScriptCall>,
 ) -> AttemptOutcome {
     let Some(agent_config) = services_template.agent_config.clone() else {
@@ -191,6 +247,47 @@ pub async fn execute_task_attempt(
         return run_headless_script(&services, &script_path, task, script_call);
     }
 
+    let initial_history = history.to_vec();
+    run_turns(
+        task,
+        followups,
+        |secs| {
+            Box::pin(tokio::time::sleep(Duration::from_secs(secs)))
+                as futures::future::BoxFuture<'static, ()>
+        },
+        |msg, hist| {
+            // A caller-supplied history (A2A) comes before this task's turns.
+            let mut full = initial_history.clone();
+            full.extend(hist);
+            run_one_turn(
+                services.clone(),
+                agent_config.clone(),
+                runtime_handle.clone(),
+                policy,
+                mode,
+                session_id.clone(),
+                msg,
+                full,
+            )
+        },
+    )
+    .await
+}
+
+/// One agent turn of a headless task: a fresh host and agent (with their own
+/// TurnStats) over the shared session id, so turns of one task land in one
+/// `session_events` stream.
+#[allow(clippy::too_many_arguments)]
+async fn run_one_turn(
+    services: HostServices,
+    agent_config: std::sync::Arc<crate::config::AgentConfig>,
+    runtime_handle: tokio::runtime::Handle,
+    policy: &Policy,
+    mode: nevoflux_builtin_wasm::AgentMode,
+    session_id: String,
+    user_message: String,
+    history: Vec<crate::http::types::HistoryTurn>,
+) -> AttemptOutcome {
     // Own session state for the same reason a chat gets one: this is a task,
     // and the template's copy is shared by the whole process.
     // Per-turn accounting (M3): the same TurnStats the sidebar uses, so a
@@ -214,7 +311,7 @@ pub async fn execute_task_attempt(
         skills_filter: None,
         session_id,
         mode,
-        user_message: task.to_string(),
+        user_message,
         history: history
             .iter()
             .map(|h| nevoflux_builtin_wasm::Message {
@@ -461,6 +558,8 @@ pub struct AutomationDeps {
     pub history: Vec<crate::http::types::HistoryTurn>,
     /// Queue id of the task (`task-N`); part of the session id.
     pub task_id: String,
+    /// Follow-up turns (full-task path only).
+    pub followups: Vec<crate::http::types::Followup>,
 }
 
 /// The binding for a call served in this process: none at all.
@@ -548,6 +647,7 @@ async fn settled_by_skiff(
             deps.mode,
             format!("skiff-{attempt}"),
             &deps.history,
+            &[],
             deps.script_call.as_ref(),
         )
         .await
@@ -652,6 +752,7 @@ pub async fn execute_full_task(
                                         deps.mode,
                                         sid.clone(),
                                         &deps.history,
+                                        &deps.followups,
                                         deps.script_call.as_ref(),
                                     )
                                     .await;
@@ -902,6 +1003,7 @@ pub async fn execute_session_task(
             deps.mode,
             format!("session-{attempt}"),
             &deps.history,
+            &[],
             deps.script_call.as_ref(),
         )
         .await
@@ -1209,6 +1311,7 @@ mod tests {
             nevoflux_builtin_wasm::AgentMode::Browser,
             "sess-1".into(),
             &[],
+            &[],
             None,
         )
         .await;
@@ -1228,5 +1331,67 @@ mod tests {
             automation_session_id("task-3", 1),
             automation_session_id("task-3", 2)
         );
+    }
+
+    #[tokio::test]
+    async fn run_turns_threads_history_and_stops_on_failure() {
+        use crate::http::types::{Followup, HistoryTurn};
+        let followups = vec![
+            Followup {
+                message: "second".into(),
+                delay_secs: 0,
+            },
+            Followup {
+                message: "third".into(),
+                delay_secs: 7,
+            },
+        ];
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, usize)>::new()));
+        let slept = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+        let seen2 = seen.clone();
+        let slept2 = slept.clone();
+        let out = run_turns(
+            "first",
+            &followups,
+            move |s| {
+                slept2.lock().unwrap().push(s);
+                Box::pin(async {}) as futures::future::BoxFuture<'static, ()>
+            },
+            move |msg: String, hist: Vec<HistoryTurn>| {
+                seen2.lock().unwrap().push((msg.clone(), hist.len()));
+                async move {
+                    AttemptOutcome {
+                        success: msg != "third",
+                        output: Some(format!("re:{msg}")),
+                        error: (msg == "third").then(|| "boom".into()),
+                        ..Default::default()
+                    }
+                }
+            },
+        )
+        .await;
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![
+                ("first".into(), 0),
+                ("second".into(), 2),
+                ("third".into(), 4)
+            ]
+        );
+        assert_eq!(*slept.lock().unwrap(), vec![7]); // zero delays are skipped
+        assert!(!out.success);
+        assert_eq!(out.turn_outputs, vec!["re:first", "re:second", "re:third"]);
+        assert_eq!(out.error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn followups_default_to_empty_and_parse() {
+        let r: crate::http::types::TaskRequest = serde_json::from_str(r#"{"task":"a"}"#).unwrap();
+        assert!(r.followups.is_empty());
+        let r: crate::http::types::TaskRequest =
+            serde_json::from_str(r#"{"task":"a","followups":[{"message":"b","delay_secs":360}]}"#)
+                .unwrap();
+        assert_eq!(r.followups[0].delay_secs, 360);
     }
 }

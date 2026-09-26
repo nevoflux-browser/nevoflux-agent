@@ -46,6 +46,7 @@ fn queued(id: &str) -> TaskResponse {
         artifacts: Vec::new(),
         session_id: None,
         usage: Vec::new(),
+        turn_outputs: Vec::new(),
     }
 }
 
@@ -155,6 +156,7 @@ mod tests {
     fn sample_request() -> TaskRequest {
         TaskRequest {
             task: "open example.com".into(),
+            followups: Vec::new(),
             mode: "browser".into(),
             profile: None,
             policy: PolicyRequest::default(),

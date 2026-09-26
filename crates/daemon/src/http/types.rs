@@ -3,6 +3,16 @@
 
 use serde::{Deserialize, Serialize};
 
+/// A follow-up message: a further turn of the same task conversation.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct Followup {
+    /// What the user says in this turn.
+    pub message: String,
+    /// Seconds to wait before sending it (e.g. to let a prompt cache expire).
+    #[serde(default)]
+    pub delay_secs: u64,
+}
+
 /// One turn of a conversation (process-internal; never serialized).
 #[derive(Debug, Clone, PartialEq)]
 pub struct HistoryTurn {
@@ -45,6 +55,9 @@ impl Default for PolicyRequest {
 pub struct TaskRequest {
     /// The instruction for the agent.
     pub task: String,
+    /// Further turns of the same conversation, run after `task`.
+    #[serde(default)]
+    pub followups: Vec<Followup>,
     /// Agent mode (default `browser`).
     #[serde(default = "default_mode")]
     pub mode: String,
@@ -154,6 +167,7 @@ impl TaskRequest {
         }
         Self {
             task,
+            followups: Vec::new(),
             mode: std::env::var("NEVOFLUX_TASK_MODE").unwrap_or_else(|_| default_mode()),
             profile: std::env::var("NEVOFLUX_TASK_PROFILE")
                 .ok()
@@ -250,6 +264,10 @@ pub struct TaskResponse {
     /// Per-turn LLM usage (M3); absent when no LLM call ran.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub usage: Vec<nevoflux_protocol::TurnUsage>,
+    /// Each turn's final text, when the task had follow-ups; `output` is the
+    /// last of them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub turn_outputs: Vec<String>,
 }
 
 #[cfg(test)]
@@ -368,6 +386,7 @@ mod tests {
             artifacts: vec![],
             session_id: None,
             usage: vec![],
+            turn_outputs: vec![],
         };
         let v = serde_json::to_value(&r).unwrap();
         assert!(v.get("session_id").is_none());
