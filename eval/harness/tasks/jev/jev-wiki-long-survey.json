@@ -1,0 +1,41 @@
+{
+ "id": "jev-wiki-long-survey",
+ "set": "jev",
+ "lang": "en",
+ "site": "wiki",
+ "task": "Go through these five pages and give me one key fact from each, labelled by page: {base}/en/Firefox.html, {base}/en/HTTP_cookie.html, {base}/en/Search_engine.html, {base}/en/Online_shopping.html, {base}/en/Wikipedia.html.",
+ "followups": [],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "Firefox",
+   "turn": -1
+  },
+  {
+   "type": "output_regex",
+   "pattern": "cookie",
+   "turn": -1
+  },
+  {
+   "type": "output_regex",
+   "pattern": "search engine",
+   "turn": -1
+  },
+  {
+   "type": "output_regex",
+   "pattern": "shopping",
+   "turn": -1
+  },
+  {
+   "type": "output_regex",
+   "pattern": "Wikipedia",
+   "turn": -1
+  }
+ ],
+ "tags": [
+  "jev",
+  "read",
+  "long"
+ ],
+ "timeout_secs": 600
+}

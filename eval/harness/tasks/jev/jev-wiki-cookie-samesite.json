@@ -1,0 +1,26 @@
+{
+ "id": "jev-wiki-cookie-samesite",
+ "set": "jev",
+ "lang": "en",
+ "site": "wiki",
+ "task": "Using {base}/en/HTTP_cookie.html, explain what the SameSite cookie attribute does and name its possible values.",
+ "followups": [],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "Strict",
+   "turn": -1
+  },
+  {
+   "type": "output_regex",
+   "pattern": "Lax",
+   "turn": -1
+  }
+ ],
+ "tags": [
+  "jev",
+  "read"
+ ],
+ "timeout_secs": 300,
+ "note": "en/HTTP_cookie: SameSite values Strict, Lax or None"
+}

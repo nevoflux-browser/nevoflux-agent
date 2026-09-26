@@ -1,0 +1,21 @@
+{
+ "id": "jev-shop-long-audit",
+ "set": "jev",
+ "lang": "en",
+ "site": "shop",
+ "task": "Check every product on {base}/search.html?q=a (all pages) and tell me how many have a rating below 3.",
+ "followups": [],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "\\b5\\b|five",
+   "turn": -1
+  }
+ ],
+ "tags": [
+  "jev",
+  "long"
+ ],
+ "timeout_secs": 600,
+ "note": "q=a hits 19; ratings < 3: K-4, M-3, M-6, H-3, P-4"
+}

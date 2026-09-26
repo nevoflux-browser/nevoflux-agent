@@ -1,0 +1,25 @@
+{
+ "id": "jev-wiki-rust-origin",
+ "set": "jev",
+ "lang": "en",
+ "site": "wiki",
+ "task": "From {base}/en/Rust_(programming_language).html: who created Rust and in what year did the project start?",
+ "followups": [],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "Graydon Hoare",
+   "turn": -1
+  },
+  {
+   "type": "output_regex",
+   "pattern": "2006",
+   "turn": -1
+  }
+ ],
+ "tags": [
+  "jev",
+  "read"
+ ],
+ "timeout_secs": 300
+}

@@ -1,0 +1,39 @@
+{
+ "id": "jev-shop-change-mind",
+ "set": "jev",
+ "lang": "en",
+ "site": "shop",
+ "task": "Add product M-1 to the cart on {base}/product.html?sku=M-1.",
+ "followups": [
+  {
+   "message": "Actually, replace it with M-2 and check out as \"Ada Lovelace\", \"1 Test Road\", express delivery.",
+   "delay_secs": 0
+  }
+ ],
+ "checks": [
+  {
+   "type": "event",
+   "kind": "cart_add",
+   "where": {
+    "sku": "M-2"
+   }
+  },
+  {
+   "type": "event",
+   "kind": "order",
+   "where": {
+    "sku_list": [
+     "M-2"
+    ],
+    "ship": "express"
+   }
+  }
+ ],
+ "tags": [
+  "jev",
+  "multi",
+  "write"
+ ],
+ "timeout_secs": 300,
+ "note": "order must contain only M-2"
+}

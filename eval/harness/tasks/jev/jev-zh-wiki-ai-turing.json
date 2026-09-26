@@ -1,0 +1,31 @@
+{
+ "id": "jev-zh-wiki-ai-turing",
+ "set": "jev",
+ "lang": "zh",
+ "site": "wiki",
+ "task": "读一下 {base}/zh/人工智能.html，图灵测试是谁提出的？",
+ "followups": [
+  {
+   "message": "他是在哪一年提出的？只根据刚才读到的内容回答。",
+   "delay_secs": 0
+  }
+ ],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "图灵",
+   "turn": 0
+  },
+  {
+   "type": "output_regex",
+   "pattern": "1950",
+   "turn": 1
+  }
+ ],
+ "tags": [
+  "jev",
+  "multi"
+ ],
+ "timeout_secs": 300,
+ "note": "zh/人工智能 '图灵则在1950年提出了…'"
+}

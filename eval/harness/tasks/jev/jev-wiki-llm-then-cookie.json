@@ -1,0 +1,26 @@
+{
+ "id": "jev-wiki-llm-then-cookie",
+ "set": "jev",
+ "lang": "en",
+ "site": "wiki",
+ "task": "Summarise {base}/en/Large_language_model.html in three sentences.",
+ "followups": [
+  {
+   "message": "Now read {base}/en/HTTP_cookie.html. Why are third-party cookies considered a problem?",
+   "delay_secs": 0
+  }
+ ],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "privacy|track",
+   "turn": 1
+  }
+ ],
+ "tags": [
+  "jev",
+  "multi"
+ ],
+ "timeout_secs": 300,
+ "note": "en/HTTP_cookie: 'third-party cookies as a considerable privacy threat'"
+}

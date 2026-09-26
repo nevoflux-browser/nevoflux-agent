@@ -1,0 +1,34 @@
+{
+ "id": "jev-mixed-wiki-shop",
+ "set": "jev",
+ "lang": "en",
+ "site": "shop",
+ "task": "Read {root}/wiki/en/Online_shopping.html and tell me one risk of online shopping it mentions.",
+ "followups": [
+  {
+   "message": "Then on {base}/index.html add the cheapest product in the shop to the cart.",
+   "delay_secs": 0
+  }
+ ],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "fraud|security|privacy|scam",
+   "turn": 0
+  },
+  {
+   "type": "event",
+   "kind": "cart_add",
+   "where": {
+    "sku": "P-1"
+   }
+  }
+ ],
+ "tags": [
+  "jev",
+  "multi",
+  "write"
+ ],
+ "timeout_secs": 300,
+ "note": "cheapest product P-1 Quill Mouse Pad $12.00"
+}

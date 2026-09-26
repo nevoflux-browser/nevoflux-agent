@@ -1,0 +1,21 @@
+{
+ "id": "jev-zh-wiki-rail",
+ "set": "jev",
+ "lang": "zh",
+ "site": "wiki",
+ "task": "阅读 {base}/zh/高速铁路.html，中国第一条时速 350 公里的高速铁路是哪条？",
+ "followups": [],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "京津",
+   "turn": -1
+  }
+ ],
+ "tags": [
+  "jev",
+  "read"
+ ],
+ "timeout_secs": 300,
+ "note": "zh/高速铁路 京津城际"
+}

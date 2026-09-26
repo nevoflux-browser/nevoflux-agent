@@ -1,0 +1,42 @@
+{
+ "id": "jev-flights-followup",
+ "set": "jev",
+ "lang": "en",
+ "site": "flights",
+ "task": "Search flights from Shanghai to Singapore on 2026-10-09 on {base}/index.html and list the three cheapest.",
+ "followups": [
+  {
+   "message": "Which of those three is a direct flight?",
+   "delay_secs": 360
+  }
+ ],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "NF640",
+   "turn": 0
+  },
+  {
+   "type": "output_regex",
+   "pattern": "NF752",
+   "turn": 0
+  },
+  {
+   "type": "output_regex",
+   "pattern": "NF866",
+   "turn": 0
+  },
+  {
+   "type": "output_regex",
+   "pattern": "NF752",
+   "turn": 1
+  }
+ ],
+ "tags": [
+  "jev",
+  "multi",
+  "ttl"
+ ],
+ "timeout_secs": 300,
+ "note": "three cheapest NF640/NF752/NF866; only NF752 is direct"
+}

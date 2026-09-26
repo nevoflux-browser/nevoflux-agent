@@ -1,0 +1,38 @@
+{
+ "id": "jev-shop-then-buy",
+ "set": "jev",
+ "lang": "en",
+ "site": "shop",
+ "task": "Find the highest-rated keyboard on {base}/index.html.",
+ "followups": [
+  {
+   "message": "Buy it with name \"Ada Lovelace\", address \"1 Test Road\" and standard delivery.",
+   "delay_secs": 0
+  }
+ ],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "Fjord",
+   "turn": 0
+  },
+  {
+   "type": "event",
+   "kind": "order",
+   "where": {
+    "name": "Ada Lovelace",
+    "ship": "standard",
+    "sku_list": [
+     "K-6"
+    ]
+   }
+  }
+ ],
+ "tags": [
+  "jev",
+  "multi",
+  "write"
+ ],
+ "timeout_secs": 300,
+ "note": "K-6 Fjord Compact Keyboard, rating 4.8"
+}

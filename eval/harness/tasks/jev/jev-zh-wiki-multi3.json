@@ -1,0 +1,35 @@
+{
+ "id": "jev-zh-wiki-multi3",
+ "set": "jev",
+ "lang": "zh",
+ "site": "wiki",
+ "task": "读 {base}/zh/大型语言模型.html，大型语言模型通常基于什么神经网络架构？",
+ "followups": [
+  {
+   "message": "再读 {base}/zh/搜索引擎.html，用一句话说说它和大型语言模型有什么关系。",
+   "delay_secs": 0
+  },
+  {
+   "message": "第一个问题里你说的那个架构叫什么？",
+   "delay_secs": 0
+  }
+ ],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "Transformer",
+   "turn": 0
+  },
+  {
+   "type": "output_regex",
+   "pattern": "Transformer",
+   "turn": 2
+  }
+ ],
+ "tags": [
+  "jev",
+  "multi"
+ ],
+ "timeout_secs": 300,
+ "note": "zh/大型语言模型 提到 Transformer"
+}

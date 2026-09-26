@@ -47,5 +47,15 @@ class BodyTest(unittest.TestCase):
         self.assertGreaterEqual(body["wall_clock_secs"], 900)
 
 
+class RenderTest(unittest.TestCase):
+    def test_render_root_placeholder(self):
+        from eval.harness.taskspec import render
+        s = TaskSpec(id="a", set="jev", lang="en", site="shop", task="{root}/wiki/en/x.html then {base}/index.html",
+                     followups=[{"message": "{base}/cart.html"}], checks=[{"type": "no_event", "kind": "k"}], tags=[])
+        r = render(s, "http://127.0.0.1:9/shop")
+        self.assertEqual(r.task, "http://127.0.0.1:9/wiki/en/x.html then http://127.0.0.1:9/shop/index.html")
+        self.assertEqual(r.followups[0]["message"], "http://127.0.0.1:9/shop/cart.html")
+
+
 if __name__ == "__main__":
     unittest.main()

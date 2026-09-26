@@ -1,0 +1,21 @@
+{
+ "id": "jev-zh-shop-long",
+ "set": "jev",
+ "lang": "zh",
+ "site": "zh-shop",
+ "task": "把 {base}/search.html?q=键 所有页的商品都看一遍，统计评价数超过 100 条的有几个。",
+ "followups": [],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "\\b5\\b|五",
+   "turn": -1
+  }
+ ],
+ "tags": [
+  "jev",
+  "long"
+ ],
+ "timeout_secs": 600,
+ "note": "q=键 命中 9 个；评价 >100：Z-1、Z-2、Z-4、Z-5、Z-7"
+}

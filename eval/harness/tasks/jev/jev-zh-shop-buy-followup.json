@@ -1,0 +1,38 @@
+{
+ "id": "jev-zh-shop-buy-followup",
+ "set": "jev",
+ "lang": "zh",
+ "site": "zh-shop",
+ "task": "在 {base}/search.html?q=键盘 里找评分最高的键盘。",
+ "followups": [
+  {
+   "message": "就买它，收货人“李雷”，地址“测试路1号”，普通配送。",
+   "delay_secs": 0
+  }
+ ],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "静音",
+   "turn": 0
+  },
+  {
+   "type": "event",
+   "kind": "order",
+   "where": {
+    "name": "李雷",
+    "ship": "standard",
+    "sku_list": [
+     "Z-4"
+    ]
+   }
+  }
+ ],
+ "tags": [
+  "jev",
+  "multi",
+  "write"
+ ],
+ "timeout_secs": 300,
+ "note": "Z-4 静音机械键盘 68键 评分 4.8"
+}

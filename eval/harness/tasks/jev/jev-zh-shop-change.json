@@ -1,0 +1,39 @@
+{
+ "id": "jev-zh-shop-change",
+ "set": "jev",
+ "lang": "zh",
+ "site": "zh-shop",
+ "task": "把 {base}/product.html?sku=Z-1 加入购物车。",
+ "followups": [
+  {
+   "message": "换成 Z-2（先把 Z-1 去掉），然后用“李雷”、“测试路1号”、快递配送结账。",
+   "delay_secs": 360
+  }
+ ],
+ "checks": [
+  {
+   "type": "event",
+   "kind": "cart_add",
+   "where": {
+    "sku": "Z-2"
+   }
+  },
+  {
+   "type": "event",
+   "kind": "order",
+   "where": {
+    "ship": "express",
+    "sku_list": [
+     "Z-2"
+    ]
+   }
+  }
+ ],
+ "tags": [
+  "jev",
+  "multi",
+  "ttl",
+  "write"
+ ],
+ "timeout_secs": 300
+}

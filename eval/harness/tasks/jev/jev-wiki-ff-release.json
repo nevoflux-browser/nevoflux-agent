@@ -1,0 +1,21 @@
+{
+ "id": "jev-wiki-ff-release",
+ "set": "jev",
+ "lang": "en",
+ "site": "wiki",
+ "task": "Read {base}/en/Firefox.html. When was Firefox 1.0 released?",
+ "followups": [],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "November 9, 2004|9 November 2004",
+   "turn": -1
+  }
+ ],
+ "tags": [
+  "jev",
+  "read"
+ ],
+ "timeout_secs": 300,
+ "note": "en/Firefox: 'Version 1.0 of Firefox was released on November 9, 2004'"
+}

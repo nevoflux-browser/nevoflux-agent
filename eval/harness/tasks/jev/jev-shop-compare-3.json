@@ -1,0 +1,21 @@
+{
+ "id": "jev-shop-compare-3",
+ "set": "jev",
+ "lang": "en",
+ "site": "shop",
+ "task": "Open products K-1, K-2 and K-3 ({base}/product.html?sku=K-1 and so on) and tell me which has the longest warranty.",
+ "followups": [],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "Cobalt",
+   "turn": -1
+  }
+ ],
+ "tags": [
+  "jev",
+  "read"
+ ],
+ "timeout_secs": 300,
+ "note": "K-3 Cobalt 60% Keyboard has 36 months (shop/data.js)"
+}

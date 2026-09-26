@@ -54,7 +54,9 @@ def load_dir(directory) -> list:
 
 
 def render(spec: TaskSpec, base_url: str) -> TaskSpec:
-    sub = lambda s: s.replace("{base}", base_url.rstrip("/"))
+    """`{base}` = the task's site root; `{root}` = the server root (other sites)."""
+    root = base_url.rstrip("/").rsplit("/", 1)[0]
+    sub = lambda s: s.replace("{base}", base_url.rstrip("/")).replace("{root}", root)
     return dataclasses.replace(
         spec, task=sub(spec.task),
         followups=[{**f, "message": sub(f["message"])} for f in spec.followups])

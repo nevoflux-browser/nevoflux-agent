@@ -1,0 +1,22 @@
+{
+ "id": "jev-msg-summary-send",
+ "set": "jev",
+ "lang": "en",
+ "site": "messenger",
+ "task": "Read {root}/wiki/en/Firefox.html and send Zhang San a one-line summary of it on {base}/index.html.",
+ "followups": [],
+ "checks": [
+  {
+   "type": "event",
+   "kind": "msg_send",
+   "where": {
+    "to": "Zhang San"
+   }
+  }
+ ],
+ "tags": [
+  "jev",
+  "write"
+ ],
+ "timeout_secs": 300
+}
