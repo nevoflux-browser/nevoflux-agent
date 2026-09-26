@@ -249,6 +249,7 @@ pub fn build_headless_runner(
                     error: outcome.error,
                     artifacts: crate::http::artifacts::list_artifacts(&artifacts_dir),
                     session_id: outcome.session_id.clone(),
+                    usage: outcome.usage.clone(),
                 }
             })
         },

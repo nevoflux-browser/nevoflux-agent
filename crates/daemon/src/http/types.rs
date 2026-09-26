@@ -247,6 +247,9 @@ pub struct TaskResponse {
     /// Session id of the (last) attempt, for `session export`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Per-turn LLM usage (M3); absent when no LLM call ran.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub usage: Vec<nevoflux_protocol::TurnUsage>,
 }
 
 #[cfg(test)]
@@ -364,11 +367,40 @@ mod tests {
             error: None,
             artifacts: vec![],
             session_id: None,
+            usage: vec![],
         };
         let v = serde_json::to_value(&r).unwrap();
         assert!(v.get("session_id").is_none());
         r.session_id = Some("automation-task-1-1".into());
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["session_id"], "automation-task-1-1");
+    }
+
+    #[test]
+    fn task_response_carries_per_turn_usage() {
+        let usage = nevoflux_protocol::TurnUsage {
+            main: nevoflux_protocol::UsageBucket {
+                input: 1200,
+                output: 80,
+                calls: 3,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let r = TaskResponse {
+            id: "task-1".into(),
+            status: TaskStatus::Succeeded,
+            attempts: 1,
+            usage: vec![usage],
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["usage"][0]["main"]["input"], 1200);
+        assert_eq!(v["usage"][0]["main"]["calls"], 3);
+        let empty = serde_json::to_value(TaskResponse::default()).unwrap();
+        assert!(
+            empty.get("usage").is_none(),
+            "no usage key when nothing ran"
+        );
     }
 }

@@ -68,6 +68,8 @@ pub struct AttemptOutcome {
     pub error: Option<String>,
     /// Session id the attempt ran under (what `session export` takes).
     pub session_id: Option<String>,
+    /// Per-turn LLM accounting (M3); one entry per turn that called the LLM.
+    pub usage: Vec<nevoflux_protocol::TurnUsage>,
 }
 
 /// Terminal result of a task after retries.
@@ -83,6 +85,8 @@ pub struct SessionOutcome {
     pub error: Option<String>,
     /// Session id of the last attempt.
     pub session_id: Option<String>,
+    /// Per-turn usage of the last attempt.
+    pub usage: Vec<nevoflux_protocol::TurnUsage>,
 }
 
 /// Session id for one attempt of one headless task. Carries the task id so
@@ -114,6 +118,7 @@ where
                 output: outcome.output,
                 error: None,
                 session_id: outcome.session_id,
+                usage: outcome.usage,
             };
         }
         if retry_decision(attempt, outcome.tainted, policy) {
@@ -125,6 +130,7 @@ where
             output: outcome.output,
             error: outcome.error,
             session_id: outcome.session_id,
+            usage: outcome.usage,
         };
     }
 }
@@ -187,9 +193,13 @@ pub async fn execute_task_attempt(
 
     // Own session state for the same reason a chat gets one: this is a task,
     // and the template's copy is shared by the whole process.
+    // Per-turn accounting (M3): the same TurnStats the sidebar uses, so a
+    // headless trial reports usage the way a chat reply does.
+    let turn_stats = crate::turn_stats::TurnStats::new();
     let host = DaemonHostFunctions::new(agent_config, runtime_handle)
         .with_services(services.with_own_session_state())
-        .with_session_id(session_id.clone());
+        .with_session_id(session_id.clone())
+        .with_turn_stats(turn_stats.clone());
     let agent = nevoflux_builtin_wasm::Agent::new(host);
 
     let mode_tools: Vec<String> = agent
@@ -237,7 +247,7 @@ pub async fn execute_task_attempt(
     // `Agent::run` is synchronous (host fns block on the stashed runtime handle
     // for async LLM calls); wrap in spawn_blocking to not hog the executor.
     let outcome = tokio::task::spawn_blocking(move || agent.run(&input)).await;
-    match outcome {
+    let mut result = match outcome {
         Ok(Ok(out)) => {
             let tainted = out
                 .tool_calls
@@ -265,7 +275,10 @@ pub async fn execute_task_attempt(
             error: Some(format!("agent task panicked: {e}")),
             ..Default::default()
         },
-    }
+    };
+    // Failed attempts cost money too, so usage is kept either way.
+    result.usage = turn_stats.snapshot().into_iter().collect();
+    result
 }
 
 /// Headless fixed-script execution (Q16): run the user's Python `run(task)` via

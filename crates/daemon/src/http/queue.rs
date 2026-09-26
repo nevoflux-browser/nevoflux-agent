@@ -45,6 +45,7 @@ fn queued(id: &str) -> TaskResponse {
         error: None,
         artifacts: Vec::new(),
         session_id: None,
+        usage: Vec::new(),
     }
 }
 
