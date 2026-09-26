@@ -1,5 +1,7 @@
 import pathlib
 import re
+import shutil
+import subprocess
 import unittest
 
 SITES = pathlib.Path(__file__).resolve().parents[1] / "sites"
@@ -39,6 +41,12 @@ class SitesTest(unittest.TestCase):
     def test_wiki_has_both_languages(self):
         self.assertTrue(list((SITES / "wiki" / "en").glob("*.html")))
         self.assertTrue(list((SITES / "wiki" / "zh").glob("*.html")))
+
+    @unittest.skipUnless(shutil.which("node"), "node not installed")
+    def test_shop_pages_render_without_throwing(self):
+        r = subprocess.run(["node", str(pathlib.Path(__file__).with_name("shop_render.js"))],
+                           capture_output=True, text=True, encoding="utf-8")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
 
 if __name__ == "__main__":

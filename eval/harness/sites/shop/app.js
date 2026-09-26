@@ -25,7 +25,7 @@
   function productRow(p) {
     return el("li", {},
       el("a", { href: "product.html?sku=" + encodeURIComponent(p.sku) }, p.name),
-      " — " + money(p) + " · " + L.rating + " " + p.rating + " (" + p.reviews + " " + L.reviews + ")");
+      " — " + money(p.price) + " · " + L.rating + " " + p.rating + " (" + p.reviews + " " + L.reviews + ")");
   }
 
   function searchBox(q) {
@@ -81,7 +81,7 @@
         status.textContent = L.added;
         nfEvent(SITE, "cart_add", { sku: p.sku, qty: n });
       });
-      main.append(el("h1", {}, p.name), el("p", { id: "price" }, money(p)),
+      main.append(el("h1", {}, p.name), el("p", { id: "price" }, money(p.price)),
         el("p", {}, L.rating + " " + p.rating + " (" + p.reviews + " " + L.reviews + ")"),
         el("p", {}, L.warranty + ": " + p.warranty + " " + L.months),
         el("label", {}, L.qty + " ", qty), " ", add, status,
