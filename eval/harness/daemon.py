@@ -3,6 +3,7 @@
 import json
 import os
 import pathlib
+import re
 import socket
 import subprocess
 import time
@@ -18,6 +19,21 @@ def free_port() -> int:
     port = s.getsockname()[1]
     s.close()
     return port
+
+
+_LOADED = re.compile(r'Loaded agent config: llm\.provider=Some\("([^"]*)"\)')
+_SERVICES = re.compile(r"LLM config set on services: provider=[^,]*, model=(\S+)")
+_LOAD_FAILED = re.compile(r"Failed to load agent config: (.*)")
+
+
+def parse_effective_config(log_text: str) -> dict:
+    """What the daemon actually loaded, read from its log: an override that
+    did not take would otherwise run the trial on the wrong provider silently."""
+    strip = re.sub(r"\x1b\[[0-9;]*m", "", log_text)
+    loaded, services, failed = _LOADED.search(strip), _SERVICES.search(strip), _LOAD_FAILED.search(strip)
+    return {"provider": loaded.group(1) if loaded else None,
+            "model": services.group(1) if services else None,
+            "load_error": failed.group(1).strip() if failed else None}
 
 
 def poll(get, timeout_secs, interval=2.0, clock=time.monotonic, sleep=time.sleep):
@@ -68,7 +84,7 @@ class Daemon:
         self.proc = subprocess.Popen(
             [str(self.exe), "--daemon", "--headless", "--http-addr", f"127.0.0.1:{self.port}",
              "--port", str(self.internal_port)],
-            env=self.env, stdout=self._log, stderr=subprocess.STDOUT,
+            env=self.env, stdout=self._log, stderr=subprocess.STDOUT, cwd=str(self.dir),
             creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
         deadline = time.monotonic() + ready_timeout
         while time.monotonic() < deadline:
@@ -80,6 +96,17 @@ class Daemon:
             except (urllib.error.URLError, ConnectionError, TimeoutError):
                 time.sleep(0.5)
         raise RuntimeError(f"daemon not ready in {ready_timeout}s; see {self.dir}")
+
+    def effective_config(self, wait_secs=10) -> dict:
+        """Parse the loaded provider/model from the log (it lands shortly after start)."""
+        deadline = time.monotonic() + wait_secs
+        while True:
+            self._log.flush()
+            eff = parse_effective_config(
+                (self.dir / "daemon.stdout.log").read_text(encoding="utf-8", errors="replace"))
+            if eff["load_error"] or (eff["provider"] and eff["model"]) or time.monotonic() > deadline:
+                return eff
+            time.sleep(0.5)
 
     def submit(self, body) -> str:
         return self._req("POST", "/tasks", body)["id"]

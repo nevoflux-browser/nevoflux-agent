@@ -76,5 +76,33 @@ class StatusTest(unittest.TestCase):
         self.assertEqual(classify_status({"status": "failed", "output": "no"}, timed_out=False), "failed")
 
 
+class EffectiveConfigTest(unittest.TestCase):
+    LOG = (
+        '2026 INFO nevoflux_daemon::server: Loaded agent config: llm.provider=Some("anthropic")\n'
+        "2026 INFO nevoflux_daemon::server: LLM config set on services: provider=Anthropic, model=k3\n"
+    )
+
+    def test_parses_provider_and_model(self):
+        eff = daemon.parse_effective_config(self.LOG)
+        self.assertEqual((eff["provider"], eff["model"], eff["load_error"]), ("anthropic", "k3", None))
+
+    def test_detects_load_failure(self):
+        eff = daemon.parse_effective_config(
+            "ERROR nevoflux_daemon::server: Failed to load agent config: bad type, using defaults\n")
+        self.assertIn("bad type", eff["load_error"])
+
+    def test_override_mismatch_is_an_error(self):
+        from eval.harness.trial import check_effective
+        eff = daemon.parse_effective_config(self.LOG)
+        self.assertIsNone(check_effective({"llm.provider": "anthropic"}, eff))
+        self.assertIn("custom:x", check_effective({"llm.provider": "custom:x"}, eff))
+        self.assertIn("bad", check_effective({}, {"provider": None, "model": None, "load_error": "bad"}))
+
+    def test_set_parses_floats_and_bools(self):
+        from eval.harness.run import _parse_set
+        self.assertEqual(_parse_set(["a.t=0.2", "a.n=3", "a.b=true", "a.s=x"]),
+                         {"a.t": 0.2, "a.n": 3, "a.b": True, "a.s": "x"})
+
+
 if __name__ == "__main__":
     unittest.main()

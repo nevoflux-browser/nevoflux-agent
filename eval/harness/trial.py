@@ -39,6 +39,16 @@ def classify_status(last: dict, timed_out: bool) -> str:
     return last.get("status") or "unknown"
 
 
+def check_effective(overrides: dict, eff: dict):
+    """Error text if the daemon did not load what the trial asked for."""
+    if eff.get("load_error"):
+        return f"daemon fell back to default config: {eff['load_error']}"
+    want = overrides.get("llm.provider")
+    if want is not None and eff.get("provider") != want:
+        return f"asked for llm.provider={want}, daemon loaded {eff.get('provider')}"
+    return None
+
+
 def _delays(spec) -> int:
     return sum(int(f.get("delay_secs", 0)) for f in spec.followups)
 
@@ -70,6 +80,11 @@ def run_trial(spec, site, cfg: TrialConfig, trial_id: str) -> dict:
     row = {"trial": trial_id, "task_id": spec.id, "set": spec.set, "lang": spec.lang}
     try:
         d.start()
+        eff = d.effective_config()
+        row.update({"provider": eff["provider"], "model": eff["model"]})
+        problem = check_effective(cfg.overrides, eff)
+        if problem:
+            raise RuntimeError(problem)
         tid = d.submit(build_task_body(rendered))
         last, timed_out = dmod.poll(lambda: d.get(tid),
                                     timeout_secs=spec.timeout_secs + _delays(spec) + 60)

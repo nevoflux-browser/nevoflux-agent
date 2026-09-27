@@ -28,7 +28,17 @@ def _parse_set(items):
     for it in items or []:
         k, _, v = it.partition("=")
         low = v.lower()
-        out[k] = True if low == "true" else False if low == "false" else int(v) if v.isdigit() else v
+        if low in ("true", "false"):
+            out[k] = low == "true"
+            continue
+        for cast in (int, float):
+            try:
+                out[k] = cast(v)
+                break
+            except ValueError:
+                pass
+        else:
+            out[k] = v
     return out
 
 
