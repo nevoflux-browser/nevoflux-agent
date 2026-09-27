@@ -3,17 +3,17 @@
  "set": "jev",
  "lang": "zh",
  "site": "zh-shop",
- "task": "在 {base}/index.html 找出所有机械键盘里最便宜的，告诉我名字和价格。",
+ "task": "在 {base}/index.html 找出所有机械键盘里最便宜的，告诉我名字和价格。 回答的最后单独一行写成“答案：<商品名> <价格>”。",
  "followups": [],
  "checks": [
   {
    "type": "output_regex",
-   "pattern": "矮轴",
+   "pattern": "答案[:：]\\s*矮轴",
    "turn": -1
   },
   {
    "type": "output_regex",
-   "pattern": "239",
+   "pattern": "答案[:：][^\\n]*239",
    "turn": -1
   }
  ],

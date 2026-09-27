@@ -6,7 +6,7 @@
  "task": "Search flights from Shanghai to Singapore on 2026-10-09 on {base}/index.html and list the three cheapest.",
  "followups": [
   {
-   "message": "Which of those three is a direct flight?",
+   "message": "Which of those three is a direct flight? End your reply with a final line in the form 'ANSWER: <flight number>'.",
    "delay_secs": 360
   }
  ],
@@ -28,7 +28,7 @@
   },
   {
    "type": "output_regex",
-   "pattern": "NF752",
+   "pattern": "ANSWER:\\s*NF752\\b",
    "turn": 1
   }
  ],

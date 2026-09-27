@@ -3,12 +3,12 @@
  "set": "jev",
  "lang": "en",
  "site": "shop",
- "task": "Open products K-1, K-2 and K-3 ({base}/product.html?sku=K-1 and so on) and tell me which has the longest warranty.",
+ "task": "Open products K-1, K-2 and K-3 ({base}/product.html?sku=K-1 and so on) and tell me which has the longest warranty. End your reply with a final line in the form 'ANSWER: <product name>'.",
  "followups": [],
  "checks": [
   {
    "type": "output_regex",
-   "pattern": "Cobalt",
+   "pattern": "ANSWER:\\s*Cobalt",
    "turn": -1
   }
  ],

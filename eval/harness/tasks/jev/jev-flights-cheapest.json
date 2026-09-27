@@ -3,12 +3,12 @@
  "set": "jev",
  "lang": "en",
  "site": "flights",
- "task": "On {base}/index.html find the cheapest direct flight from Shanghai to Singapore on 2026-10-09. Check every result page.",
+ "task": "On {base}/index.html find the cheapest direct flight from Shanghai to Singapore on 2026-10-09. Check every result page. End your reply with a final line in the form 'ANSWER: <flight number>'.",
  "followups": [],
  "checks": [
   {
    "type": "output_regex",
-   "pattern": "NF752",
+   "pattern": "ANSWER:\\s*NF752\\b",
    "turn": -1
   }
  ],

@@ -13,7 +13,7 @@
   },
   {
    "type": "output_regex",
-   "pattern": "paid",
+   "pattern": "(?<!not )(?<!un)\\bpaid\\b",
    "turn": -1
   }
  ],

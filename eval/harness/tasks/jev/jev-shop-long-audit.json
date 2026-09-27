@@ -3,12 +3,12 @@
  "set": "jev",
  "lang": "en",
  "site": "shop",
- "task": "Check every product on {base}/search.html?q=a (all pages) and tell me how many have a rating below 3.",
+ "task": "Check every product on {base}/search.html?q=a (all pages) and tell me how many have a rating below 3. End your reply with a final line in the form 'ANSWER: <number>'.",
  "followups": [],
  "checks": [
   {
    "type": "output_regex",
-   "pattern": "\\b5\\b|five",
+   "pattern": "ANSWER:\\s*5\\b",
    "turn": -1
   }
  ],
