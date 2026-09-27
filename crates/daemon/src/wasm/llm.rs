@@ -2002,6 +2002,7 @@ where
     // For multi-turn with multimodal content, we keep all messages in chat_history and use
     // the text from the last user message as prompt. Some API providers return empty responses
     // when a multimodal message is passed directly as the prompt in multi-turn conversations.
+    let chat_history = regroup_tool_images(chat_history, provider == ProviderType::Anthropic);
     let (prompt_message, chat_history) = split_prompt(chat_history);
 
     // Build the completion request using the builder pattern
@@ -2151,6 +2152,72 @@ fn merge_consecutive_same_role_messages(messages: Vec<Message>) -> Vec<Message> 
     }
 
     merged
+}
+
+/// Put the images that tool results carry (screenshots) after the last tool
+/// result of each run of tool-result turns.
+///
+/// A turn that called several tools gets one tool-result turn per call. If an
+/// image sits between them — inline after the first `tool_result`
+/// (Anthropic) or as its own user message (other wires) — the endpoint sees
+/// a tool call that is not answered before other content and rejects the
+/// request with 400. With `inline` the images join the last tool-result turn
+/// (Anthropic allows content after the tool_result blocks); otherwise they
+/// follow the run as one image-only user message.
+fn regroup_tool_images(history: Vec<Message>, inline: bool) -> Vec<Message> {
+    fn has_tool_result(m: &Message) -> bool {
+        matches!(m, Message::User { content } if content.iter().any(|c| matches!(c, UserContent::ToolResult(_))))
+    }
+    fn image_only(m: &Message) -> bool {
+        matches!(m, Message::User { content } if content.iter().all(|c| matches!(c, UserContent::Image(_))))
+    }
+    fn flush(
+        out: &mut Vec<Message>,
+        run: &mut Vec<Message>,
+        images: &mut Vec<UserContent>,
+        inline: bool,
+    ) {
+        if images.is_empty() {
+            out.append(run);
+            return;
+        }
+        let imgs = std::mem::take(images);
+        if inline {
+            if let Some(Message::User { content }) = run.last_mut() {
+                let mut blocks: Vec<UserContent> = content.clone().into_iter().collect();
+                blocks.extend(imgs);
+                *content = OneOrMany::many(blocks).expect("non-empty");
+            }
+            out.append(run);
+        } else {
+            out.append(run);
+            out.push(Message::User {
+                content: OneOrMany::many(imgs).expect("non-empty"),
+            });
+        }
+    }
+
+    let mut out = Vec::with_capacity(history.len());
+    let mut run: Vec<Message> = Vec::new();
+    let mut images: Vec<UserContent> = Vec::new();
+    for m in history {
+        if has_tool_result(&m) || (!run.is_empty() && image_only(&m)) {
+            if let Message::User { content } = m {
+                let (imgs, rest): (Vec<UserContent>, Vec<UserContent>) = content
+                    .into_iter()
+                    .partition(|c| matches!(c, UserContent::Image(_)));
+                images.extend(imgs);
+                if let Ok(rest) = OneOrMany::many(rest) {
+                    run.push(Message::User { content: rest });
+                }
+            }
+        } else {
+            flush(&mut out, &mut run, &mut images, inline);
+            out.push(m);
+        }
+    }
+    flush(&mut out, &mut run, &mut images, inline);
+    out
 }
 
 /// Split a converted conversation into (prompt, history) for rig, which
@@ -5810,6 +5877,7 @@ where
         chat_history.len()
     );
 
+    let chat_history = regroup_tool_images(chat_history, provider == ProviderType::Anthropic);
     let (prompt_message, chat_history) = split_prompt(chat_history);
 
     tracing::info!("Final: chat_history_len={}", chat_history.len());
@@ -6235,6 +6303,135 @@ mod tests {
         let (prompt, rest) = super::split_prompt(history);
         assert_eq!(rest.len(), 3);
         assert_eq!(prompt, Message::from("what is this?"));
+    }
+
+    fn tool_call_turn(ids: &[&str]) -> rig::completion::message::Message {
+        use rig::completion::message::{AssistantContent, Message};
+        Message::Assistant {
+            id: None,
+            content: rig::OneOrMany::many(
+                ids.iter()
+                    .map(|i| AssistantContent::tool_call(*i, "t", serde_json::json!({})))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+        }
+    }
+
+    fn tool_result_turn(id: &str) -> rig::completion::message::Message {
+        use rig::completion::message::{Message, ToolResult, ToolResultContent, UserContent};
+        Message::User {
+            content: rig::OneOrMany::one(UserContent::ToolResult(ToolResult {
+                id: id.into(),
+                call_id: Some(id.into()),
+                content: rig::OneOrMany::one(ToolResultContent::text("{}")),
+            })),
+        }
+    }
+
+    fn image_turn() -> rig::completion::message::Message {
+        use rig::completion::message::{DocumentSourceKind, Image, Message, UserContent};
+        Message::User {
+            content: rig::OneOrMany::one(UserContent::Image(Image {
+                data: DocumentSourceKind::Base64("AAAA".into()),
+                media_type: None,
+                detail: None,
+                additional_params: None,
+            })),
+        }
+    }
+
+    /// Shape of each message: which kinds of blocks it carries, in order.
+    fn shapes(history: &[rig::completion::message::Message]) -> Vec<Vec<&'static str>> {
+        use rig::completion::message::{Message, UserContent};
+        history
+            .iter()
+            .map(|m| match m {
+                Message::Assistant { .. } => vec!["assistant"],
+                Message::User { content } => content
+                    .iter()
+                    .map(|c| match c {
+                        UserContent::ToolResult(_) => "tool_result",
+                        UserContent::Image(_) => "image",
+                        UserContent::Text(_) => "text",
+                        _ => "other",
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// Several tool calls in one turn, the first a screenshot: every
+    /// tool_result must come before the image, or the endpoint rejects the
+    /// request ("an assistant message with tool_calls must be followed by
+    /// tool messages responding to each tool_call_id").
+    #[test]
+    fn tool_images_move_after_the_last_tool_result_anthropic() {
+        let history = vec![
+            tool_call_turn(&["t1", "t2"]),
+            super::anthropic_tool_result_with_image(
+                "t1".into(),
+                "{}",
+                "AAAA".into(),
+                rig::completion::message::ImageMediaType::PNG,
+            ),
+            tool_result_turn("t2"),
+        ];
+        let out = super::regroup_tool_images(history, true);
+        assert_eq!(
+            shapes(&out),
+            vec![
+                vec!["assistant"],
+                vec!["tool_result"],
+                vec!["tool_result", "image"]
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_images_move_after_the_last_tool_result_openai() {
+        let history = vec![
+            tool_call_turn(&["t1", "t2"]),
+            tool_result_turn("t1"),
+            image_turn(),
+            tool_result_turn("t2"),
+        ];
+        let out = super::regroup_tool_images(history, false);
+        assert_eq!(
+            shapes(&out),
+            vec![
+                vec!["assistant"],
+                vec!["tool_result"],
+                vec!["tool_result"],
+                vec!["image"]
+            ]
+        );
+    }
+
+    #[test]
+    fn single_tool_image_layout_is_unchanged() {
+        let anthropic = vec![
+            tool_call_turn(&["t1"]),
+            super::anthropic_tool_result_with_image(
+                "t1".into(),
+                "{}",
+                "AAAA".into(),
+                rig::completion::message::ImageMediaType::PNG,
+            ),
+        ];
+        assert_eq!(
+            shapes(&super::regroup_tool_images(anthropic, true)),
+            vec![vec!["assistant"], vec!["tool_result", "image"]]
+        );
+        let openai = vec![
+            tool_call_turn(&["t1"]),
+            tool_result_turn("t1"),
+            image_turn(),
+        ];
+        assert_eq!(
+            shapes(&super::regroup_tool_images(openai, false)),
+            vec![vec!["assistant"], vec!["tool_result"], vec!["image"]]
+        );
     }
 
     /// The ACP bridge must not offer tools only the built-in agent can run.
