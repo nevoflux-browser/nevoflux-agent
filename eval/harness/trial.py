@@ -87,6 +87,7 @@ def run_trial(spec, site, cfg: TrialConfig, trial_id: str) -> dict:
             "checks": g["checks"], "turn_outputs": result["turn_outputs"],
             "output": result["output"], "error": last.get("error"),
             "usage": last.get("usage") or [], "session_id": sid,
+            "events": result["events"],
             "session_jsonl": (jsonl.read_text(encoding="utf-8") if exported else None),
         })
     except Exception as e:  # a broken trial scores 0 and keeps its directory
