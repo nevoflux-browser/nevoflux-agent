@@ -30,6 +30,12 @@ class CalibrateTest(unittest.TestCase):
         self.assertEqual(s["cost"]["input"], 400)
         self.assertAlmostEqual(s["cost"]["estimated_share"], 0.5)
 
+    def test_resumed_runs_count_only_the_latest_row(self):
+        rows = [row(0, "a", False, status="provider_error"), row(0, "a", True)]
+        s = summarize(rows)
+        self.assertEqual(s["per_rep_score"], [1.0])
+        self.assertEqual(s["missing_rate"], 0.0)
+
     def test_provider_errors_count_as_missing(self):
         rows = [row(0, "a", False, status="provider_error")] + [row(0, str(i), True) for i in range(4)]
         s = summarize(rows)

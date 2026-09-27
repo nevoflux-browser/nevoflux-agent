@@ -1,0 +1,40 @@
+import unittest
+
+from eval.harness.run import latest_rows, plan_trials, should_stop
+from eval.harness.taskspec import TaskSpec
+
+
+def spec(i):
+    return TaskSpec(id=i, set="j20", lang="en", site="w", task="t", followups=[],
+                    checks=[{"type": "no_event", "kind": "k"}], tags=[])
+
+
+def row(rep, tid, status, ok=False):
+    return {"rep": rep, "task_id": tid, "status": status, "pass": ok}
+
+
+class ResumeTest(unittest.TestCase):
+    def test_plan_skips_real_results_and_reruns_missing_ones(self):
+        done = [row(0, "a", "succeeded", True), row(0, "b", "provider_error"),
+                row(1, "a", "failed")]
+        todo = [(rep, s.id) for rep, s in plan_trials([spec("a"), spec("b")], 2, done)]
+        # (0,a) and (1,a) have real results; (0,b) was a provider error; (1,b) never ran.
+        self.assertEqual(todo, [(0, "b"), (1, "b")])
+
+    def test_latest_row_wins(self):
+        rows = [row(0, "b", "provider_error"), row(0, "a", "succeeded", True),
+                row(0, "b", "succeeded", True)]
+        latest = latest_rows(rows)
+        self.assertEqual(len(latest), 2)
+        self.assertTrue(all(r["status"] == "succeeded" for r in latest))
+
+
+class StopTest(unittest.TestCase):
+    def test_stops_after_three_provider_errors_in_a_row(self):
+        self.assertFalse(should_stop(["succeeded", "provider_error", "provider_error"]))
+        self.assertTrue(should_stop(["succeeded", "provider_error", "provider_error", "provider_error"]))
+        self.assertFalse(should_stop(["provider_error", "provider_error", "failed"]))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -11,6 +11,11 @@ MISSING = {"harness_error", "timeout", "provider_error"}
 
 
 def summarize(rows) -> dict:
+    # A resumed run re-runs missing trials; only the latest row per trial counts.
+    latest = {}
+    for r in rows:
+        latest[(r["rep"], r["task_id"])] = r
+    rows = list(latest.values())
     reps = sorted({r["rep"] for r in rows})
     per_rep = [statistics.mean(1.0 if r["pass"] else 0.0 for r in rows if r["rep"] == k) for k in reps]
     ids = sorted({r["task_id"] for r in rows})
