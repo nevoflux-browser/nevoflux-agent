@@ -42,6 +42,14 @@ class SitesTest(unittest.TestCase):
         self.assertTrue(list((SITES / "wiki" / "en").glob("*.html")))
         self.assertTrue(list((SITES / "wiki" / "zh").glob("*.html")))
 
+    def test_harness_text_files_are_lf(self):
+        # The repo is LF; Python's write_text on Windows writes CRLF.
+        root = SITES.parent
+        exts = {".py", ".js", ".html", ".json", ".md", ".txt"}
+        crlf = [str(p.relative_to(root)) for p in root.rglob("*")
+                if p.suffix in exts and "__pycache__" not in p.parts and b"\r\n" in p.read_bytes()]
+        self.assertEqual(crlf, [])
+
     @unittest.skipUnless(shutil.which("node"), "node not installed")
     def test_shop_pages_render_without_throwing(self):
         r = subprocess.run(["node", str(pathlib.Path(__file__).with_name("shop_render.js"))],

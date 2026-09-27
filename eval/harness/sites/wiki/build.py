@@ -37,7 +37,7 @@ def main():
         lang, _, title = src.stem.partition("__")
         out = HERE / lang / f"{title}.html"
         out.parent.mkdir(exist_ok=True)
-        out.write_text(render(title, lang, src.read_text(encoding="utf-8")), encoding="utf-8")
+        out.write_bytes(render(title, lang, src.read_text(encoding="utf-8")).encode("utf-8"))
         print(out.relative_to(HERE))
 
 
