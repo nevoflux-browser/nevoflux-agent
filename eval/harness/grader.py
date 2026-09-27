@@ -43,9 +43,15 @@ def _check(c, result):
     raise ValueError(f"unknown check type {t}")
 
 
+# Statuses where the agent never got a fair run; their "output" is error text
+# that must not be allowed to satisfy an answer regex.
+MISSING = {"provider_error", "timeout", "harness_error"}
+
+
 def grade(spec, result) -> dict:
     rows = []
     for c in spec.checks:
         ok, why = _check(c, result)
         rows.append({"check": c, "ok": ok, "why": why})
-    return {"pass": all(r["ok"] for r in rows), "checks": rows}
+    passed = all(r["ok"] for r in rows) and result.get("status") not in MISSING
+    return {"pass": passed, "checks": rows}

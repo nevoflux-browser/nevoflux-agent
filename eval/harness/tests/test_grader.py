@@ -55,6 +55,14 @@ class GraderTest(unittest.TestCase):
                    "status": "succeeded", "trial": "t1"})
         self.assertTrue(r["pass"])
 
+    def test_missing_trial_never_passes(self):
+        # The quota error text "5-hour usage limit" matched a `\b5\b` answer regex.
+        for status in ("provider_error", "timeout", "harness_error"):
+            r = grade(spec([{"type": "output_regex", "pattern": r"\b5\b"}]),
+                      {"turn_outputs": [], "output": "You've reached your 5-hour usage limit",
+                       "events": [], "status": status})
+            self.assertFalse(r["pass"], status)
+
     def test_all_checks_must_pass(self):
         r = grade(spec([{"type": "output_regex", "pattern": "ok"}, {"type": "event", "kind": "order", "where": {}}]),
                   {"turn_outputs": [], "output": "ok", "events": [], "status": "succeeded"})
