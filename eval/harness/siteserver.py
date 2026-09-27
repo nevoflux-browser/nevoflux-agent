@@ -2,8 +2,11 @@
 
 Pages report what the agent did through /__event (see sites/_lib/beacon.js);
 the grader reads the log instead of scraping the page after the browser is
-gone. Events are scoped to the current trial so a late beacon from the
-previous trial can never count.
+gone. Each event is stamped with the trial that was current when its request
+arrived and events() only returns the current trial's. That keeps the slow
+endpoint's delayed event with the trial that triggered it; a beacon from a
+previous trial's browser that is still alive would still be stamped with the
+new trial, so trials must kill their browser before the next one starts.
 """
 
 import json
@@ -32,10 +35,14 @@ class SiteServer:
         with self._lock:
             return [e for e in self._events if e["trial"] == self._trial]
 
-    def _record(self, site: str, kind: str, data) -> None:
+    def current_trial(self) -> str:
         with self._lock:
-            self._events.append({"trial": self._trial, "ts": time.time(),
-                                 "site": site, "kind": kind, "data": data})
+            return self._trial
+
+    def _record(self, site: str, kind: str, data, trial=None) -> None:
+        with self._lock:
+            self._events.append({"trial": self._trial if trial is None else trial,
+                                 "ts": time.time(), "site": site, "kind": kind, "data": data})
 
     def _reset(self) -> None:
         with self._lock:
@@ -91,8 +98,9 @@ class SiteServer:
                     return self._json(200, server.events())
                 if u.path == "/__slow":
                     q = urllib.parse.parse_qs(u.query)
+                    trial = server.current_trial()  # the trial that sent it, not the one current later
                     time.sleep(int(q.get("ms", ["1000"])[0]) / 1000)
-                    server._record(q.get("site", [""])[0], q.get("kind", ["slow"])[0], {})
+                    server._record(q.get("site", [""])[0], q.get("kind", ["slow"])[0], {}, trial)
                     return self._json(200, {"ok": True})
                 return super().do_GET()
 

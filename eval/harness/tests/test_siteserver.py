@@ -49,6 +49,18 @@ class SiteServerTest(unittest.TestCase):
         self.s.set_trial("t2")
         self.assertEqual(self.s.events(), [])
 
+    def test_slow_event_belongs_to_the_trial_that_sent_it(self):
+        import threading
+        t = threading.Thread(target=lambda: urllib.request.urlopen(
+            f"{self.base}/__slow?ms=400&kind=pay_done&site=w", timeout=5).read())
+        t.start()
+        time.sleep(0.1)
+        self.s.set_trial("t2")  # the next trial starts while the request is in flight
+        t.join()
+        self.assertEqual(self.s.events(), [], "late event leaked into the next trial")
+        self.s.set_trial("t1")
+        self.assertEqual([e["kind"] for e in self.s.events()], ["pay_done"])
+
     def test_slow_endpoint_delays_then_records(self):
         t0 = time.perf_counter()
         urllib.request.urlopen(f"{self.base}/__slow?ms=300&kind=slow_done&site=w", timeout=5).read()
