@@ -1811,24 +1811,12 @@ where
                         let clean_b64 = clean_base64_data(&attachment.data);
                         let detected_media_type =
                             detect_image_media_type_from_base64(&clean_b64, &attachment.mime_type);
-                        let tool_result = ToolResult {
-                            id: tool_call_id.clone(),
-                            call_id: Some(tool_call_id),
-                            content: OneOrMany::many(vec![
-                                ToolResultContent::text(&msg.content),
-                                ToolResultContent::image_base64(
-                                    &clean_b64,
-                                    Some(detected_media_type),
-                                    None,
-                                ),
-                            ])
-                            .unwrap_or_else(|_| {
-                                OneOrMany::one(ToolResultContent::text(&msg.content))
-                            }),
-                        };
-                        chat_history.push(Message::User {
-                            content: OneOrMany::one(UserContent::ToolResult(tool_result)),
-                        });
+                        chat_history.push(anthropic_tool_result_with_image(
+                            tool_call_id,
+                            &msg.content,
+                            clean_b64,
+                            detected_media_type,
+                        ));
                     }
                     Some(attachment) => {
                         // OpenAI/others: text tool result + separate user image message
@@ -1860,26 +1848,12 @@ where
                                     &screenshot.base64_data,
                                     "image/png",
                                 );
-                                let tool_result = ToolResult {
-                                    id: tool_call_id.clone(),
-                                    call_id: Some(tool_call_id),
-                                    content: OneOrMany::many(vec![
-                                        ToolResultContent::text(
-                                            &screenshot.text_without_screenshot,
-                                        ),
-                                        ToolResultContent::image_base64(
-                                            &screenshot.base64_data,
-                                            Some(detected_media_type),
-                                            None,
-                                        ),
-                                    ])
-                                    .unwrap_or_else(|_| {
-                                        OneOrMany::one(ToolResultContent::text(&msg.content))
-                                    }),
-                                };
-                                chat_history.push(Message::User {
-                                    content: OneOrMany::one(UserContent::ToolResult(tool_result)),
-                                });
+                                chat_history.push(anthropic_tool_result_with_image(
+                                    tool_call_id,
+                                    &screenshot.text_without_screenshot,
+                                    screenshot.base64_data,
+                                    detected_media_type,
+                                ));
                             }
                             Some(screenshot) => {
                                 let detected_media_type = detect_image_media_type_from_base64(
@@ -2028,42 +2002,7 @@ where
     // For multi-turn with multimodal content, we keep all messages in chat_history and use
     // the text from the last user message as prompt. Some API providers return empty responses
     // when a multimodal message is passed directly as the prompt in multi-turn conversations.
-    let (prompt_message, chat_history) = {
-        let last_user_idx = chat_history
-            .iter()
-            .rposition(|m| matches!(m, Message::User { .. }));
-        if let Some(idx) = last_user_idx {
-            let has_multimodal = match &chat_history[idx] {
-                Message::User { content } => content
-                    .iter()
-                    .any(|c| matches!(c, UserContent::Image(_) | UserContent::Document(_))),
-                _ => false,
-            };
-            if has_multimodal && idx > 0 {
-                // Multi-turn multimodal: keep all messages in chat_history,
-                // use text from last user message as prompt
-                let text = match &chat_history[idx] {
-                    Message::User { content } => content
-                        .iter()
-                        .filter_map(|c| match c {
-                            UserContent::Text(t) => Some(t.text.clone()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                    _ => String::new(),
-                };
-                (Message::from(text), chat_history)
-            } else {
-                // Single-turn or text-only: pop the message as prompt
-                let mut history = chat_history;
-                let msg = history.remove(idx);
-                (msg, history)
-            }
-        } else {
-            (Message::from(""), chat_history)
-        }
-    };
+    let (prompt_message, chat_history) = split_prompt(chat_history);
 
     // Build the completion request using the builder pattern
     let mut builder = completion_model.completion_request(prompt_message);
@@ -2212,6 +2151,83 @@ fn merge_consecutive_same_role_messages(messages: Vec<Message>) -> Vec<Message> 
     }
 
     merged
+}
+
+/// Split a converted conversation into (prompt, history) for rig, which
+/// takes the newest user turn as a separate prompt.
+///
+/// A user turn carrying an image *and text* (an upload in a later turn) stays
+/// in history with its text as the prompt — some providers answer empty when
+/// a multimodal message is the prompt itself. A turn with an image but no
+/// text is a tool result coming back (a screenshot); it is sent as the prompt
+/// as it is, since keeping it and prompting with its (empty) text would send
+/// an empty text block, which strict endpoints reject with 400.
+fn split_prompt(chat_history: Vec<Message>) -> (Message, Vec<Message>) {
+    let Some(idx) = chat_history
+        .iter()
+        .rposition(|m| matches!(m, Message::User { .. }))
+    else {
+        return (Message::from(""), chat_history);
+    };
+    let (has_multimodal, text) = match &chat_history[idx] {
+        Message::User { content } => (
+            content
+                .iter()
+                .any(|c| matches!(c, UserContent::Image(_) | UserContent::Document(_))),
+            content
+                .iter()
+                .filter_map(|c| match c {
+                    UserContent::Text(t) => Some(t.text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        _ => (false, String::new()),
+    };
+    if has_multimodal && idx > 0 && !text.trim().is_empty() {
+        tracing::info!(
+            "Multi-turn multimodal: keeping message[{}] in history, prompt text_len={}",
+            idx,
+            text.len()
+        );
+        (Message::from(text), chat_history)
+    } else {
+        tracing::info!("Extracted prompt message from message[{}]", idx);
+        let mut history = chat_history;
+        let msg = history.remove(idx);
+        (msg, history)
+    }
+}
+
+/// The user turn that returns a tool result carrying an image, for the
+/// Anthropic wire: the text as the `tool_result`, the image as a sibling
+/// `image` block in the same turn.
+///
+/// Not an image *inside* `tool_result`: rig 0.29 serialises that as
+/// `{"type":"base64",...}` (the source's own `type` field overwrites the
+/// variant tag), which strict endpoints reject with 400 invalid_request_error.
+fn anthropic_tool_result_with_image(
+    tool_call_id: String,
+    text: &str,
+    base64: String,
+    media_type: ImageMediaType,
+) -> Message {
+    let tool_result = ToolResult {
+        id: tool_call_id.clone(),
+        call_id: Some(tool_call_id),
+        content: OneOrMany::one(ToolResultContent::text(text)),
+    };
+    let image = UserContent::Image(Image {
+        data: DocumentSourceKind::Base64(base64),
+        media_type: Some(media_type),
+        detail: None,
+        additional_params: None,
+    });
+    Message::User {
+        content: OneOrMany::many(vec![UserContent::ToolResult(tool_result), image])
+            .expect("two blocks"),
+    }
 }
 
 /// Convert MIME type string to rig ImageMediaType.
@@ -5545,24 +5561,12 @@ where
                         let clean_b64 = clean_base64_data(&attachment.data);
                         let detected_media_type =
                             detect_image_media_type_from_base64(&clean_b64, &attachment.mime_type);
-                        let tool_result = ToolResult {
-                            id: tool_call_id.clone(),
-                            call_id: Some(tool_call_id),
-                            content: OneOrMany::many(vec![
-                                ToolResultContent::text(&msg.content),
-                                ToolResultContent::image_base64(
-                                    &clean_b64,
-                                    Some(detected_media_type),
-                                    None,
-                                ),
-                            ])
-                            .unwrap_or_else(|_| {
-                                OneOrMany::one(ToolResultContent::text(&msg.content))
-                            }),
-                        };
-                        chat_history.push(Message::User {
-                            content: OneOrMany::one(UserContent::ToolResult(tool_result)),
-                        });
+                        chat_history.push(anthropic_tool_result_with_image(
+                            tool_call_id,
+                            &msg.content,
+                            clean_b64,
+                            detected_media_type,
+                        ));
                     }
                     Some(attachment) => {
                         // OpenAI/others: text tool result + separate user image message
@@ -5594,26 +5598,12 @@ where
                                     &screenshot.base64_data,
                                     "image/png",
                                 );
-                                let tool_result = ToolResult {
-                                    id: tool_call_id.clone(),
-                                    call_id: Some(tool_call_id),
-                                    content: OneOrMany::many(vec![
-                                        ToolResultContent::text(
-                                            &screenshot.text_without_screenshot,
-                                        ),
-                                        ToolResultContent::image_base64(
-                                            &screenshot.base64_data,
-                                            Some(detected_media_type),
-                                            None,
-                                        ),
-                                    ])
-                                    .unwrap_or_else(|_| {
-                                        OneOrMany::one(ToolResultContent::text(&msg.content))
-                                    }),
-                                };
-                                chat_history.push(Message::User {
-                                    content: OneOrMany::one(UserContent::ToolResult(tool_result)),
-                                });
+                                chat_history.push(anthropic_tool_result_with_image(
+                                    tool_call_id,
+                                    &screenshot.text_without_screenshot,
+                                    screenshot.base64_data,
+                                    detected_media_type,
+                                ));
                             }
                             Some(screenshot) => {
                                 let detected_media_type = detect_image_media_type_from_base64(
@@ -5820,50 +5810,7 @@ where
         chat_history.len()
     );
 
-    let (prompt_message, chat_history) = {
-        let last_user_idx = chat_history
-            .iter()
-            .rposition(|m| matches!(m, Message::User { .. }));
-        if let Some(idx) = last_user_idx {
-            let has_multimodal = match &chat_history[idx] {
-                Message::User { content } => content
-                    .iter()
-                    .any(|c| matches!(c, UserContent::Image(_) | UserContent::Document(_))),
-                _ => false,
-            };
-            if has_multimodal && idx > 0 {
-                // Multi-turn multimodal: keep all messages in chat_history,
-                // use text from last user message as prompt. Some API providers
-                // return empty responses when a multimodal message is passed
-                // directly as the prompt in multi-turn conversations.
-                let text = match &chat_history[idx] {
-                    Message::User { content } => content
-                        .iter()
-                        .filter_map(|c| match c {
-                            UserContent::Text(t) => Some(t.text.clone()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                    _ => String::new(),
-                };
-                tracing::info!(
-                    "Multi-turn multimodal: keeping message[{}] in history, prompt text_len={}",
-                    idx,
-                    text.len()
-                );
-                (Message::from(text), chat_history)
-            } else {
-                tracing::info!("Extracted prompt message from message[{}]", idx);
-                let mut history = chat_history;
-                let msg = history.remove(idx);
-                (msg, history)
-            }
-        } else {
-            tracing::info!("No user message found, using empty prompt");
-            (Message::from(""), chat_history)
-        }
-    };
+    let (prompt_message, chat_history) = split_prompt(chat_history);
 
     tracing::info!("Final: chat_history_len={}", chat_history.len());
 
@@ -6184,6 +6131,111 @@ where
 
 #[cfg(test)]
 mod tests {
+
+    /// A screenshot handed back to an Anthropic-wire model must arrive as an
+    /// `image` block. rig 0.29 serialises an image *inside* `tool_result` as
+    /// `{"type":"base64",...}` (its variant tag is overwritten by the source's
+    /// own `type` field), which Kimi and other strict endpoints reject with
+    /// 400 invalid_request_error — every headless task that took a screenshot
+    /// died on the next call.
+    #[test]
+    fn anthropic_tool_result_image_serializes_as_image_block() {
+        use rig::providers::anthropic::completion as anthropic;
+        let msg = super::anthropic_tool_result_with_image(
+            "toolu_1".into(),
+            r#"{"success":true,"screenshot_available":true}"#,
+            "/9j/4AAQSkZJRg==".into(),
+            rig::completion::message::ImageMediaType::JPEG,
+        );
+        let wire: anthropic::Message = msg.try_into().expect("converts to the Anthropic wire");
+        let v = serde_json::to_value(&wire).unwrap();
+        let blocks = v["content"].as_array().expect("content blocks");
+        assert_eq!(blocks[0]["type"], "tool_result");
+        assert_eq!(blocks[0]["tool_use_id"], "toolu_1");
+        for inner in blocks[0]["content"].as_array().unwrap() {
+            assert_eq!(
+                inner["type"], "text",
+                "no image inside tool_result: {inner}"
+            );
+        }
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["source"]["type"], "base64");
+        assert_eq!(blocks[1]["source"]["media_type"], "image/jpeg");
+        assert_eq!(blocks[1]["source"]["data"], "/9j/4AAQSkZJRg==");
+    }
+
+    /// After a screenshot the last user turn is a tool result plus an image
+    /// and has no text of its own. It must go out as the prompt itself, not be
+    /// kept in history with an empty text prompt appended: strict endpoints
+    /// reject the empty text block with 400.
+    #[test]
+    fn split_prompt_sends_tool_result_image_turn_as_the_prompt() {
+        use rig::completion::message::{AssistantContent, Message, UserContent};
+        use rig::OneOrMany;
+        let history = vec![
+            Message::from("take a screenshot"),
+            Message::Assistant {
+                id: None,
+                content: OneOrMany::one(AssistantContent::tool_call(
+                    "toolu_1",
+                    "browser_screenshot",
+                    serde_json::json!({}),
+                )),
+            },
+            super::anthropic_tool_result_with_image(
+                "toolu_1".into(),
+                "{}",
+                "/9j/AAAA".into(),
+                rig::completion::message::ImageMediaType::JPEG,
+            ),
+        ];
+        let (prompt, rest) = super::split_prompt(history);
+        assert_eq!(rest.len(), 2, "tool-result turn leaves the history");
+        match prompt {
+            Message::User { content } => {
+                assert!(content
+                    .iter()
+                    .any(|c| matches!(c, UserContent::ToolResult(_))));
+                assert!(content.iter().any(|c| matches!(c, UserContent::Image(_))));
+                assert!(!content
+                    .iter()
+                    .any(|c| matches!(c, UserContent::Text(t) if t.text.is_empty())));
+            }
+            other => panic!("prompt must be the user turn, got {other:?}"),
+        }
+    }
+
+    /// A user-uploaded image with text in a later turn keeps the old
+    /// behaviour: the message stays in history and its text becomes the prompt.
+    #[test]
+    fn split_prompt_keeps_user_multimodal_turn_in_history() {
+        use rig::completion::message::{Image, Message, Text, UserContent};
+        use rig::OneOrMany;
+        let history = vec![
+            Message::from("hi"),
+            Message::Assistant {
+                id: None,
+                content: OneOrMany::one(rig::completion::message::AssistantContent::text("hello")),
+            },
+            Message::User {
+                content: OneOrMany::many(vec![
+                    UserContent::Text(Text {
+                        text: "what is this?".into(),
+                    }),
+                    UserContent::Image(Image {
+                        data: rig::completion::message::DocumentSourceKind::Base64("AAAA".into()),
+                        media_type: None,
+                        detail: None,
+                        additional_params: None,
+                    }),
+                ])
+                .unwrap(),
+            },
+        ];
+        let (prompt, rest) = super::split_prompt(history);
+        assert_eq!(rest.len(), 3);
+        assert_eq!(prompt, Message::from("what is this?"));
+    }
 
     /// The ACP bridge must not offer tools only the built-in agent can run.
     ///
