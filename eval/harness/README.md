@@ -3,6 +3,52 @@
 Runs the J20 browser-execution regression set and the Jev A/B set against a
 real headless NevoFlux, one trial at a time, on a Windows dev box.
 
+## Usage
+
+Build the daemon first (`cargo build -j 3 --release`); the runner uses
+`target/release/nevoflux-agent.exe` and the dev browser under
+`nevoflux/engine/.../dist/bin/nevoflux.exe` (`--agent-exe`, `--browser-bin`
+to override). From the repo root, in Git Bash:
+
+```bash
+# J20 regression set, 3 passes, on the Kimi (k3) Anthropic-wire provider
+PYTHONIOENCODING=utf-8 python -m eval.harness.run \
+  --tasks eval/harness/tasks/j20 --k 3 --set llm.provider=anthropic \
+  --out eval/results/baseline-j20
+
+# delta and cost from a finished run
+python -m eval.harness.calibrate eval/results/baseline-j20/trials.jsonl
+```
+
+- `--set section.key=value` edits the trial's copy of your config (never your
+  own file); repeatable. Values parse as bool/int/float/string. The trial
+  fails if the daemon did not load the requested `llm.provider`, or fell back
+  to default config.
+- `--only id1,id2` runs a subset; `--keep-dirs` keeps each trial directory
+  (config, `daemon.stdout.log`, `data/`) for debugging.
+- **Resume**: re-run the same command with the same `--out`. Trials that
+  already have a real result are skipped; `provider_error` / `harness_error`
+  / `timeout` trials run again. Only the latest row per (pass, task) counts.
+- **Exit code 2**: three provider errors in a row (provider down, or a
+  subscription quota such as Kimi's 5-hour window). Wait and re-run.
+- Output: `<out>/trials.jsonl` (one row per trial: status, pass, per-check
+  reasons, turn outputs, per-turn usage, provider/model actually loaded, site
+  events, exported session JSONL), `<out>/summary.json`, `<out>/run.json`.
+- Statuses: `succeeded`/`failed` are agent results; `provider_error` (the
+  daemon reports provider failures as a succeeded task whose output is the
+  error text), `timeout`, `harness_error` are missing trials: they never
+  pass, they count 0 in the score, and more than 10% missing sets
+  `eval_invalid` in calibrate.
+
+Provider notes: `custom:chinamobile` (deepseekv4-flash) rejects any image, so
+it fails every trial where the agent takes a screenshot; use a vision model.
+A J20 trial reads about 230k input tokens (Jev about 350k) before P0's prompt
+caching; Kimi's coding plan runs out after roughly 25 trials per 5 hours.
+
+Tasks are JSON files under `tasks/<set>/`; `{base}` is the task's site root
+and `{root}` the server root. Pick-one and count tasks ask for a final
+`ANSWER:` / `答案：` line and check only that line.
+
 ## Environment prerequisites (verified 2026-09-26)
 
 Each trial runs its own daemon:
