@@ -781,7 +781,9 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
 </CRITICAL_INSTRUCTIONS>"#,
                 skill.name, skill.name, skill.base_path, skill.content, files_section
             );
-            sections.insert(0, PromptSectionText::kernel("skill/loaded", body));
+            // Last, not first: the sections before it stay byte-identical on
+            // the turn that loads a skill, so the cached prefix survives.
+            sections.push(PromptSectionText::kernel("skill/loaded", body));
         }
 
         // A pack holding the prompt replaces the body from here (design spec
@@ -864,9 +866,10 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
             self.local_dynamic.borrow_mut().clear();
             self.local_tools_changed.set(false);
             tools = self.local_active_tools(&input.tab_ids);
-        } else {
-            Self::apply_tab_hint(&mut tools, &input.tab_ids);
         }
+        // Cloud tools carry no per-turn tab hint: the attached tabs are named
+        // in the user message (`format_tab_context`), and a hint in the
+        // schemas changed the tools block, which leads the cached prefix.
 
         // Turn boundaries wrap the whole loop so they pair no matter how it
         // exits (design spec §3.2).
@@ -2198,8 +2201,7 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
         let mut accumulated_text = String::new();
         let mut accumulated_reasoning = String::new();
         // Use a HashMap to deduplicate tool calls by id, preferring those with call_id set
-        let mut tool_calls_map: std::collections::HashMap<String, ToolCall> =
-            std::collections::HashMap::new();
+        let mut tool_calls_map = OrderedToolCalls::default();
 
         // Buffering state for text-based <tool_call> XML that may span multiple chunks
         let mut tool_call_buf = String::new();
@@ -2241,7 +2243,7 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                                     let complete = std::mem::take(&mut tool_call_buf);
                                     let (clean, extracted) = parse_tool_calls_from_text(&complete);
                                     for tc in extracted {
-                                        tool_calls_map.insert(tc.id.clone(), tc);
+                                        tool_calls_map.insert(tc);
                                     }
                                     if !clean.is_empty() {
                                         accumulated_text.push_str(&clean);
@@ -2253,7 +2255,7 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                                     // Complete tool call in a single chunk
                                     let (clean, extracted) = parse_tool_calls_from_text(text);
                                     for tc in extracted {
-                                        tool_calls_map.insert(tc.id.clone(), tc);
+                                        tool_calls_map.insert(tc);
                                     }
                                     if !clean.is_empty() {
                                         accumulated_text.push_str(&clean);
@@ -2319,7 +2321,7 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                             }
                         };
                         if should_insert {
-                            tool_calls_map.insert(tc.id.clone(), tc);
+                            tool_calls_map.insert(tc);
                         }
                     }
 
@@ -2369,7 +2371,7 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
 
         Ok(LlmResponse {
             text: accumulated_text,
-            tool_calls: tool_calls_map.into_values().collect(),
+            tool_calls: tool_calls_map.into_vec(),
             reasoning: if accumulated_reasoning.is_empty() {
                 None
             } else {
@@ -6313,14 +6315,47 @@ fn parse_tool_calls_from_text(text: &str) -> (String, Vec<ToolCall>) {
 /// `None` suggests everything. A soul that lists skills is saying which ones are
 /// worth its turn — not which ones exist, so an unknown name in the list is
 /// simply ignored rather than an error.
+/// Tool calls collected from a stream, keyed by id but kept in the order
+/// they first arrived. A HashMap put parallel calls into the history in a
+/// different order from run to run, which changed the cached prefix.
+#[derive(Default)]
+struct OrderedToolCalls {
+    order: Vec<String>,
+    by_id: std::collections::HashMap<String, ToolCall>,
+}
+
+impl OrderedToolCalls {
+    fn insert(&mut self, tc: ToolCall) {
+        if !self.by_id.contains_key(&tc.id) {
+            self.order.push(tc.id.clone());
+        }
+        self.by_id.insert(tc.id.clone(), tc);
+    }
+
+    fn get(&self, id: &str) -> Option<&ToolCall> {
+        self.by_id.get(id)
+    }
+
+    fn into_vec(mut self) -> Vec<ToolCall> {
+        self.order
+            .iter()
+            .filter_map(|id| self.by_id.remove(id))
+            .collect()
+    }
+}
+
 fn filter_skills(skills: Vec<SkillSummary>, allowed: Option<&[String]>) -> Vec<SkillSummary> {
-    let Some(allowed) = allowed.filter(|a| !a.is_empty()) else {
-        return skills;
+    let mut skills: Vec<SkillSummary> = match allowed.filter(|a| !a.is_empty()) {
+        None => skills,
+        Some(allowed) => skills
+            .into_iter()
+            .filter(|s| allowed.iter().any(|a| a.eq_ignore_ascii_case(&s.name)))
+            .collect(),
     };
+    // The registry is a HashMap, so its order changes between processes; a
+    // sorted catalog keeps the system prompt, and the cache, stable.
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
     skills
-        .into_iter()
-        .filter(|s| allowed.iter().any(|a| a.eq_ignore_ascii_case(&s.name)))
-        .collect()
 }
 
 /// Format skill summaries for system prompt injection.
@@ -7359,40 +7394,120 @@ mod tests {
     /// An explicitly invoked skill outranks everything, so it leads — and it is
     /// the one section a `keep_kernel` replacement must not remove.
     #[test]
-    fn a_loaded_skill_leads_the_prompt_and_is_marked_kernel() {
-        let mock = MockHostFunctions::new();
-        let agent = session_log_agent(mock);
-        let mut input = session_log_input("run it");
-        input.skill_context = Some(SkillContext {
-            name: "design-md".into(),
-            base_path: "/skills/design-md".into(),
-            content: "do the thing".into(),
-            available_files: vec!["resume.md".into()],
-        });
-        input.soul_context = Some("I am a careful assistant.".into());
-        agent.run(&input).unwrap();
+    fn a_loaded_skill_no_longer_leads_the_prompt() {
+        let sections_for = |with_skill: bool| {
+            let mock = MockHostFunctions::new();
+            let agent = session_log_agent(mock);
+            let mut input = session_log_input("run it");
+            if with_skill {
+                input.skill_context = Some(SkillContext {
+                    name: "design-md".into(),
+                    base_path: "/skills/design-md".into(),
+                    content: "do the thing".into(),
+                    available_files: vec!["resume.md".into()],
+                });
+            }
+            input.soul_context = Some("I am a careful assistant.".into());
+            agent.run(&input).unwrap();
+            let sections = agent.host.prompt_sections.borrow().clone();
+            sections
+        };
+        let plain = sections_for(false);
+        let with = sections_for(true);
+        // Using a skill must leave everything before it untouched, so the
+        // cached prefix survives the turn that loads a skill.
+        assert_eq!(with.len(), plain.len() + 1);
+        for (a, b) in plain.iter().zip(with.iter()) {
+            assert_eq!(a.id, b.id);
+            assert_eq!(a.body, b.body, "section {} changed", a.id);
+        }
+        let last = with.last().unwrap();
+        assert_eq!(last.id, "skill/loaded");
+        assert!(last.kernel, "the loaded skill is a kernel section");
+        assert!(last.body.contains("design-md"), "{}", last.body);
+        assert!(
+            last.body.contains("resume.md"),
+            "available files must survive the move"
+        );
+    }
 
+    #[test]
+    fn skills_catalog_is_sorted_by_name() {
+        let mock = MockHostFunctions::new();
+        *mock.skills.borrow_mut() = ["zeta", "alpha", "mid"]
+            .iter()
+            .map(|n| SkillSummary {
+                name: (*n).into(),
+                description: format!("{n} skill"),
+                tags: vec![],
+            })
+            .collect();
+        let agent = session_log_agent(mock);
+        agent.run(&session_log_input("hi")).unwrap();
         let sections = agent.host.prompt_sections.borrow().clone();
+        let catalog = sections
+            .iter()
+            .find(|s| s.id == "skills/catalog")
+            .expect("catalog section");
+        let pos = |n: &str| catalog.body.find(&format!("**{n}**")).unwrap();
+        assert!(pos("alpha") < pos("mid") && pos("mid") < pos("zeta"));
+    }
+
+    #[test]
+    fn attached_tabs_do_not_change_tool_schemas() {
+        let run = |tabs: Vec<TabInfo>| {
+            let mock = MockHostFunctions::new();
+            let agent = session_log_agent(mock);
+            let mut input = session_log_input("summarize this");
+            input.mode = AgentMode::Browser;
+            input.tab_ids = tabs;
+            agent.run(&input).unwrap();
+            let req = agent.host.captured_requests.borrow()[0].clone();
+            req
+        };
+        let tab = |id: i64, title: &str| TabInfo {
+            space: String::new(),
+            tab_id: id,
+            tab_title: title.into(),
+            url: format!("https://example.com/{id}"),
+        };
+        let plain = run(vec![]);
+        let attached = run(vec![tab(7, "Docs"), tab(9, "Blog")]);
         assert_eq!(
-            sections.first().map(|s| s.id.as_str()),
-            Some("skill/loaded")
+            serde_json::to_string(&plain.tools).unwrap(),
+            serde_json::to_string(&attached.tools).unwrap(),
+            "attached tabs belong in the user message, not the tool schemas"
         );
-        assert!(sections[0].kernel, "the loaded skill is a kernel section");
-        assert!(
-            sections[0].body.contains("design-md"),
-            "{}",
-            sections[0].body
-        );
-        assert!(
-            sections[0].body.contains("resume.md"),
-            "available files must survive the refactor"
-        );
+        let user = attached
+            .messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, MessageRole::User))
+            .unwrap();
+        assert!(user.content.contains("explicitly attached the tabs"));
+        assert!(user.content.contains("Docs"));
+    }
+
+    #[test]
+    fn streamed_tool_calls_keep_the_order_they_arrived_in() {
+        let tc = |id: &str, arg: i64| ToolCall {
+            id: id.into(),
+            call_id: None,
+            name: "t".into(),
+            arguments: serde_json::json!({ "n": arg }),
+            signature: None,
+        };
+        let mut calls = OrderedToolCalls::default();
+        calls.insert(tc("zzz", 1));
+        calls.insert(tc("aaa", 2));
+        calls.insert(tc("zzz", 3)); // a later, fuller copy of the first call
+        assert!(calls.get("aaa").is_some());
+        let out = calls.into_vec();
         assert_eq!(
-            sections.last().map(|s| s.id.as_str()),
-            Some("soul"),
-            "soul is volatile, so it sits after the cacheable head"
+            out.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["zzz", "aaa"]
         );
-        assert!(!sections.last().unwrap().kernel);
+        assert_eq!(out[0].arguments["n"], 3);
     }
 
     /// A custom prompt replaces the body wholesale. Reporting it as one opaque

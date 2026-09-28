@@ -1112,6 +1112,9 @@ pub struct MockHostFunctions {
     /// Tool names passed to each `llm_chat` call, in order — lets tests assert
     /// which tools were advertised on each iteration (e.g. the canvas gate).
     pub captured_tool_names: std::cell::RefCell<Vec<Vec<String>>>,
+    /// Every `llm_chat` request, whole — lets tests compare tool schemas and
+    /// the messages byte for byte.
+    pub captured_requests: std::cell::RefCell<Vec<LlmRequest>>,
     /// Session-log hook calls in the order they were made, rendered as short
     /// strings — lets tests assert that a tool is announced before it runs and
     /// that turn/step boundaries pair up.
@@ -1160,6 +1163,7 @@ impl MockHostFunctions {
             next_subagent_id: std::cell::Cell::new(1),
             subagents: std::cell::RefCell::new(vec![]),
             captured_tool_names: std::cell::RefCell::new(vec![]),
+            captured_requests: std::cell::RefCell::new(vec![]),
             recorded_events: std::cell::RefCell::new(vec![]),
             gate: std::cell::RefCell::new(ToolGate::Allow),
             post_arguments: std::cell::RefCell::new(vec![]),
@@ -1289,6 +1293,7 @@ impl HostFunctions for MockHostFunctions {
         self.captured_tool_names
             .borrow_mut()
             .push(request.tools.iter().map(|t| t.name.clone()).collect());
+        self.captured_requests.borrow_mut().push(request.clone());
         let mut responses = self.llm_responses.borrow_mut();
         if responses.is_empty() {
             Ok(LlmResponse {
