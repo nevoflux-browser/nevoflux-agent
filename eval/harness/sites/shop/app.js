@@ -92,7 +92,15 @@
       main.append(el("h1", {}, L.cart));
       if (!c.length) { main.append(el("p", {}, L.emptyCart)); return; }
       const ul = el("ul", { id: "cart" });
-      c.forEach((x) => ul.append(el("li", {}, bySku(x.sku).name + " × " + x.qty)));
+      c.forEach((x) => {
+        const rm = el("button", { "data-sku": x.sku, "aria-label": L.remove + " " + bySku(x.sku).name }, L.remove);
+        rm.addEventListener("click", () => {
+          saveCart(cart().filter((y) => y.sku !== x.sku));
+          nfEvent(SITE, "cart_remove", { sku: x.sku });
+          location.reload();
+        });
+        ul.append(el("li", {}, bySku(x.sku).name + " × " + x.qty + " ", rm));
+      });
       main.append(ul, el("p", {}, el("a", { href: "checkout.html", id: "to-checkout" }, L.checkout)));
     },
     checkout() {

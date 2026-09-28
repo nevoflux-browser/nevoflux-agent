@@ -9,7 +9,7 @@ window.L10N = {
   emptyCart: "Your cart is empty", name: "Full name", address: "Address",
   delivery: "Delivery", standard: "Standard delivery", express: "Express delivery",
   placeOrder: "Place order", ordered: "Order placed", rating: "Rating",
-  reviews: "reviews", warranty: "Warranty", months: "months", added: "Added to cart",
+  reviews: "reviews", remove: "Remove", warranty: "Warranty", months: "months", added: "Added to cart",
   featured: "All products", noResults: "No products found",
 };
 window.PRODUCTS = [

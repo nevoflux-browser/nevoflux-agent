@@ -8,7 +8,7 @@ window.L10N = {
   emptyCart: "购物车是空的", name: "收货人", address: "收货地址",
   delivery: "配送方式", standard: "普通配送", express: "快递配送",
   placeOrder: "提交订单", ordered: "下单成功", rating: "评分",
-  reviews: "条评价", warranty: "保修", months: "个月", added: "已加入购物车",
+  reviews: "条评价", remove: "删除", warranty: "保修", months: "个月", added: "已加入购物车",
   featured: "全部商品", noResults: "没有找到商品",
 };
 window.PRODUCTS = [
