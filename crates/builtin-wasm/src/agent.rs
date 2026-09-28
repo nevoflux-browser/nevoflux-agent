@@ -6553,6 +6553,12 @@ pub struct ResultBudget {
     /// again. On-device it is half that — a screenful is a larger share of a
     /// 16K context than of a cloud one.
     pub aged: usize,
+    /// Aged results are left alone until together they exceed this many
+    /// bytes, then all of them shrink at once. Shrinking one per step
+    /// rewrote a message deep in the history on every step, so the prompt
+    /// cache missed on every step of a long turn. `0` shrinks every step,
+    /// which local mode keeps: fitting its small context matters more.
+    pub aged_watermark: usize,
 }
 
 impl ResultBudget {
@@ -6574,6 +6580,7 @@ impl ResultBudget {
         min_single: 10 * 1024,
         max_single: 32 * 1024,
         aged: 4 * 1024,
+        aged_watermark: 64 * 1024,
     };
 
     /// Derive a budget from the engine's context size.
@@ -6595,6 +6602,7 @@ impl ResultBudget {
             min_single: (4 * 1024).min(max_single),
             max_single,
             aged: 2 * 1024,
+            aged_watermark: 0,
         }
     }
 }
@@ -6638,7 +6646,16 @@ fn shrink_aged_tool_results_with(messages: &mut [Message], budget: ResultBudget)
     if results.len() <= RECENT_TOOL_RESULTS_KEPT_WHOLE {
         return;
     }
-    for &i in &results[..results.len() - RECENT_TOOL_RESULTS_KEPT_WHOLE] {
+    let aged = &results[..results.len() - RECENT_TOOL_RESULTS_KEPT_WHOLE];
+    let pending: usize = aged
+        .iter()
+        .map(|&i| messages[i].content.len())
+        .filter(|&len| len > budget.aged)
+        .sum();
+    if pending <= budget.aged_watermark {
+        return;
+    }
+    for &i in aged {
         let full = messages[i].content.len();
         if full <= budget.aged {
             continue;
@@ -6789,6 +6806,33 @@ mod tests {
         assert_eq!(msgs[1].content.len(), 20 * 1024);
     }
 
+    /// Cloud waits until the aged results add up to the watermark, then
+    /// shrinks all of them at once: shrinking one per step rewrote a message
+    /// deep in the history on every step, so the prompt cache missed every
+    /// step of a long turn.
+    #[test]
+    fn cloud_aged_results_wait_for_the_watermark_then_shrink_together() {
+        // 1 aged result of 5 KiB (< 64 KiB watermark): nothing is rewritten.
+        let mut msgs: Vec<Message> = (0..RECENT_TOOL_RESULTS_KEPT_WHOLE + 1)
+            .map(|i| tool_result(&format!("t{i}"), 5 * 1024))
+            .collect();
+        let before = msgs.clone();
+        shrink_aged_tool_results_with(&mut msgs, ResultBudget::CLOUD);
+        for (a, b) in before.iter().zip(msgs.iter()) {
+            assert_eq!(a.content, b.content, "below the watermark nothing changes");
+        }
+        // 14 aged results of 5 KiB = 70 KiB > 64 KiB: all 14 shrink in one pass.
+        let mut msgs: Vec<Message> = (0..RECENT_TOOL_RESULTS_KEPT_WHOLE + 14)
+            .map(|i| tool_result(&format!("t{i}"), 5 * 1024))
+            .collect();
+        shrink_aged_tool_results_with(&mut msgs, ResultBudget::CLOUD);
+        let shrunk = msgs
+            .iter()
+            .filter(|m| m.content.len() <= ResultBudget::CLOUD.aged)
+            .count();
+        assert_eq!(shrunk, 14);
+    }
+
     /// 短会话一个字都不该动。修剪是为长会话省钱,不是给每次对话降质。
     #[test]
     fn a_short_conversation_keeps_every_tool_result_whole() {
@@ -6806,7 +6850,8 @@ mod tests {
     /// assistant 的 tool_calls 找不到配对的结果,供应商直接拒。
     #[test]
     fn aged_tool_results_shrink_while_the_pairing_survives() {
-        let n = RECENT_TOOL_RESULTS_KEPT_WHOLE + 4;
+        // 9 条老结果 × 8 KiB = 72 KiB,超过云端 64 KiB 水位线,才会一起压缩。
+        let n = RECENT_TOOL_RESULTS_KEPT_WHOLE + 9;
         let mut msgs: Vec<Message> = (0..n)
             .map(|i| tool_result(&format!("t{i}"), 8 * 1024))
             .collect();
@@ -6816,13 +6861,13 @@ mod tests {
         for (i, m) in msgs.iter().enumerate() {
             assert_eq!(m.tool_call_id.as_deref(), Some(format!("t{i}").as_str()));
         }
-        // 前 4 条被压缩
-        for m in &msgs[..4] {
+        // 前 9 条被压缩
+        for m in &msgs[..9] {
             assert!(m.content.len() < 8 * 1024, "老结果没压缩");
             assert!(m.content.contains("[Earlier tool result"));
         }
-        // 最近 6 条原样
-        for m in &msgs[4..] {
+        // 最近 12 条原样
+        for m in &msgs[9..] {
             assert_eq!(m.content.len(), 8 * 1024, "近期结果被误伤");
         }
     }
