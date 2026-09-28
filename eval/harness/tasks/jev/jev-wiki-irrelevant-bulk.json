@@ -1,0 +1,25 @@
+{
+ "id": "jev-wiki-irrelevant-bulk",
+ "set": "jev",
+ "lang": "en",
+ "site": "wiki",
+ "task": "Read {base}/en/Wikipedia.html and {base}/en/Large_language_model.html.",
+ "followups": [
+  {
+   "message": "Forget those. What does {base}/en/Rust_(programming_language).html say about memory safety?",
+   "delay_secs": 0
+  }
+ ],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "memory safety|borrow",
+   "turn": 1
+  }
+ ],
+ "tags": [
+  "jev",
+  "multi"
+ ],
+ "timeout_secs": 300
+}

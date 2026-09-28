@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>SkyHop — search flights</title>
+<script src="../_lib/beacon.js"></script>
+<style>.combo ul { border: 1px solid #999; margin: 0; padding: 0 4px; list-style: none; }</style>
+<h1>Search flights</h1>
+<form id="f">
+  <div class="combo">
+    <label>From <input id="from" role="combobox" aria-expanded="false" aria-controls="from-list" autocomplete="off"></label>
+    <ul id="from-list" role="listbox" hidden></ul>
+  </div>
+  <div class="combo">
+    <label>To <input id="to" role="combobox" aria-expanded="false" aria-controls="to-list" autocomplete="off"></label>
+    <ul id="to-list" role="listbox" hidden></ul>
+  </div>
+  <p><label>Date <input id="date" type="date"></label></p>
+  <p><label><input id="direct" type="checkbox"> Direct flights only</label></p>
+  <button type="submit">Search</button>
+</form>
+<p id="status" role="status"></p>
+<script src="flights.js"></script>
+</html>

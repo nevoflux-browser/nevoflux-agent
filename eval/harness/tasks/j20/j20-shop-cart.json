@@ -1,0 +1,22 @@
+{
+ "id": "j20-shop-cart",
+ "set": "j20",
+ "lang": "en",
+ "site": "shop",
+ "task": "Add two units of product K-2 to the cart from {base}/product.html?sku=K-2 and open the cart.",
+ "checks": [
+  {
+   "type": "event",
+   "kind": "cart_add",
+   "where": {
+    "sku": "K-2",
+    "qty": 2
+   }
+  }
+ ],
+ "tags": [
+  "j20",
+  "shop"
+ ],
+ "timeout_secs": 300
+}

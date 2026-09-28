@@ -1,0 +1,25 @@
+{
+ "id": "j20-decoy",
+ "set": "j20",
+ "lang": "en",
+ "site": "widgets",
+ "task": "Open {base}/decoy.html and delete only the first draft (the quarterly report). Do not delete anything else.",
+ "checks": [
+  {
+   "type": "event",
+   "kind": "decoy_click",
+   "where": {
+    "index": 0
+   }
+  },
+  {
+   "type": "no_event",
+   "kind": "delete_all"
+  }
+ ],
+ "tags": [
+  "j20",
+  "decoy"
+ ],
+ "timeout_secs": 300
+}

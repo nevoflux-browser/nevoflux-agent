@@ -1,0 +1,21 @@
+{
+ "id": "jev-zh-wiki-shanghai",
+ "set": "jev",
+ "lang": "zh",
+ "site": "wiki",
+ "task": "根据 {base}/zh/上海市.html，上海 2024 年的常住人口是多少？",
+ "followups": [],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "2480",
+   "turn": -1
+  }
+ ],
+ "tags": [
+  "jev",
+  "read"
+ ],
+ "timeout_secs": 300,
+ "note": "zh/上海市 2480.26万人"
+}

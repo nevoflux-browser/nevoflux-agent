@@ -455,7 +455,13 @@ impl AgentConfig {
     ///
     /// This is typically ~/.config/nevoflux/config.toml on Linux/macOS
     /// or %APPDATA%\nevoflux\config.toml on Windows.
+    /// `NEVOFLUX_CONFIG`, when set and non-empty, wins over both.
     pub fn default_config_path() -> Result<PathBuf, ConfigError> {
+        // Evaluation runs and other harnesses give each process its own config
+        // without touching the user's; empty counts as unset.
+        if let Some(p) = std::env::var_os("NEVOFLUX_CONFIG").filter(|p| !p.is_empty()) {
+            return Ok(PathBuf::from(p));
+        }
         let config_dir = dirs::config_dir().ok_or(ConfigError::NoConfigDir)?;
         let primary = config_dir.join("nevoflux").join("config.toml");
 
@@ -3241,5 +3247,17 @@ denied_commands = ["sudo *"]
         assert_eq!(base.auth.allowed_commands, vec!["cargo *", "make *"]);
         assert_eq!(base.auth.sensitive_patterns, vec![".env*"]);
         assert_eq!(base.auth.denied_commands, vec!["sudo *"]);
+    }
+
+    #[test]
+    fn nevoflux_config_env_overrides_default_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let custom = tmp.path().join("eval-config.toml");
+        std::env::set_var("NEVOFLUX_CONFIG", &custom);
+        assert_eq!(AgentConfig::default_config_path().unwrap(), custom);
+        // Empty means "not set".
+        std::env::set_var("NEVOFLUX_CONFIG", "");
+        assert_ne!(AgentConfig::default_config_path().unwrap(), custom);
+        std::env::remove_var("NEVOFLUX_CONFIG");
     }
 }

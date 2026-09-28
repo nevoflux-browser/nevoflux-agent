@@ -783,6 +783,7 @@ mod tests {
                     output: Some(format!("did: {}", req.task)),
                     error: None,
                     artifacts: vec![],
+                    ..Default::default()
                 }
             })
         });
@@ -1080,6 +1081,7 @@ mod tests {
                     output: Some(format!("did: {}", req.task)),
                     error: None,
                     artifacts: vec![],
+                    ..Default::default()
                 }
             })
         });
@@ -1180,6 +1182,7 @@ mod tests {
                     output: Some(format!("flow={} history=[{}]", req.session_flow, echoed)),
                     error: None,
                     artifacts: vec![],
+                    ..Default::default()
                 }
             })
         });

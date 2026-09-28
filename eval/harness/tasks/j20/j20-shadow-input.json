@@ -1,0 +1,21 @@
+{
+ "id": "j20-shadow-input",
+ "set": "j20",
+ "lang": "en",
+ "site": "widgets",
+ "task": "Open {base}/shadow.html, enter the promo code SPRING24 and apply it.",
+ "checks": [
+  {
+   "type": "event",
+   "kind": "shadow_submit",
+   "where": {
+    "value": "SPRING24"
+   }
+  }
+ ],
+ "tags": [
+  "j20",
+  "shadow"
+ ],
+ "timeout_secs": 300
+}

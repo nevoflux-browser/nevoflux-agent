@@ -821,6 +821,7 @@ async fn run_daemon(
                             output: None,
                             error: Some("headless runner context unavailable".into()),
                             artifacts: Vec::new(),
+                            ..Default::default()
                         }
                     })
                 })

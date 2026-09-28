@@ -1,0 +1,25 @@
+{
+ "id": "jev-wiki-compare-two",
+ "set": "jev",
+ "lang": "en",
+ "site": "wiki",
+ "task": "Using {base}/en/Firefox.html and {base}/en/Web_browser.html: which organization develops Firefox, and name two kinds of devices browsers are used on.",
+ "followups": [],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "Mozilla",
+   "turn": -1
+  },
+  {
+   "type": "output_regex",
+   "pattern": "laptop|tablet|smartphone|desktop|smartwatch|television|console",
+   "turn": -1
+  }
+ ],
+ "tags": [
+  "jev",
+  "read"
+ ],
+ "timeout_secs": 300
+}

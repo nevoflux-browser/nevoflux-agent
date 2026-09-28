@@ -105,6 +105,8 @@ pub struct AgentExecOutcome {
     /// json array `[{"name": ..., "ok": true}]` — the same trace shape the
     /// loop executor persists to `loop_iterations.summary_json`.
     pub trace: serde_json::Value,
+    /// Token accounting for the run (M3); `None` when no LLM call ran.
+    pub usage: Option<nevoflux_protocol::TurnUsage>,
 }
 
 /// Filter a mode's full tool catalog down to the run allowlist by removing any
@@ -257,9 +259,11 @@ pub async fn run_agent_once(
     // Reset interrupt flag so a stray prior cancel doesn't poison this run.
     services_for_run.reset_interrupt();
 
+    let turn_stats = crate::turn_stats::TurnStats::new();
     let mut host = crate::agent_host::DaemonHostFunctions::new(agent_config, runtime_handle)
         .with_services(services_for_run)
-        .with_session_id(req.session_id.clone());
+        .with_session_id(req.session_id.clone())
+        .with_turn_stats(turn_stats.clone());
     if let Some(budget) = req.token_budget.clone() {
         host = host.with_token_budget(budget);
     }
@@ -329,6 +333,7 @@ pub async fn run_agent_once(
             Ok(AgentExecOutcome {
                 text: out.text,
                 trace,
+                usage: turn_stats.snapshot(),
             })
         }
         Err(e) => Err(e.message),

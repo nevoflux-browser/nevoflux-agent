@@ -44,6 +44,9 @@ fn queued(id: &str) -> TaskResponse {
         output: None,
         error: None,
         artifacts: Vec::new(),
+        session_id: None,
+        usage: Vec::new(),
+        turn_outputs: Vec::new(),
     }
 }
 
@@ -153,6 +156,7 @@ mod tests {
     fn sample_request() -> TaskRequest {
         TaskRequest {
             task: "open example.com".into(),
+            followups: Vec::new(),
             mode: "browser".into(),
             profile: None,
             policy: PolicyRequest::default(),
@@ -181,6 +185,7 @@ mod tests {
                     output: Some("ok".into()),
                     error: None,
                     artifacts: vec![],
+                    ..Default::default()
                 }
             })
         });
@@ -216,6 +221,7 @@ mod tests {
                     output: Some("完成".into()),
                     error: None,
                     artifacts: vec![],
+                    ..Default::default()
                 }
             })
         });
@@ -246,6 +252,7 @@ mod tests {
                     output: None,
                     error: None,
                     artifacts: vec![],
+                    ..Default::default()
                 }
             })
         });

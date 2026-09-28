@@ -1,0 +1,22 @@
+{
+ "id": "j20-messenger",
+ "set": "j20",
+ "lang": "en",
+ "site": "messenger",
+ "task": "In {base}/index.html send Zhang San the message: Meeting moved to 3pm.",
+ "checks": [
+  {
+   "type": "event",
+   "kind": "msg_send",
+   "where": {
+    "to": "Zhang San",
+    "text": "Meeting moved to 3pm."
+   }
+  }
+ ],
+ "tags": [
+  "j20",
+  "messenger"
+ ],
+ "timeout_secs": 300
+}

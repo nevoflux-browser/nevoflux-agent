@@ -1,0 +1,30 @@
+{
+ "id": "jev-wiki-back-reference",
+ "set": "jev",
+ "lang": "en",
+ "site": "wiki",
+ "task": "Read {base}/en/Firefox.html and tell me which layout engine Firefox uses.",
+ "followups": [
+  {
+   "message": "Earlier you read about Firefox. Which browser was it the spiritual successor of? Answer from what you read.",
+   "delay_secs": 0
+  }
+ ],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "Gecko",
+   "turn": 0
+  },
+  {
+   "type": "output_regex",
+   "pattern": "Netscape",
+   "turn": 1
+  }
+ ],
+ "tags": [
+  "jev",
+  "multi"
+ ],
+ "timeout_secs": 300
+}

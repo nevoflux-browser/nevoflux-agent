@@ -1,0 +1,25 @@
+{
+ "id": "j20-zh-search",
+ "set": "j20",
+ "lang": "zh",
+ "site": "zh-shop",
+ "task": "在 {base}/index.html 搜索“机械键盘”，告诉我最便宜的那个叫什么、多少钱。",
+ "checks": [
+  {
+   "type": "event",
+   "kind": "search",
+   "where": {}
+  },
+  {
+   "type": "output_regex",
+   "pattern": "矮轴[\\s\\S]*239|239[\\s\\S]*矮轴",
+   "turn": -1
+  }
+ ],
+ "tags": [
+  "j20",
+  "shop"
+ ],
+ "timeout_secs": 300,
+ "note": "最便宜机械键盘 = Z-6 矮轴机械键盘 超薄 ¥239 (zh-shop/data.js)"
+}

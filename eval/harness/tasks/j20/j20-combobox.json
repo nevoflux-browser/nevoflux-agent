@@ -1,0 +1,21 @@
+{
+ "id": "j20-combobox",
+ "set": "j20",
+ "lang": "en",
+ "site": "widgets",
+ "task": "Open {base}/combobox.html and pick \"Singapore\" from the city picker.",
+ "checks": [
+  {
+   "type": "event",
+   "kind": "combo_pick",
+   "where": {
+    "value": "Singapore"
+   }
+  }
+ ],
+ "tags": [
+  "j20",
+  "combobox"
+ ],
+ "timeout_secs": 300
+}

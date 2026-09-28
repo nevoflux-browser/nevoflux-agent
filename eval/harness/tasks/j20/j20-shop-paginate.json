@@ -1,0 +1,21 @@
+{
+ "id": "j20-shop-paginate",
+ "set": "j20",
+ "lang": "en",
+ "site": "shop",
+ "task": "On {base}/search.html?q=a list every product on page 2 of the results.",
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "Fjord Compact Keyboard[\\s\\S]*Juniper Gaming Mouse",
+   "turn": -1
+  }
+ ],
+ "tags": [
+  "j20",
+  "shop",
+  "paginate"
+ ],
+ "timeout_secs": 300,
+ "note": "q=a matches 19 products in catalogue order; page 2 = Fjord Compact Keyboard .. Juniper Gaming Mouse"
+}

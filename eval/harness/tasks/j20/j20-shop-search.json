@@ -1,0 +1,25 @@
+{
+ "id": "j20-shop-search",
+ "set": "j20",
+ "lang": "en",
+ "site": "shop",
+ "task": "On {base}/index.html search for \"keyboard\" and tell me the cheapest result's name and price.",
+ "checks": [
+  {
+   "type": "event",
+   "kind": "search",
+   "where": {}
+  },
+  {
+   "type": "output_regex",
+   "pattern": "Cobalt[\\s\\S]*49\\.99|49\\.99[\\s\\S]*Cobalt",
+   "turn": -1
+  }
+ ],
+ "tags": [
+  "j20",
+  "shop"
+ ],
+ "timeout_secs": 300,
+ "note": "cheapest keyboard = K-3 Cobalt 60% Keyboard $49.99 (shop/data.js)"
+}

@@ -1,0 +1,21 @@
+{
+ "id": "jev-flights-cheapest",
+ "set": "jev",
+ "lang": "en",
+ "site": "flights",
+ "task": "On {base}/index.html find the cheapest direct flight from Shanghai to Singapore on 2026-10-09. Check every result page. End your reply with a final line in the form 'ANSWER: <flight number>'.",
+ "followups": [],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "ANSWER:\\s*NF752\\b",
+   "turn": -1
+  }
+ ],
+ "tags": [
+  "jev",
+  "long"
+ ],
+ "timeout_secs": 600,
+ "note": "flights/results.js: cheapest direct NF752 $219"
+}

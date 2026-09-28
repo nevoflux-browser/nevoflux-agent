@@ -1,0 +1,12 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Widgets — city picker</title>
+<script src="../_lib/beacon.js"></script>
+<h1>Pick a destination city</h1>
+<div id="combo">
+  <input id="city" role="combobox" aria-expanded="false" aria-controls="list"
+         aria-autocomplete="list" aria-label="City" autocomplete="off">
+  <ul id="list" role="listbox" hidden></ul>
+</div>
+<p id="status">No city selected</p>
+<script src="combobox.js"></script>

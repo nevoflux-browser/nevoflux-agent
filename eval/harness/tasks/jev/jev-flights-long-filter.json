@@ -1,0 +1,26 @@
+{
+ "id": "jev-flights-long-filter",
+ "set": "jev",
+ "lang": "en",
+ "site": "flights",
+ "task": "On {base}/index.html search Shanghai to Singapore on 2026-10-09 and list every direct flight under $300 across all result pages.",
+ "followups": [],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "NF752",
+   "turn": -1
+  },
+  {
+   "type": "output_regex",
+   "pattern": "NF118",
+   "turn": -1
+  }
+ ],
+ "tags": [
+  "jev",
+  "long"
+ ],
+ "timeout_secs": 600,
+ "note": "direct under $300: NF752 $219, NF118 $276"
+}

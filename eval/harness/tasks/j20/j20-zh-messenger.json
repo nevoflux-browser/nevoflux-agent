@@ -1,0 +1,22 @@
+{
+ "id": "j20-zh-messenger",
+ "set": "j20",
+ "lang": "zh",
+ "site": "messenger",
+ "task": "在 {base}/index.html 给张三发消息：会议改到下午三点。",
+ "checks": [
+  {
+   "type": "event",
+   "kind": "msg_send",
+   "where": {
+    "to": "Zhang San",
+    "text": "会议改到下午三点。"
+   }
+  }
+ ],
+ "tags": [
+  "j20",
+  "messenger"
+ ],
+ "timeout_secs": 300
+}

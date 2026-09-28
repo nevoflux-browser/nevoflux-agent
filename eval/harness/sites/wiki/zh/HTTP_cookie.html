@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>HTTP cookie — Wiki mirror</title>
+<h1>HTTP cookie</h1>
+<p>HTTP cookie，简称cookie，又称数码存根、小型文本文件、“网站／浏览＋魔饼／魔片”等，是浏览网站时由网络服务器创建并由网页浏览器存放在用户计算机或其他设备的小文本文件。Cookie使Web服务器能在用户的设备存储状态信息（如添加到在线商店购物车中的商品）或跟踪用户的浏览活动（如点击特定按钮、登录或记录历史）。</p>
+<h2>历史</h2>
+<p>“cookie”一词由网络浏览器程序员卢·蒙特利创造，源自“magic cookie”（1979年就已经出现，当时指UNIX程序收发的数据包）。“magic cookie”这词本身来自幸运饼。</p>
+<p>卢·蒙特利在1994年6月想到这点子时正在网景工作，公司则正在为MCI开发电子商务应用程序。文顿·瑟夫和约翰·克伦辛代表MCI与网景讨论技术，表示不希望总是由其服务器保存事务状态，而要求网景将状态存储在用户计算机。Cookies便是网景提出的解决方案。</p>
+<p>同年，蒙特利与约翰·詹南德雷亚一起编写了最初的网景cookie规范。1994年10月13日发布的网景导航者0.9beta版开始支持cookie。它公开的首次使用目的是检查网景网站的访问者是否已经访问过该网站。蒙特利于1995年申请了cookie技术的专利，1998年获批（US 5774670 ）。1995年10月发布的第2版Internet Explorer也宣布支持cookie。</p>
+<p>当时，cookie并未为公众所知，虽然默认用户接受cookie，网站并不会通知用户其存在。1996年2月12日，英国《金融时报》发表文章介绍cookie，使其为大众所知。其潜在的隐私问题也引起讨论，1996年和1997年的美国联邦贸易委员会两次就cookie举行听证会。</p>
+<p>互联网工程任务组专门成立了工作小组规范cookie的用法。布莱恩·贝伦多夫和大卫·克里斯托分别提出两套有关HTTP事务状态的替代方案。但由克里斯托本人和蒙特利领导的小组很快决定还是使用网景规范。1996年2月，工作组将第三方cookie确定为严重隐私威胁。该小组制定的规范RFC 2109最终于1997年2月发布，要求第三方cookie要么根本不允许，要么至少默认不启用。</p>
+<p>网景的cookie头字段为Set-Cookie，RFC 2965添加了Set-Cookie2头字段，即“RFC 2965 cookie”，但Set-Cookie2很少使用，终于2011年4月的RFC 6265中弃用，已经没有现代浏览器可以识别Set-Cookie2头字段。</p>
+<h2>结构</h2>
+<p>Cookie的基本结构包括</p>
+<p>名；</p>
+<p>值；</p>
+<p>各种属性。</p>
+<h3>属性</h3>
+<p>一块cookie可能有Domain、Path、Expires、Max-Age、Secure、HttpOnly等多种属性，如</p>
+<h4>Domain和Path</h4>
+<p>Domain和Path属性定义了cookie的范围。它们告诉浏览器cookie属于什么网站。Cookies只能设置在当前资源的顶级域及其子域上。</p>
+<p>如果服务器未指定cookie的Domain和Path，则它们默认为所请求资源的域和路径。</p>
+<h4>Expires和Max-Age</h4>
+<p>Expires属性定义了浏览器应删除cookie的时间，格式为Wdy, DD Mon YYYY HH:MM:SS GMT或Wdy, DD Mon YY HH:MM:SS GMT（YY大于或等于0并且小于等于69）。</p>
+<p>此外也可用Max-Age将cookie的过期时间设置为某一段时间之后（相对于浏览器接收cookie的时间而言）。但Internet Explorer等浏览器可能不支持Max-Age。</p>
+<h4>Secure和HttpOnly</h4>
+<p>Secure属性旨在将cookie加密，使浏览器仅通过安全／加密连接使用cookie。</p>
+<p>HttpOnly要求浏览器不要通过HTTP（和HTTPS）以外的渠道使用cookie。这意味着无法通过客户端脚本语言（尤其是JavaScript）访问cookie，因此无法通过跨站点脚本攻击轻易窃取。</p>
+<h2>分类</h2>
+<h3>会话cookie</h3>
+<p>会话cookie仅在浏览网站时临时存储，关闭浏览器后会自动过期或删除。</p>
+<h3>持久cookie</h3>
+<p>持久cookie只在其创建者设置的特定日期后过期，期间一直有效。</p>
+<h3>安全cookie</h3>
+<p>安全cookie只能通过加密连接传输（HTTPS）。它们不能通过未加密的连接传输（HTTP），使cookie不易被盗。</p>
+<h2>用途</h2>
+<h3>会话管理</h3>
+<p>虽然最初引入cookie是为了让用户在浏览网站时记录要购买的物品。但现在用户购物车的内容通常存储在服务器的数据库中，而不再是客户端的cookie中。</p>
+<p>当前会话cookie的常见用途是登录。当用户访问网站的登录页面时，Web服务器通常会向客户端发送一个包含唯一会话标识符的cookie。当用户成功登录时，服务器会记住该特定会话标识符已经过身份验证，并授予用户访问其服务的权限。</p>
+<h3>喜好设定</h3>
+<p>许多网站用cookie存储用户偏好等设置，向用户显示喜好内容。</p>
+<h3>跟踪</h3>
+<p>跟踪cookie用于跟踪记录用户的网络浏览习惯，如用户的购物习惯。</p>
+<h2>浏览器设置</h2>
+<p>大多数现代浏览器都支持cookie并允许用户禁用它们，以下是常见选项：</p>
+<p>完全启用或禁用cookie，以便它们始终被接受或始终被阻止；</p>
+<p>使用cookie管理器查看和有选择地删除cookie；</p>
+<p>彻底清除cookie等所有私人数据。</p>
+<p>此外也有管理cookie权限的附加组件。</p>
+<h2>安全和隐私</h2>
+<h3>第三方cookie和隐私</h3>
+<p>网页可能第三方服务，使用网页很可能会遇到第三方cookie（访问网页外其他服务器的cookie）。RFC 2109和RFC 2965要求浏览器保护用户隐私，默认不允许在服务器间共享cookie，但RFC 6265放宽。大多数浏览器只要第三方网站有合理的隐私政策申明，就默认允许第三方cookie。</p>
+<p>广告是第三方cookie常见的使用场景，广告公司借此跟踪用户。网站应当告知用户有第三方cookie存在，不向消费者披露第三方cookie使用情况的网站运营商可能面临法律风险，一般网站都会在隐私或cookie政策说明其使用的第三方cookie。</p>
+<h3>窃取cookie和劫持会话</h3>
+<p>很多网站用cookie作为用户的唯一标识符，但如果网站使用cookie作为会话标识符，攻击者就可以窃取受害者的全套cookie来冒充其请求。</p>
+<h2>参考文献</h2>
+<h2>外部链接</h2>
+<p>RFC 6265</p>
+<footer><p>Text from Wikipedia, CC BY-SA 4.0. See ../ATTRIBUTION.md.</p></footer>
+</html>

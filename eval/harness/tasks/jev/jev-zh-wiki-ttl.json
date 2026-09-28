@@ -1,0 +1,37 @@
+{
+ "id": "jev-zh-wiki-ttl",
+ "set": "jev",
+ "lang": "zh",
+ "site": "wiki",
+ "task": "阅读 {base}/zh/维基百科.html，维基百科是哪一年推出的？",
+ "followups": [
+  {
+   "message": "刚才那篇文章里，维基百科是由哪两个人合作推出的？",
+   "delay_secs": 360
+  }
+ ],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "2001",
+   "turn": 0
+  },
+  {
+   "type": "output_regex",
+   "pattern": "威尔[斯士]",
+   "turn": 1
+  },
+  {
+   "type": "output_regex",
+   "pattern": "桑格",
+   "turn": 1
+  }
+ ],
+ "tags": [
+  "jev",
+  "multi",
+  "ttl"
+ ],
+ "timeout_secs": 300,
+ "note": "zh/维基百科 吉米·威尔斯与拉里·桑格，2001年"
+}

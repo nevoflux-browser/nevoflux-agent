@@ -1,0 +1,37 @@
+{
+ "id": "jev-wiki-ttl-return",
+ "set": "jev",
+ "lang": "en",
+ "site": "wiki",
+ "task": "According to {base}/en/Search_engine.html, what was the first tool used for searching content on the Internet, and when did it debut?",
+ "followups": [
+  {
+   "message": "Remind me: what was that first search tool called, and in which year did it debut?",
+   "delay_secs": 360
+  }
+ ],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "Archie",
+   "turn": 0
+  },
+  {
+   "type": "output_regex",
+   "pattern": "Archie",
+   "turn": 1
+  },
+  {
+   "type": "output_regex",
+   "pattern": "1990",
+   "turn": 1
+  }
+ ],
+ "tags": [
+  "jev",
+  "multi",
+  "ttl"
+ ],
+ "timeout_secs": 300,
+ "note": "en/Search_engine: Archie, debuted 10 September 1990"
+}

@@ -1,0 +1,25 @@
+{
+ "id": "jev-zh-wiki-irrelevant",
+ "set": "jev",
+ "lang": "zh",
+ "site": "wiki",
+ "task": "读 {base}/zh/上海市.html 和 {base}/zh/维基百科.html。",
+ "followups": [
+  {
+   "message": "这些先不管。{base}/zh/Firefox.html 里说 Firefox 用的是什么排版引擎？",
+   "delay_secs": 0
+  }
+ ],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "Gecko",
+   "turn": 1
+  }
+ ],
+ "tags": [
+  "jev",
+  "multi"
+ ],
+ "timeout_secs": 300
+}

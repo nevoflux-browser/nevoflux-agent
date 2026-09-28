@@ -56,7 +56,7 @@ fn should_soft_reset(runs_script_backend: bool, env_val: Option<&str>) -> bool {
 }
 
 /// Result of one attempt at a task.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AttemptOutcome {
     /// Whether the attempt completed the task.
     pub success: bool,
@@ -66,10 +66,16 @@ pub struct AttemptOutcome {
     pub output: Option<String>,
     /// Error detail, if failed.
     pub error: Option<String>,
+    /// Session id the attempt ran under (what `session export` takes).
+    pub session_id: Option<String>,
+    /// Per-turn LLM accounting (M3); one entry per turn that called the LLM.
+    pub usage: Vec<nevoflux_protocol::TurnUsage>,
+    /// Final text of each turn, in order (see [`run_turns`]).
+    pub turn_outputs: Vec<String>,
 }
 
 /// Terminal result of a task after retries.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SessionOutcome {
     /// Final status.
     pub status: TaskStatus,
@@ -79,6 +85,68 @@ pub struct SessionOutcome {
     pub output: Option<String>,
     /// Final error, if failed.
     pub error: Option<String>,
+    /// Session id of the last attempt.
+    pub session_id: Option<String>,
+    /// Per-turn usage of the last attempt.
+    pub usage: Vec<nevoflux_protocol::TurnUsage>,
+    /// Per-turn outputs of the last attempt.
+    pub turn_outputs: Vec<String>,
+}
+
+/// Run the first message and each follow-up as consecutive turns of one
+/// conversation. History is the plain text of earlier turns — the same thing
+/// a chat carries across turns when Jev is off. Stops at the first failed
+/// turn; later turns would be answering a conversation that went wrong.
+pub(crate) async fn run_turns<F, Fut, S>(
+    first: &str,
+    followups: &[crate::http::types::Followup],
+    sleep: S,
+    mut run: F,
+) -> AttemptOutcome
+where
+    F: FnMut(String, Vec<crate::http::types::HistoryTurn>) -> Fut,
+    Fut: Future<Output = AttemptOutcome>,
+    S: Fn(u64) -> futures::future::BoxFuture<'static, ()>,
+{
+    use crate::http::types::HistoryTurn;
+    let mut history: Vec<HistoryTurn> = Vec::new();
+    let mut acc = AttemptOutcome::default();
+    let messages = std::iter::once((first.to_string(), 0u64))
+        .chain(followups.iter().map(|f| (f.message.clone(), f.delay_secs)));
+    for (msg, delay) in messages {
+        if delay > 0 {
+            sleep(delay).await;
+        }
+        let turn = run(msg.clone(), history.clone()).await;
+        acc.tainted |= turn.tainted;
+        acc.usage.extend(turn.usage);
+        acc.session_id = turn.session_id.or(acc.session_id);
+        let text = turn.output.clone().unwrap_or_default();
+        acc.turn_outputs.push(text.clone());
+        acc.output = turn.output;
+        if !turn.success {
+            acc.success = false;
+            acc.error = turn.error;
+            return acc;
+        }
+        history.push(HistoryTurn {
+            role: "user".into(),
+            content: msg,
+        });
+        history.push(HistoryTurn {
+            role: "assistant".into(),
+            content: text,
+        });
+        acc.success = true;
+    }
+    acc
+}
+
+/// Session id for one attempt of one headless task. Carries the task id so
+/// events from different tasks never pile up under the same id in
+/// `session_events` (they used to share `automation-1`).
+pub fn automation_session_id(task_id: &str, attempt: u32) -> String {
+    format!("automation-{task_id}-{attempt}")
 }
 
 /// Drive a task with taint-gated retry (≤3, untainted-only; `idempotent`
@@ -102,6 +170,9 @@ where
                 attempts: attempt,
                 output: outcome.output,
                 error: None,
+                session_id: outcome.session_id,
+                usage: outcome.usage,
+                turn_outputs: outcome.turn_outputs,
             };
         }
         if retry_decision(attempt, outcome.tainted, policy) {
@@ -112,6 +183,9 @@ where
             attempts: attempt,
             output: outcome.output,
             error: outcome.error,
+            session_id: outcome.session_id,
+            usage: outcome.usage,
+            turn_outputs: outcome.turn_outputs,
         };
     }
 }
@@ -138,6 +212,7 @@ pub async fn execute_task_attempt(
     mode: nevoflux_builtin_wasm::AgentMode,
     session_id: String,
     history: &[crate::http::types::HistoryTurn],
+    followups: &[crate::http::types::Followup],
     script_call: Option<&ScriptCall>,
 ) -> AttemptOutcome {
     let Some(agent_config) = services_template.agent_config.clone() else {
@@ -146,6 +221,7 @@ pub async fn execute_task_attempt(
             tainted: false,
             output: None,
             error: Some("no agent_config on services".into()),
+            ..Default::default()
         };
     };
     let Some(runtime_handle) = services_template.runtime_handle.clone() else {
@@ -154,6 +230,7 @@ pub async fn execute_task_attempt(
             tainted: false,
             output: None,
             error: Some("no runtime_handle on services".into()),
+            ..Default::default()
         };
     };
 
@@ -170,11 +247,56 @@ pub async fn execute_task_attempt(
         return run_headless_script(&services, &script_path, task, script_call);
     }
 
+    let initial_history = history.to_vec();
+    run_turns(
+        task,
+        followups,
+        |secs| {
+            Box::pin(tokio::time::sleep(Duration::from_secs(secs)))
+                as futures::future::BoxFuture<'static, ()>
+        },
+        |msg, hist| {
+            // A caller-supplied history (A2A) comes before this task's turns.
+            let mut full = initial_history.clone();
+            full.extend(hist);
+            run_one_turn(
+                services.clone(),
+                agent_config.clone(),
+                runtime_handle.clone(),
+                policy,
+                mode,
+                session_id.clone(),
+                msg,
+                full,
+            )
+        },
+    )
+    .await
+}
+
+/// One agent turn of a headless task: a fresh host and agent (with their own
+/// TurnStats) over the shared session id, so turns of one task land in one
+/// `session_events` stream.
+#[allow(clippy::too_many_arguments)]
+async fn run_one_turn(
+    services: HostServices,
+    agent_config: std::sync::Arc<crate::config::AgentConfig>,
+    runtime_handle: tokio::runtime::Handle,
+    policy: &Policy,
+    mode: nevoflux_builtin_wasm::AgentMode,
+    session_id: String,
+    user_message: String,
+    history: Vec<crate::http::types::HistoryTurn>,
+) -> AttemptOutcome {
     // Own session state for the same reason a chat gets one: this is a task,
     // and the template's copy is shared by the whole process.
+    // Per-turn accounting (M3): the same TurnStats the sidebar uses, so a
+    // headless trial reports usage the way a chat reply does.
+    let turn_stats = crate::turn_stats::TurnStats::new();
     let host = DaemonHostFunctions::new(agent_config, runtime_handle)
         .with_services(services.with_own_session_state())
-        .with_session_id(session_id.clone());
+        .with_session_id(session_id.clone())
+        .with_turn_stats(turn_stats.clone());
     let agent = nevoflux_builtin_wasm::Agent::new(host);
 
     let mode_tools: Vec<String> = agent
@@ -189,7 +311,7 @@ pub async fn execute_task_attempt(
         skills_filter: None,
         session_id,
         mode,
-        user_message: task.to_string(),
+        user_message,
         history: history
             .iter()
             .map(|h| nevoflux_builtin_wasm::Message {
@@ -222,7 +344,7 @@ pub async fn execute_task_attempt(
     // `Agent::run` is synchronous (host fns block on the stashed runtime handle
     // for async LLM calls); wrap in spawn_blocking to not hog the executor.
     let outcome = tokio::task::spawn_blocking(move || agent.run(&input)).await;
-    match outcome {
+    let mut result = match outcome {
         Ok(Ok(out)) => {
             let tainted = out
                 .tool_calls
@@ -233,6 +355,7 @@ pub async fn execute_task_attempt(
                 tainted,
                 output: Some(out.text),
                 error: None,
+                ..Default::default()
             }
         }
         Ok(Err(e)) => AttemptOutcome {
@@ -240,14 +363,19 @@ pub async fn execute_task_attempt(
             tainted: true,
             output: None,
             error: Some(e.message),
+            ..Default::default()
         },
         Err(e) => AttemptOutcome {
             success: false,
             tainted: true,
             output: None,
             error: Some(format!("agent task panicked: {e}")),
+            ..Default::default()
         },
-    }
+    };
+    // Failed attempts cost money too, so usage is kept either way.
+    result.usage = turn_stats.snapshot().into_iter().collect();
+    result
 }
 
 /// Headless fixed-script execution (Q16): run the user's Python `run(task)` via
@@ -274,6 +402,7 @@ fn run_headless_script(
                 error: Some(format!(
                     "headless script mode: cannot read NEVOFLUX_HEADLESS_SCRIPT '{script_path}': {e}"
                 )),
+                ..Default::default()
             };
         }
     };
@@ -283,6 +412,7 @@ fn run_headless_script(
             tainted: false,
             output: None,
             error: Some("headless script mode: no bound browser context".into()),
+            ..Default::default()
         };
     };
 
@@ -344,6 +474,7 @@ fn run_headless_script(
             tainted: true,
             output: Some(text),
             error: None,
+            ..Default::default()
         }
     } else {
         let message = result
@@ -370,6 +501,7 @@ fn run_headless_script(
             tainted: true,
             output: None,
             error: Some(message),
+            ..Default::default()
         }
     }
 }
@@ -424,6 +556,10 @@ pub struct AutomationDeps {
     /// Non-empty only on the A2A path, where a `contextId` makes several tasks
     /// one conversation. Everywhere else a task is a fresh run.
     pub history: Vec<crate::http::types::HistoryTurn>,
+    /// Queue id of the task (`task-N`); part of the session id.
+    pub task_id: String,
+    /// Follow-up turns (full-task path only).
+    pub followups: Vec<crate::http::types::Followup>,
 }
 
 /// The binding for a call served in this process: none at all.
@@ -511,6 +647,7 @@ async fn settled_by_skiff(
             deps.mode,
             format!("skiff-{attempt}"),
             &deps.history,
+            &[],
             deps.script_call.as_ref(),
         )
         .await
@@ -569,6 +706,7 @@ pub async fn execute_full_task(
                         tainted: false,
                         output: None,
                         error: Some("this task needs a browser; set NEVOFLUX_BROWSER_BIN".into()),
+                        ..Default::default()
                     };
                 };
                 let clone = match deps.profile_mgr.clone_base(&deps.profile) {
@@ -579,6 +717,7 @@ pub async fn execute_full_task(
                             tainted: false,
                             output: None,
                             error: Some(format!("profile clone failed: {e}")),
+                            ..Default::default()
                         }
                     }
                 };
@@ -599,27 +738,33 @@ pub async fn execute_full_task(
                             tainted: false, // browser never started ⇒ untainted (retryable)
                             output: None,
                             error: Some(format!("browser launch failed: {e}")),
+                            ..Default::default()
                         },
                         Ok(mut handle) => {
                             let outcome = match deps.registry.single() {
                                 Ok(browser) => {
-                                    execute_task_attempt(
+                                    let sid = automation_session_id(&deps.task_id, attempt);
+                                    let mut out = execute_task_attempt(
                                         deps.services_template.clone(),
                                         &browser,
                                         policy,
                                         task,
                                         deps.mode,
-                                        format!("automation-{attempt}"),
+                                        sid.clone(),
                                         &deps.history,
+                                        &deps.followups,
                                         deps.script_call.as_ref(),
                                     )
-                                    .await
+                                    .await;
+                                    out.session_id = Some(sid);
+                                    out
                                 }
                                 Err(e) => AttemptOutcome {
                                     success: false,
                                     tainted: false,
                                     output: None,
                                     error: Some(format!("binding failed: {e}")),
+                                    ..Default::default()
                                 },
                             };
                             // Reap the launcher child for this attempt.
@@ -711,6 +856,7 @@ fn failed(msg: String) -> SessionOutcome {
         attempts: 1,
         output: None,
         error: Some(msg),
+        ..Default::default()
     }
 }
 
@@ -845,6 +991,7 @@ pub async fn execute_session_task(
                     tainted: false,
                     output: None,
                     error: Some(format!("binding failed: {e}")),
+                    ..Default::default()
                 }
             }
         };
@@ -856,6 +1003,7 @@ pub async fn execute_session_task(
             deps.mode,
             format!("session-{attempt}"),
             &deps.history,
+            &[],
             deps.script_call.as_ref(),
         )
         .await
@@ -1069,6 +1217,7 @@ mod tests {
             tainted,
             output: None,
             error: Some("boom".into()),
+            ..Default::default()
         }
     }
 
@@ -1078,6 +1227,7 @@ mod tests {
             tainted: false,
             output: Some("done".into()),
             error: None,
+            ..Default::default()
         }
     }
 
@@ -1161,11 +1311,87 @@ mod tests {
             nevoflux_builtin_wasm::AgentMode::Browser,
             "sess-1".into(),
             &[],
+            &[],
             None,
         )
         .await;
         assert!(!out.success);
         assert!(!out.tainted, "setup failure must be untainted (retryable)");
         assert!(out.error.unwrap().contains("agent_config"));
+    }
+
+    #[test]
+    fn automation_session_id_is_unique_per_task_and_attempt() {
+        assert_eq!(automation_session_id("task-3", 1), "automation-task-3-1");
+        assert_ne!(
+            automation_session_id("task-3", 1),
+            automation_session_id("task-4", 1)
+        );
+        assert_ne!(
+            automation_session_id("task-3", 1),
+            automation_session_id("task-3", 2)
+        );
+    }
+
+    #[tokio::test]
+    async fn run_turns_threads_history_and_stops_on_failure() {
+        use crate::http::types::{Followup, HistoryTurn};
+        let followups = vec![
+            Followup {
+                message: "second".into(),
+                delay_secs: 0,
+            },
+            Followup {
+                message: "third".into(),
+                delay_secs: 7,
+            },
+        ];
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, usize)>::new()));
+        let slept = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+        let seen2 = seen.clone();
+        let slept2 = slept.clone();
+        let out = run_turns(
+            "first",
+            &followups,
+            move |s| {
+                slept2.lock().unwrap().push(s);
+                Box::pin(async {}) as futures::future::BoxFuture<'static, ()>
+            },
+            move |msg: String, hist: Vec<HistoryTurn>| {
+                seen2.lock().unwrap().push((msg.clone(), hist.len()));
+                async move {
+                    AttemptOutcome {
+                        success: msg != "third",
+                        output: Some(format!("re:{msg}")),
+                        error: (msg == "third").then(|| "boom".into()),
+                        ..Default::default()
+                    }
+                }
+            },
+        )
+        .await;
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![
+                ("first".into(), 0),
+                ("second".into(), 2),
+                ("third".into(), 4)
+            ]
+        );
+        assert_eq!(*slept.lock().unwrap(), vec![7]); // zero delays are skipped
+        assert!(!out.success);
+        assert_eq!(out.turn_outputs, vec!["re:first", "re:second", "re:third"]);
+        assert_eq!(out.error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn followups_default_to_empty_and_parse() {
+        let r: crate::http::types::TaskRequest = serde_json::from_str(r#"{"task":"a"}"#).unwrap();
+        assert!(r.followups.is_empty());
+        let r: crate::http::types::TaskRequest =
+            serde_json::from_str(r#"{"task":"a","followups":[{"message":"b","delay_secs":360}]}"#)
+                .unwrap();
+        assert_eq!(r.followups[0].delay_secs, 360);
     }
 }

@@ -3,6 +3,16 @@
 
 use serde::{Deserialize, Serialize};
 
+/// A follow-up message: a further turn of the same task conversation.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct Followup {
+    /// What the user says in this turn.
+    pub message: String,
+    /// Seconds to wait before sending it (e.g. to let a prompt cache expire).
+    #[serde(default)]
+    pub delay_secs: u64,
+}
+
 /// One turn of a conversation (process-internal; never serialized).
 #[derive(Debug, Clone, PartialEq)]
 pub struct HistoryTurn {
@@ -45,6 +55,9 @@ impl Default for PolicyRequest {
 pub struct TaskRequest {
     /// The instruction for the agent.
     pub task: String,
+    /// Further turns of the same conversation, run after `task`.
+    #[serde(default)]
+    pub followups: Vec<Followup>,
     /// Agent mode (default `browser`).
     #[serde(default = "default_mode")]
     pub mode: String,
@@ -154,6 +167,7 @@ impl TaskRequest {
         }
         Self {
             task,
+            followups: Vec::new(),
             mode: std::env::var("NEVOFLUX_TASK_MODE").unwrap_or_else(|_| default_mode()),
             profile: std::env::var("NEVOFLUX_TASK_PROFILE")
                 .ok()
@@ -210,6 +224,12 @@ pub enum TaskStatus {
     Canceled,
 }
 
+impl Default for TaskStatus {
+    fn default() -> Self {
+        TaskStatus::Queued
+    }
+}
+
 impl TaskStatus {
     /// Whether this is a terminal state. Polling and SSE both use it to decide
     /// when to stop.
@@ -222,7 +242,7 @@ impl TaskStatus {
 }
 
 /// Task result / status snapshot.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct TaskResponse {
     /// Task id.
     pub id: String,
@@ -238,6 +258,16 @@ pub struct TaskResponse {
     pub error: Option<String>,
     /// Drained artifact paths (relative to the task workspace).
     pub artifacts: Vec<String>,
+    /// Session id of the (last) attempt, for `session export`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Per-turn LLM usage (M3); absent when no LLM call ran.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub usage: Vec<nevoflux_protocol::TurnUsage>,
+    /// Each turn's final text, when the task had follow-ups; `output` is the
+    /// last of them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub turn_outputs: Vec<String>,
 }
 
 #[cfg(test)]
@@ -305,6 +335,7 @@ mod tests {
             output: None,
             error: Some("cancelled".into()),
             artifacts: vec![],
+            ..Default::default()
         };
         let s = serde_json::to_string(&r).unwrap();
         assert!(s.contains(r#""status":"canceled""#), "got {s}");
@@ -335,11 +366,60 @@ mod tests {
             output: None,
             error: None,
             artifacts: vec![],
+            ..Default::default()
         };
         let s = serde_json::to_string(&r).unwrap();
         assert!(s.contains(r#""status":"running""#));
         assert!(s.contains(r#""id":"t1""#));
         // output/error omitted when None
         assert!(!s.contains("output"));
+    }
+
+    #[test]
+    fn task_response_serializes_session_id_only_when_present() {
+        let mut r = TaskResponse {
+            id: "task-1".into(),
+            status: TaskStatus::Succeeded,
+            attempts: 1,
+            output: None,
+            error: None,
+            artifacts: vec![],
+            session_id: None,
+            usage: vec![],
+            turn_outputs: vec![],
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        assert!(v.get("session_id").is_none());
+        r.session_id = Some("automation-task-1-1".into());
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["session_id"], "automation-task-1-1");
+    }
+
+    #[test]
+    fn task_response_carries_per_turn_usage() {
+        let usage = nevoflux_protocol::TurnUsage {
+            main: nevoflux_protocol::UsageBucket {
+                input: 1200,
+                output: 80,
+                calls: 3,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let r = TaskResponse {
+            id: "task-1".into(),
+            status: TaskStatus::Succeeded,
+            attempts: 1,
+            usage: vec![usage],
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["usage"][0]["main"]["input"], 1200);
+        assert_eq!(v["usage"][0]["main"]["calls"], 3);
+        let empty = serde_json::to_value(TaskResponse::default()).unwrap();
+        assert!(
+            empty.get("usage").is_none(),
+            "no usage key when nothing ran"
+        );
     }
 }

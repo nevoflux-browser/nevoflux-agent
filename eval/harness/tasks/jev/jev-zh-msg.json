@@ -1,0 +1,22 @@
+{
+ "id": "jev-zh-msg",
+ "set": "jev",
+ "lang": "zh",
+ "site": "messenger",
+ "task": "读 {root}/wiki/zh/高速铁路.html，然后在 {base}/index.html 把一句话总结发给张三。",
+ "followups": [],
+ "checks": [
+  {
+   "type": "event",
+   "kind": "msg_send",
+   "where": {
+    "to": "Zhang San"
+   }
+  }
+ ],
+ "tags": [
+  "jev",
+  "write"
+ ],
+ "timeout_secs": 300
+}

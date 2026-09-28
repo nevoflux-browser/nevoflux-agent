@@ -1,0 +1,25 @@
+{
+ "id": "j20-slow-report-effect",
+ "set": "j20",
+ "lang": "en",
+ "site": "widgets",
+ "task": "Open {base}/slow.html, click Pay now once, and report the final status text.",
+ "checks": [
+  {
+   "type": "event_count",
+   "kind": "pay_click",
+   "op": "==",
+   "n": 1
+  },
+  {
+   "type": "output_regex",
+   "pattern": "(?<!not )(?<!un)\\bpaid\\b",
+   "turn": -1
+  }
+ ],
+ "tags": [
+  "j20",
+  "slow"
+ ],
+ "timeout_secs": 300
+}

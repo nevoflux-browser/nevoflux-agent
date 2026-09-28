@@ -1,0 +1,25 @@
+{
+ "id": "jev-zh-wiki-compare",
+ "set": "jev",
+ "lang": "zh",
+ "site": "wiki",
+ "task": "读 {base}/zh/网页浏览器.html 和 {base}/zh/Firefox.html，说出一个两篇都提到的浏览器，以及 Firefox 是否开源。",
+ "followups": [],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "Firefox|火狐",
+   "turn": -1
+  },
+  {
+   "type": "output_regex",
+   "pattern": "开源|开放源代码",
+   "turn": -1
+  }
+ ],
+ "tags": [
+  "jev",
+  "read"
+ ],
+ "timeout_secs": 300
+}

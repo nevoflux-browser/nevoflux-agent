@@ -1,0 +1,25 @@
+{
+ "id": "j20-flights-search",
+ "set": "j20",
+ "lang": "en",
+ "site": "flights",
+ "task": "On {base}/index.html search direct flights from Shanghai to Singapore on 2026-10-09.",
+ "checks": [
+  {
+   "type": "event",
+   "kind": "flight_search",
+   "where": {
+    "from": "Shanghai",
+    "to": "Singapore",
+    "date": "2026-10-09",
+    "direct": true
+   }
+  }
+ ],
+ "tags": [
+  "j20",
+  "flights",
+  "combobox"
+ ],
+ "timeout_secs": 300
+}
