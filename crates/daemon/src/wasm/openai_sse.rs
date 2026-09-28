@@ -159,11 +159,23 @@ pub fn usage_from(chunk: &serde_json::Value) -> Option<LlmUsage> {
     if usage.is_null() {
         return None;
     }
+    // Cache hits are already inside prompt_tokens on this wire. DeepSeek names
+    // them `prompt_cache_hit_tokens`; the OpenAI-compatible form is
+    // `prompt_tokens_details.cached_tokens`. Neither reports cache writes.
+    let cache_read = usage["prompt_cache_hit_tokens"]
+        .as_u64()
+        .or_else(|| {
+            usage
+                .pointer("/prompt_tokens_details/cached_tokens")?
+                .as_u64()
+        })
+        .map(|v| v as u32);
     Some(LlmUsage {
         prompt_tokens: usage["prompt_tokens"].as_u64().unwrap_or(0) as u32,
         completion_tokens: usage["completion_tokens"].as_u64().unwrap_or(0) as u32,
         total_tokens: usage["total_tokens"].as_u64().unwrap_or(0) as u32,
-        ..Default::default()
+        cache_read_tokens: cache_read,
+        cache_write_tokens: None,
     })
 }
 
@@ -275,6 +287,32 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 10);
         assert_eq!(usage.completion_tokens, 5);
         assert_eq!(usage.total_tokens, 15);
+    }
+
+    /// DeepSeek reports cache hits as `prompt_cache_hit_tokens`; the
+    /// OpenAI-compatible form is `prompt_tokens_details.cached_tokens`. Both
+    /// are already inside `prompt_tokens`.
+    #[test]
+    fn usage_from_reads_cache_hits() {
+        let deepseek = serde_json::json!({"usage": {
+            "prompt_tokens": 1000, "completion_tokens": 5, "total_tokens": 1005,
+            "prompt_cache_hit_tokens": 700, "prompt_cache_miss_tokens": 300
+        }});
+        let u = usage_from(&deepseek).unwrap();
+        assert_eq!(
+            (u.prompt_tokens, u.cache_read_tokens, u.cache_write_tokens),
+            (1000, Some(700), None)
+        );
+
+        let openai = serde_json::json!({"usage": {
+            "prompt_tokens": 2000, "completion_tokens": 5, "total_tokens": 2005,
+            "prompt_tokens_details": {"cached_tokens": 1500}
+        }});
+        let u = usage_from(&openai).unwrap();
+        assert_eq!((u.prompt_tokens, u.cache_read_tokens), (2000, Some(1500)));
+
+        let plain = serde_json::json!({"usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}});
+        assert_eq!(usage_from(&plain).unwrap().cache_read_tokens, None);
     }
 
     #[test]

@@ -24,6 +24,8 @@ def summarize(rows) -> dict:
     turns = [u for r in rows for u in (r.get("usage") or [])]
     buckets = [b for u in turns for b in (u.get("main"), u.get("subagent")) if b]
     missing = sum(r["status"] in MISSING for r in rows) / len(rows) if rows else 0.0
+    total_input = sum(b.get("input", 0) for b in buckets)
+    cache_read = sum(b.get("cache_read") or 0 for b in buckets)
     return {
         "per_rep_score": per_rep,
         "mean": statistics.mean(per_rep) if per_rep else 0.0,
@@ -34,8 +36,12 @@ def summarize(rows) -> dict:
         "missing_rate": missing,
         "eval_invalid": missing > 0.10,
         "cost": {
-            "input": sum(b.get("input", 0) for b in buckets),
+            "input": total_input,
             "output": sum(b.get("output", 0) for b in buckets),
+            # Cache reads/writes are part of `input`; None-reporting calls add 0.
+            "cache_read": cache_read,
+            "cache_write": sum(b.get("cache_write") or 0 for b in buckets),
+            "cache_hit_ratio": cache_read / total_input if total_input else 0.0,
             "estimated_share": (sum(bool(u.get("main", {}).get("estimated")) for u in turns) / len(turns)
                                 if turns else 0.0),
         },

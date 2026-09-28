@@ -30,6 +30,17 @@ class CalibrateTest(unittest.TestCase):
         self.assertEqual(s["cost"]["input"], 400)
         self.assertAlmostEqual(s["cost"]["estimated_share"], 0.5)
 
+    def test_cache_totals_and_hit_ratio(self):
+        r = row(0, "a", True, inp=1000)
+        r["usage"][0]["main"]["cache_read"] = 800
+        r["usage"][0]["main"]["cache_write"] = 100
+        s = summarize([r, row(0, "b", True, inp=1000)])
+        self.assertEqual((s["cost"]["cache_read"], s["cost"]["cache_write"]), (800, 100))
+        self.assertAlmostEqual(s["cost"]["cache_hit_ratio"], 0.4)
+
+    def test_cache_hit_ratio_is_zero_without_input(self):
+        self.assertEqual(summarize([])["cost"]["cache_hit_ratio"], 0.0)
+
     def test_resumed_runs_count_only_the_latest_row(self):
         rows = [row(0, "a", False, status="provider_error"), row(0, "a", True)]
         s = summarize(rows)
