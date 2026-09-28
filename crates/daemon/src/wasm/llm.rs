@@ -1551,6 +1551,13 @@ async fn execute_deepseek_chat_raw(
 /// elsewhere, currently dropping `reasoning_content` from the response
 /// (matches `execute_deepseek_chat_raw`'s known limitation). The
 /// streaming path is where reasoning actually flows back to the host.
+/// Messages endpoint for the raw Anthropic path; real Anthropic when no
+/// base URL is configured.
+fn anthropic_messages_url(base_url: Option<&str>) -> String {
+    let base = base_url.unwrap_or("https://api.anthropic.com");
+    format!("{}/v1/messages", base.trim_end_matches('/'))
+}
+
 async fn execute_anthropic_chat_raw(
     api_key: &str,
     model: &str,
@@ -1566,15 +1573,12 @@ async fn execute_anthropic_chat_raw(
             cache: false,
         },
     );
-    let base = base_url
-        .ok_or_else(|| DaemonError::InternalError("Anthropic-raw requires base_url".into()))?;
-    let url = format!("{}/v1/messages", base.trim_end_matches('/'));
+    let url = anthropic_messages_url(base_url);
 
     tracing::debug!(
-        base_url = base,
         full_url = %url,
         model = model,
-        "Anthropic-raw (MiMo) chat POST"
+        "Anthropic-raw chat POST"
     );
 
     let client = reqwest::Client::new();
@@ -1632,6 +1636,8 @@ async fn execute_anthropic_chat_raw(
     }
 
     let finish_reason = raw["stop_reason"].as_str().unwrap_or("stop").to_string();
+    let mut usage_acc = AnthropicUsageAcc::default();
+    usage_acc.apply(&raw);
 
     Ok(LlmChatResponse {
         content: content_text,
@@ -1641,7 +1647,7 @@ async fn execute_anthropic_chat_raw(
         } else {
             Some(tool_calls)
         },
-        usage: None,
+        usage: usage_acc.into_usage(),
         images: vec![],
     })
 }
@@ -3344,6 +3350,10 @@ async fn stream_deepseek_raw(
 struct AnthropicUsageAcc {
     input: Option<u64>,
     output: Option<u64>,
+    /// `cache_read_input_tokens`: input served from the prompt cache.
+    cache_read: Option<u64>,
+    /// `cache_creation_input_tokens`: input written to the prompt cache.
+    cache_write: Option<u64>,
 }
 
 impl AnthropicUsageAcc {
@@ -3361,6 +3371,12 @@ impl AnthropicUsageAcc {
         if let Some(v) = usage["output_tokens"].as_u64() {
             self.output = Some(v);
         }
+        if let Some(v) = usage["cache_read_input_tokens"].as_u64() {
+            self.cache_read = Some(v);
+        }
+        if let Some(v) = usage["cache_creation_input_tokens"].as_u64() {
+            self.cache_write = Some(v);
+        }
     }
 
     /// Only counts as usage when at least one field arrived.
@@ -3368,13 +3384,19 @@ impl AnthropicUsageAcc {
         if self.input.is_none() && self.output.is_none() {
             return None;
         }
-        let prompt = self.input.unwrap_or(0) as u32;
+        // Anthropic's `input_tokens` counts only the uncached part; our
+        // prompt_tokens means all input, so the cache parts are added once.
+        let cache_read = self.cache_read.map(|v| v as u32);
+        let cache_write = self.cache_write.map(|v| v as u32);
+        let prompt =
+            self.input.unwrap_or(0) as u32 + cache_read.unwrap_or(0) + cache_write.unwrap_or(0);
         let completion = self.output.unwrap_or(0) as u32;
         Some(LlmUsage {
             prompt_tokens: prompt,
             completion_tokens: completion,
             total_tokens: prompt + completion,
-            ..Default::default()
+            cache_read_tokens: cache_read,
+            cache_write_tokens: cache_write,
         })
     }
 }
@@ -3421,15 +3443,12 @@ async fn stream_anthropic_raw(
             cache: false,
         },
     );
-    let base = base_url
-        .ok_or_else(|| DaemonError::InternalError("Anthropic-raw requires base_url".into()))?;
-    let url = format!("{}/v1/messages", base.trim_end_matches('/'));
+    let url = anthropic_messages_url(base_url);
 
     tracing::debug!(
-        base_url = base,
         full_url = %url,
         model = model,
-        "Anthropic-raw (MiMo) streaming POST"
+        "Anthropic-raw streaming POST"
     );
 
     let http_client = reqwest::Client::new();
@@ -3462,7 +3481,10 @@ async fn stream_anthropic_raw(
         name: String,
         partial_input: String,
     }
-    let mut tool_uses: HashMap<i64, ToolUseAccum> = HashMap::new();
+    // Ordered by content-block index, so parallel calls reach the history in
+    // the order the model wrote them (a HashMap made the prefix differ).
+    let mut tool_uses: std::collections::BTreeMap<i64, ToolUseAccum> =
+        std::collections::BTreeMap::new();
     // Token usage, spread across message_start and message_delta.
     let mut usage_acc = AnthropicUsageAcc::default();
 
@@ -6753,6 +6775,51 @@ mod tests {
         assert_eq!(body["system"], "SYS");
         assert_eq!(body["messages"][0]["content"], "q");
         assert!(!body.to_string().contains("cache_control"));
+    }
+
+    #[test]
+    fn usage_acc_total_input_includes_cache() {
+        let mut acc = super::AnthropicUsageAcc::default();
+        acc.apply(
+            &serde_json::json!({"type": "message_start", "message": {"usage": {
+                "input_tokens": 100,
+                "cache_read_input_tokens": 9000,
+                "cache_creation_input_tokens": 400,
+                "output_tokens": 1
+            }}}),
+        );
+        acc.apply(&serde_json::json!({"type": "message_delta", "usage": {"output_tokens": 50}}));
+        let u = acc.into_usage().unwrap();
+        assert_eq!(u.prompt_tokens, 9500);
+        assert_eq!(u.completion_tokens, 50);
+        assert_eq!(u.total_tokens, 9550);
+        assert_eq!(
+            (u.cache_read_tokens, u.cache_write_tokens),
+            (Some(9000), Some(400))
+        );
+    }
+
+    #[test]
+    fn usage_acc_without_cache_fields_leaves_them_none() {
+        let mut acc = super::AnthropicUsageAcc::default();
+        acc.apply(&serde_json::json!({"usage": {"input_tokens": 100, "output_tokens": 5}}));
+        let u = acc.into_usage().unwrap();
+        assert_eq!(
+            (u.prompt_tokens, u.cache_read_tokens, u.cache_write_tokens),
+            (100, None, None)
+        );
+    }
+
+    #[test]
+    fn anthropic_messages_url_defaults_to_api_anthropic_com() {
+        assert_eq!(
+            super::anthropic_messages_url(None),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            super::anthropic_messages_url(Some("https://api.kimi.com/coding/")),
+            "https://api.kimi.com/coding/v1/messages"
+        );
     }
 
     /// The ACP bridge must not offer tools only the built-in agent can run.
