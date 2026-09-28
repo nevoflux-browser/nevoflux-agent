@@ -5634,9 +5634,40 @@ async fn announce_active_soul(services: &HostServices, soul: &AgentRoleDefinitio
 /// be bound, so an unbound user sees no change at all.
 ///
 /// Returns `None` if no retriever is available or all soul documents are empty.
+/// Hot knowledge for a session, built once and then reused for the rest of
+/// that session.
+///
+/// It sits in the system prompt, so it has to stay byte-identical between
+/// turns for the prompt cache to hit — while the live list reorders as
+/// confidence moves and its "Nd old" notes tick over each day.
+fn hot_knowledge_for_session(
+    session_id: &str,
+    build: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static SNAPSHOTS: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
+    let map = SNAPSHOTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(mut map) = map.lock() else {
+        return build();
+    };
+    if let Some(snapshot) = map.get(session_id) {
+        return snapshot.clone();
+    }
+    // Bounded: a long-running daemon sees many sessions; dropping all old
+    // snapshots at once only costs each of them one rebuilt prefix.
+    if map.len() >= 256 {
+        map.clear();
+    }
+    let snapshot = build();
+    map.insert(session_id.to_string(), snapshot.clone());
+    snapshot
+}
+
 fn build_soul_context(
     services: &HostServices,
     active: Option<&AgentRoleDefinition>,
+    session_id: &str,
 ) -> Option<String> {
     let retriever = services.knowledge_retriever.as_ref()?;
     let cache = retriever.soul_cache();
@@ -5682,7 +5713,9 @@ fn build_soul_context(
         .as_ref()
         .map(|c| c.daemon.context.hot_knowledge_limit)
         .unwrap_or_else(|| crate::config::ContextConfig::default().hot_knowledge_limit);
-    let hot_section = build_hot_knowledge_section(&services.database, hot_limit);
+    let hot_section = hot_knowledge_for_session(session_id, || {
+        build_hot_knowledge_section(&services.database, hot_limit)
+    });
     if let Some(hot) = hot_section {
         sections.push(hot);
     }
@@ -5711,9 +5744,13 @@ fn populate_mcp_tool_inventory(mut content: String, services: &HostServices) -> 
         if tools.is_empty() {
             "| (No MCP tools connected) | | | | |".to_string()
         } else {
-            tools
+            // Sorted, so the inventory (in the system prompt) does not change
+            // with the index's internal order.
+            let mut names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+            names.sort_unstable();
+            names
                 .iter()
-                .map(|t| format!("| `{}` | MCP | - | - | - |", t.name))
+                .map(|n| format!("| `{}` | MCP | - | - | - |", n))
                 .collect::<Vec<_>>()
                 .join("\n")
         }
@@ -6861,7 +6898,7 @@ async fn handle_chat_message_streaming(
         available_models: config.llm.configured_providers(),
         mcp_servers: mcp_servers.clone(),
         soul_context: {
-            let sc = build_soul_context(&services, active_soul.as_deref());
+            let sc = build_soul_context(&services, active_soul.as_deref(), &session_id);
             debug!(
                 "soul_context for AgentInput: has_retriever={}, soul={:?}, len={:?}",
                 services.knowledge_retriever.is_some(),
@@ -7477,7 +7514,11 @@ async fn handle_chat_message_streaming(
                             mcp_servers: mcp_servers.clone(),
                             // The re-run continues the same turn, so it keeps the
                             // soul that was resolved for it.
-                            soul_context: build_soul_context(&services, active_soul.as_deref()),
+                            soul_context: build_soul_context(
+                                &services,
+                                active_soul.as_deref(),
+                                &session_id,
+                            ),
                             tools_config: active_soul
                                 .as_deref()
                                 .and_then(|s| s.tools_config.clone()),
@@ -8708,7 +8749,7 @@ async fn handle_chat_message(
                 skill_context,
                 available_models: config.llm.configured_providers(),
                 mcp_servers,
-                soul_context: build_soul_context(&services, active_soul.as_deref()),
+                soul_context: build_soul_context(&services, active_soul.as_deref(), &session_id),
                 // A soul may narrow the tools it can reach, but never widens them
                 // and never touches mode/provider/model.
                 tools_config: active_soul.as_deref().and_then(|s| s.tools_config.clone()),
@@ -15181,6 +15222,19 @@ mod tests {
     /// The hot knowledge layer must cap how many entries it injects: hot entries
     /// are only ever added (`knowledge_teach` / `memory_create`), so an uncapped
     /// layer grows the fixed per-turn token cost without bound.
+    #[test]
+    fn hot_knowledge_is_snapshotted_per_session() {
+        let first = super::hot_knowledge_for_session("sess-hk-a", || Some("hot v1".into()));
+        let again = super::hot_knowledge_for_session("sess-hk-a", || Some("changed".into()));
+        let other = super::hot_knowledge_for_session("sess-hk-b", || Some("other".into()));
+        assert_eq!(first.as_deref(), Some("hot v1"));
+        assert_eq!(again, first, "same session keeps its first snapshot");
+        assert_eq!(other.as_deref(), Some("other"));
+        let none = super::hot_knowledge_for_session("sess-hk-c", || None);
+        let later = super::hot_knowledge_for_session("sess-hk-c", || Some("appeared".into()));
+        assert_eq!((none, later), (None, None), "an empty snapshot is kept too");
+    }
+
     #[test]
     fn hot_knowledge_section_caps_injected_entries() {
         use nevoflux_storage::{CreateKnowledgeParams, Storage};
