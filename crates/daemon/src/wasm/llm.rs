@@ -25,7 +25,7 @@ use rig::message::{
     ToolCall as RigToolCall, ToolFunction, ToolResult, ToolResultContent, UserContent,
 };
 use rig::providers::{
-    anthropic, cohere, gemini, groq, mistral, ollama, openai, openrouter, perplexity, together, xai,
+    cohere, gemini, groq, mistral, ollama, openai, openrouter, perplexity, together, xai,
 };
 use rig::streaming::{StreamedAssistantContent, ToolCallDeltaContent};
 use rig::OneOrMany;
@@ -456,28 +456,25 @@ pub async fn execute_llm_chat(
 }
 
 /// Execute a chat request using the Anthropic provider.
+/// Every Anthropic call goes through the raw Messages path (decision M1″):
+/// rig 0.29 drops the cache token counts from streamed Anthropic usage and
+/// cannot place our cache breakpoints, and the raw path is also the one
+/// that carries MiMo's thinking round-trip.
 async fn execute_anthropic_chat(
     api_key: &str,
     model: &str,
     request: LlmChatRequest,
-    provider: ProviderType,
+    _provider: ProviderType,
     base_url: Option<&str>,
 ) -> Result<LlmChatResponse> {
-    if is_mimo_anthropic_compat_base_url(base_url) {
-        tracing::debug!(
-            "Anthropic provider with MiMo /anthropic base_url — routing through Anthropic-raw path for thinking-block round-trip"
-        );
-        return execute_anthropic_chat_raw(api_key, model, request, base_url).await;
-    }
-    let mut builder = anthropic::Client::builder().api_key(api_key);
-    if let Some(url) = base_url {
-        builder = builder.base_url(url);
-    }
-    let client: anthropic::Client = builder.build().map_err(|e| {
-        DaemonError::InternalError(format!("Failed to create Anthropic client: {}", e))
-    })?;
-    let completion_model = client.completion_model(model);
-    execute_rig_completion(completion_model, request, provider).await
+    execute_anthropic_chat_raw(
+        api_key,
+        model,
+        request,
+        base_url,
+        anthropic_body_opts(base_url),
+    )
+    .await
 }
 
 /// Execute a chat request using the OpenAI provider.
@@ -612,6 +609,15 @@ fn is_mimo_base_url(url: Option<&str>) -> bool {
 /// and MiMo rejects the next request. Hits to this URL are routed through
 /// `stream_anthropic_raw` / `execute_anthropic_chat_raw`, which emit the
 /// thinking block ourselves alongside `tool_use`.
+/// Body options for every Anthropic call: caching always on; thinking sent
+/// back only to MiMo, which rejects a tool turn without it.
+fn anthropic_body_opts(base_url: Option<&str>) -> AnthropicBodyOpts {
+    AnthropicBodyOpts {
+        include_reasoning: is_mimo_anthropic_compat_base_url(base_url),
+        cache: true,
+    }
+}
+
 fn is_mimo_anthropic_compat_base_url(url: Option<&str>) -> bool {
     url.map(|u| {
         let lower = u.to_ascii_lowercase();
@@ -1563,16 +1569,9 @@ async fn execute_anthropic_chat_raw(
     model: &str,
     request: LlmChatRequest,
     base_url: Option<&str>,
+    opts: AnthropicBodyOpts,
 ) -> Result<LlmChatResponse> {
-    let body = build_anthropic_messages_request_body(
-        model,
-        &request,
-        false,
-        AnthropicBodyOpts {
-            include_reasoning: true,
-            cache: false,
-        },
-    );
+    let body = build_anthropic_messages_request_body(model, &request, false, opts);
     let url = anthropic_messages_url(base_url);
 
     tracing::debug!(
@@ -2854,21 +2853,17 @@ async fn stream_anthropic(
     provider: ProviderType,
     base_url: Option<&str>,
 ) -> Result<()> {
-    if is_mimo_anthropic_compat_base_url(base_url) {
-        tracing::debug!(
-            "Anthropic provider with MiMo /anthropic base_url — streaming via Anthropic-raw path for thinking-block round-trip"
-        );
-        return stream_anthropic_raw(api_key, model, request, tx, base_url).await;
-    }
-    let mut builder = anthropic::Client::builder().api_key(api_key);
-    if let Some(url) = base_url {
-        builder = builder.base_url(url);
-    }
-    let client: anthropic::Client = builder.build().map_err(|e| {
-        DaemonError::InternalError(format!("Failed to create Anthropic client: {}", e))
-    })?;
-    let completion_model = client.completion_model(model);
-    stream_rig_completion(completion_model, request, tx, provider).await
+    // See `execute_anthropic_chat`: all Anthropic traffic is raw (M1″).
+    let _ = provider;
+    stream_anthropic_raw(
+        api_key,
+        model,
+        request,
+        tx,
+        base_url,
+        anthropic_body_opts(base_url),
+    )
+    .await
 }
 
 /// Stream from OpenAI provider.
@@ -3401,8 +3396,9 @@ impl AnthropicUsageAcc {
     }
 }
 
-/// Stream from MiMo's Anthropic-compat endpoint using raw HTTP + Anthropic
-/// SSE parsing.
+/// Stream from an Anthropic Messages endpoint (Anthropic, Kimi, MiMo, …)
+/// using raw HTTP + Anthropic SSE parsing. Every Anthropic call comes here
+/// (decision M1″); it started as the MiMo path, for the reasons below.
 ///
 /// Sibling of `stream_deepseek_raw` but speaking Anthropic Messages API
 /// instead of OpenAI Chat Completions. Routed to from `stream_anthropic`
@@ -3431,18 +3427,11 @@ async fn stream_anthropic_raw(
     request: LlmChatRequest,
     tx: mpsc::Sender<LlmStreamChunk>,
     base_url: Option<&str>,
+    opts: AnthropicBodyOpts,
 ) -> Result<()> {
     use futures::StreamExt;
 
-    let body = build_anthropic_messages_request_body(
-        model,
-        &request,
-        true,
-        AnthropicBodyOpts {
-            include_reasoning: true,
-            cache: false,
-        },
-    );
+    let body = build_anthropic_messages_request_body(model, &request, true, opts);
     let url = anthropic_messages_url(base_url);
 
     tracing::debug!(
@@ -6820,6 +6809,16 @@ mod tests {
             super::anthropic_messages_url(Some("https://api.kimi.com/coding/")),
             "https://api.kimi.com/coding/v1/messages"
         );
+    }
+
+    #[test]
+    fn anthropic_body_opts_cache_always_reasoning_only_for_mimo() {
+        let kimi = super::anthropic_body_opts(Some("https://api.kimi.com/coding/"));
+        assert!(kimi.cache && !kimi.include_reasoning);
+        let real = super::anthropic_body_opts(None);
+        assert!(real.cache && !real.include_reasoning);
+        let mimo = super::anthropic_body_opts(Some("https://api.xiaomimimo.com/anthropic"));
+        assert!(mimo.cache && mimo.include_reasoning);
     }
 
     /// The ACP bridge must not offer tools only the built-in agent can run.
