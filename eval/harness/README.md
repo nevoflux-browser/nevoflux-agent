@@ -97,6 +97,40 @@ Then `POST /tasks` and poll `GET /tasks/<id>`.
   the same task failed with `No API key configured`. So the daemon reads
   `NEVOFLUX_CONFIG`, not the user's config.
 
+## Baseline (2026-09-27)
+
+Provider `llm.anthropic` = Kimi `k3` (Anthropic wire, `https://api.kimi.com/coding/`),
+chosen by the user; agent built from this branch (screenshot fixes included),
+browser = dev build `nevoflux.exe` (engine obj, 2026-09-09), no prompt caching
+yet (pre-P0). Runs took ~16 h wall clock because of Kimi's 5-hour quota.
+
+**J20, k=3** (`eval/results/baseline-j20`): per-pass 0.90 / 1.00 / 0.95,
+mean **0.95**, sd 0.05, **δ = 0.10**, 0 missing trials. About 179k input
+tokens and 92 s per trial; 10.75M input tokens in total.
+
+- Flaky tasks, both real agent failures, and both "claimed success it did not
+  achieve":
+  - `j20-flights-search` (1/3): never ticked "Direct flights only"; filtered
+    the results itself instead.
+  - `j20-select-form` (2/3): reported gift wrap as ticked; the submitted form
+    had `gift: false`.
+- δ = 0.10 misses the v1.4 G1 target (δ ≤ 0.03). This isn't noise to be
+  engineered away: with 20 tasks, one task flipping moves the score by 0.05,
+  so two flaky tasks at k=3 already give sd 0.05. Getting δ ≤ 0.03 needs
+  either many more tasks or a much larger k. That decision belongs to G1,
+  not the harness.
+
+**Jev set, k=1 dry run** (`eval/results/jev-dry-k3-v2`): 29/30, 0 missing.
+About 131k input tokens and 134 s per trial. The one failure,
+`jev-zh-shop-change`, exposed a site gap: the cart had no remove control
+(fixed afterwards), and the agent then claimed to have emptied the cart. The
+Jev set's δ calibration is deferred until after P0 on purpose. G2 compares
+Jev on/off against the *post-P0* baseline, so a pre-P0 Jev baseline wouldn't
+be the reference.
+
+Note: the J20 baseline ran before the cart page gained its remove button;
+only `j20-shop-cart` opens the cart, and it doesn't use removal.
+
 ## Known gaps
 
 - Agent-loop tasks have no deadline on the daemon side: `wall_clock_secs`
