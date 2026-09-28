@@ -180,7 +180,7 @@ pub struct LlmChatRequest {
 /// - `assistant`: A response from the LLM (may include tool_calls)
 /// - `system`: A system instruction
 /// - `tool`: A tool execution result (requires tool_call_id)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LlmMessage {
     /// The role of the message sender.
     pub role: String,
@@ -1133,10 +1133,70 @@ pub(crate) fn build_deepseek_request_body(
 /// rig-Message → Anthropic-wire converter (and our
 /// `build_rig_assistant_message` upstream of it) discards
 /// `LlmMessage.reasoning`, which MiMo rejects.
+/// Choices for the raw Anthropic request body.
+#[derive(Debug, Clone, Copy, Default)]
+struct AnthropicBodyOpts {
+    /// Send `thinking` blocks back on assistant turns. MiMo rejects a turn
+    /// without them; other endpoints never got them (rig drops reasoning),
+    /// and unsigned thinking is not guaranteed to be accepted elsewhere.
+    include_reasoning: bool,
+    /// Mark prompt-cache breakpoints: the last tool, the end of the system
+    /// prompt, and the last block of the last message.
+    cache: bool,
+}
+
+/// MIME string for an image media type, as Anthropic's `media_type` wants it.
+fn image_media_mime(t: ImageMediaType) -> &'static str {
+    match t {
+        ImageMediaType::JPEG => "image/jpeg",
+        ImageMediaType::PNG => "image/png",
+        ImageMediaType::GIF => "image/gif",
+        ImageMediaType::WEBP => "image/webp",
+        ImageMediaType::HEIC => "image/heic",
+        ImageMediaType::HEIF => "image/heif",
+        ImageMediaType::SVG => "image/svg+xml",
+    }
+}
+
+/// An Anthropic `image` content block from an attachment.
+fn anthropic_image_block(att: &LlmAttachment) -> serde_json::Value {
+    let data = clean_base64_data(&att.data);
+    let media = image_media_mime(detect_image_media_type_from_base64(&data, &att.mime_type));
+    serde_json::json!({
+        "type": "image",
+        "source": {"type": "base64", "media_type": media, "data": data},
+    })
+}
+
+/// Append images that tool results carried to the last `tool_result` turn of
+/// the run just finished: every tool_result has to come before other content,
+/// or the endpoint rejects the request (see `regroup_tool_images`).
+fn flush_tool_images(messages: &mut [serde_json::Value], pending: &mut Vec<serde_json::Value>) {
+    if pending.is_empty() {
+        return;
+    }
+    if let Some(serde_json::Value::Array(blocks)) = messages.last_mut().map(|m| &mut m["content"]) {
+        blocks.append(pending);
+    }
+    pending.clear();
+}
+
+/// Mark a prompt-cache breakpoint on a content value, turning a plain string
+/// into a one-block array first.
+fn mark_cache_breakpoint(content: &mut serde_json::Value) {
+    if let serde_json::Value::String(text) = content {
+        *content = serde_json::json!([{"type": "text", "text": text.clone()}]);
+    }
+    if let Some(last) = content.as_array_mut().and_then(|a| a.last_mut()) {
+        last["cache_control"] = serde_json::json!({"type": "ephemeral"});
+    }
+}
+
 fn build_anthropic_messages_request_body(
     model: &str,
     request: &LlmChatRequest,
     stream: bool,
+    opts: AnthropicBodyOpts,
 ) -> serde_json::Value {
     let mut body = serde_json::json!({
         "model": model,
@@ -1154,8 +1214,12 @@ fn build_anthropic_messages_request_body(
     }
 
     let mut messages: Vec<serde_json::Value> = Vec::new();
+    let mut pending_images: Vec<serde_json::Value> = Vec::new();
 
     for msg in &request.messages {
+        if msg.role != "tool" {
+            flush_tool_images(&mut messages, &mut pending_images);
+        }
         match msg.role.as_str() {
             "system" => {
                 // Anthropic has no `system` role inside messages — flatten
@@ -1211,13 +1275,19 @@ fn build_anthropic_messages_request_body(
                         "content": msg.content,
                     }],
                 }));
+                pending_images.extend(
+                    msg.attachments
+                        .iter()
+                        .filter(|a| a.mime_type.starts_with("image/"))
+                        .map(anthropic_image_block),
+                );
             }
             "assistant" => {
                 let mut parts: Vec<serde_json::Value> = Vec::new();
                 // Thinking block first — Anthropic requires it to precede
                 // text / tool_use on the same assistant turn for the
                 // round-trip to be accepted.
-                if let Some(ref r) = msg.reasoning {
+                if let Some(r) = msg.reasoning.as_ref().filter(|_| opts.include_reasoning) {
                     if !r.is_empty() {
                         parts.push(serde_json::json!({
                             "type": "thinking",
@@ -1254,11 +1324,17 @@ fn build_anthropic_messages_request_body(
         }
     }
 
+    flush_tool_images(&mut messages, &mut pending_images);
+    if opts.cache {
+        if let Some(last) = messages.last_mut() {
+            mark_cache_breakpoint(&mut last["content"]);
+        }
+    }
     body["messages"] = serde_json::Value::Array(messages);
 
     if let Some(ref tools) = request.tools {
         if !tools.is_empty() {
-            let arr: Vec<serde_json::Value> = tools
+            let mut arr: Vec<serde_json::Value> = tools
                 .iter()
                 .map(|t| {
                     serde_json::json!({
@@ -1268,7 +1344,22 @@ fn build_anthropic_messages_request_body(
                     })
                 })
                 .collect();
+            if opts.cache {
+                if let Some(last) = arr.last_mut() {
+                    last["cache_control"] = serde_json::json!({"type": "ephemeral"});
+                }
+            }
             body["tools"] = serde_json::Value::Array(arr);
+        }
+    }
+
+    if opts.cache {
+        if let Some(text) = body["system"].as_str().map(str::to_string) {
+            body["system"] = serde_json::json!([{
+                "type": "text",
+                "text": text,
+                "cache_control": {"type": "ephemeral"},
+            }]);
         }
     }
 
@@ -1466,7 +1557,15 @@ async fn execute_anthropic_chat_raw(
     request: LlmChatRequest,
     base_url: Option<&str>,
 ) -> Result<LlmChatResponse> {
-    let body = build_anthropic_messages_request_body(model, &request, false);
+    let body = build_anthropic_messages_request_body(
+        model,
+        &request,
+        false,
+        AnthropicBodyOpts {
+            include_reasoning: true,
+            cache: false,
+        },
+    );
     let base = base_url
         .ok_or_else(|| DaemonError::InternalError("Anthropic-raw requires base_url".into()))?;
     let url = format!("{}/v1/messages", base.trim_end_matches('/'));
@@ -3313,7 +3412,15 @@ async fn stream_anthropic_raw(
 ) -> Result<()> {
     use futures::StreamExt;
 
-    let body = build_anthropic_messages_request_body(model, &request, true);
+    let body = build_anthropic_messages_request_body(
+        model,
+        &request,
+        true,
+        AnthropicBodyOpts {
+            include_reasoning: true,
+            cache: false,
+        },
+    );
     let base = base_url
         .ok_or_else(|| DaemonError::InternalError("Anthropic-raw requires base_url".into()))?;
     let url = format!("{}/v1/messages", base.trim_end_matches('/'));
@@ -6443,6 +6550,209 @@ mod tests {
             shapes(&super::regroup_tool_images(openai, false)),
             vec![vec!["assistant"], vec!["tool_result"], vec!["image"]]
         );
+    }
+
+    fn anth_req(messages: Vec<super::LlmMessage>) -> super::LlmChatRequest {
+        super::LlmChatRequest {
+            messages,
+            tools: Some(vec![
+                super::LlmToolDefinition {
+                    name: "a".into(),
+                    description: "A".into(),
+                    parameters: serde_json::json!({"type": "object"}),
+                },
+                super::LlmToolDefinition {
+                    name: "b".into(),
+                    description: "B".into(),
+                    parameters: serde_json::json!({"type": "object"}),
+                },
+            ]),
+            ..Default::default()
+        }
+    }
+
+    fn user_msg(text: &str) -> super::LlmMessage {
+        super::LlmMessage {
+            role: "user".into(),
+            content: text.into(),
+            ..Default::default()
+        }
+    }
+
+    fn tool_msg(id: &str, image: Option<&str>) -> super::LlmMessage {
+        super::LlmMessage {
+            role: "tool".into(),
+            content: "{}".into(),
+            tool_call_id: Some(id.into()),
+            attachments: image
+                .map(|d| {
+                    vec![super::LlmAttachment {
+                        name: "s.png".into(),
+                        mime_type: "image/png".into(),
+                        data: d.into(),
+                    }]
+                })
+                .unwrap_or_default(),
+            ..Default::default()
+        }
+    }
+
+    fn call(id: &str) -> super::LlmToolCall {
+        super::LlmToolCall {
+            id: id.into(),
+            call_id: Some(id.into()),
+            name: "a".into(),
+            arguments: serde_json::json!({}),
+            signature: None,
+        }
+    }
+
+    fn block_types(body: &serde_json::Value) -> Vec<Vec<String>> {
+        body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| match &m["content"] {
+                serde_json::Value::Array(a) => a
+                    .iter()
+                    .map(|b| b["type"].as_str().unwrap().to_string())
+                    .collect(),
+                _ => vec!["string".to_string()],
+            })
+            .collect()
+    }
+
+    #[test]
+    fn raw_body_puts_tool_images_after_the_last_tool_result() {
+        let asst = super::LlmMessage {
+            role: "assistant".into(),
+            tool_calls: Some(vec![call("t1"), call("t2")]),
+            ..Default::default()
+        };
+        let req = anth_req(vec![
+            user_msg("go"),
+            asst,
+            tool_msg("t1", Some("/9j/AAAA")),
+            tool_msg("t2", None),
+        ]);
+        let body = super::build_anthropic_messages_request_body(
+            "m",
+            &req,
+            true,
+            super::AnthropicBodyOpts::default(),
+        );
+        let kinds = block_types(&body);
+        assert_eq!(kinds[2], vec!["tool_result"]);
+        assert_eq!(kinds[3], vec!["tool_result", "image"]);
+        assert_eq!(
+            body["messages"][3]["content"][1]["source"]["media_type"],
+            "image/jpeg"
+        );
+        assert_eq!(
+            body["messages"][3]["content"][1]["source"]["data"],
+            "/9j/AAAA"
+        );
+    }
+
+    #[test]
+    fn raw_body_single_tool_image_joins_its_own_tool_result() {
+        let asst = super::LlmMessage {
+            role: "assistant".into(),
+            tool_calls: Some(vec![call("t1")]),
+            ..Default::default()
+        };
+        let req = anth_req(vec![
+            user_msg("go"),
+            asst,
+            tool_msg("t1", Some("data:image/png;base64,iVBORw0KGgo=")),
+            user_msg("next"),
+        ]);
+        let body = super::build_anthropic_messages_request_body(
+            "m",
+            &req,
+            true,
+            super::AnthropicBodyOpts::default(),
+        );
+        let kinds = block_types(&body);
+        assert_eq!(kinds[2], vec!["tool_result", "image"]);
+        assert_eq!(
+            body["messages"][2]["content"][1]["source"]["data"],
+            "iVBORw0KGgo="
+        );
+        assert_eq!(kinds[3], vec!["string"]);
+    }
+
+    #[test]
+    fn raw_body_sends_reasoning_only_when_asked() {
+        let asst = super::LlmMessage {
+            role: "assistant".into(),
+            content: "hi".into(),
+            reasoning: Some("think".into()),
+            ..Default::default()
+        };
+        let req = anth_req(vec![user_msg("q"), asst]);
+        let off = super::build_anthropic_messages_request_body(
+            "m",
+            &req,
+            true,
+            super::AnthropicBodyOpts::default(),
+        );
+        assert!(off["messages"][1]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|b| b["type"] != "thinking"));
+        let on = super::build_anthropic_messages_request_body(
+            "m",
+            &req,
+            true,
+            super::AnthropicBodyOpts {
+                include_reasoning: true,
+                cache: false,
+            },
+        );
+        assert_eq!(on["messages"][1]["content"][0]["type"], "thinking");
+    }
+
+    #[test]
+    fn raw_body_places_three_cache_breakpoints() {
+        let mut req = anth_req(vec![user_msg("q")]);
+        req.system = Some("SYS".into());
+        let body = super::build_anthropic_messages_request_body(
+            "m",
+            &req,
+            true,
+            super::AnthropicBodyOpts {
+                include_reasoning: false,
+                cache: true,
+            },
+        );
+        assert_eq!(body["system"][0]["text"], "SYS");
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        assert!(body["tools"][0].get("cache_control").is_none());
+        assert_eq!(body["tools"][1]["cache_control"]["type"], "ephemeral");
+        assert_eq!(body["messages"][0]["content"][0]["type"], "text");
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        let n = body.to_string().matches("\"cache_control\"").count();
+        assert_eq!(n, 3, "Anthropic allows at most 4 breakpoints; we use 3");
+    }
+
+    #[test]
+    fn raw_body_without_cache_is_unchanged_shape() {
+        let mut req = anth_req(vec![user_msg("q")]);
+        req.system = Some("SYS".into());
+        let body = super::build_anthropic_messages_request_body(
+            "m",
+            &req,
+            false,
+            super::AnthropicBodyOpts::default(),
+        );
+        assert_eq!(body["system"], "SYS");
+        assert_eq!(body["messages"][0]["content"], "q");
+        assert!(!body.to_string().contains("cache_control"));
     }
 
     /// The ACP bridge must not offer tools only the built-in agent can run.
