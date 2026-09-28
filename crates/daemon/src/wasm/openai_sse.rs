@@ -163,6 +163,7 @@ pub fn usage_from(chunk: &serde_json::Value) -> Option<LlmUsage> {
         prompt_tokens: usage["prompt_tokens"].as_u64().unwrap_or(0) as u32,
         completion_tokens: usage["completion_tokens"].as_u64().unwrap_or(0) as u32,
         total_tokens: usage["total_tokens"].as_u64().unwrap_or(0) as u32,
+        ..Default::default()
     })
 }
 

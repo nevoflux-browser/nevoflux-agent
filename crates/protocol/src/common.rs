@@ -537,6 +537,13 @@ pub struct UsageBucket {
     /// True when at least one call's numbers came from estimation.
     #[serde(default, skip_serializing_if = "is_false")]
     pub estimated: bool,
+    /// Part of `input` read from the provider's prompt cache, summed over
+    /// the calls that reported it; `None` when none did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read: Option<u64>,
+    /// Part of `input` written to the provider's prompt cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write: Option<u64>,
 }
 
 /// Token usage snapshot for one assistant reply.
@@ -1226,6 +1233,7 @@ mod turn_usage_tests {
                 output: 5,
                 calls: 1,
                 estimated: false,
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -1255,12 +1263,14 @@ mod turn_usage_tests {
                 output: 646,
                 calls: 5,
                 estimated: false,
+                ..Default::default()
             },
             subagent: Some(UsageBucket {
                 input: 4102,
                 output: 210,
                 calls: 3,
                 estimated: true,
+                ..Default::default()
             }),
             last_input: Some(3204),
             decode_ms: Some(15300),
@@ -1281,5 +1291,24 @@ mod turn_usage_tests {
         assert!(usage.subagent.is_none());
         assert!(!usage.external_agent);
         assert!(!usage.main.estimated);
+    }
+
+    #[test]
+    fn usage_bucket_cache_fields_are_optional_on_the_wire() {
+        let old: UsageBucket =
+            serde_json::from_str(r#"{"input":10,"output":2,"calls":1,"estimated":false}"#).unwrap();
+        assert_eq!((old.cache_read, old.cache_write), (None, None));
+        let v = serde_json::to_value(&old).unwrap();
+        assert!(v.get("cache_read").is_none() && v.get("cache_write").is_none());
+        let with = UsageBucket {
+            cache_read: Some(900),
+            cache_write: Some(50),
+            ..old
+        };
+        let v = serde_json::to_value(&with).unwrap();
+        assert_eq!(
+            (v["cache_read"].as_u64(), v["cache_write"].as_u64()),
+            (Some(900), Some(50))
+        );
     }
 }

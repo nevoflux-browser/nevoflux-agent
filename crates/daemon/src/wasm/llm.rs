@@ -300,14 +300,22 @@ pub struct LlmChatResponse {
 }
 
 /// Token usage statistics for an LLM request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LlmUsage {
-    /// Number of tokens in the prompt.
+    /// Number of tokens in the prompt: all input, cache reads and cache
+    /// writes included.
     pub prompt_tokens: u32,
     /// Number of tokens in the completion.
     pub completion_tokens: u32,
     /// Total tokens used (prompt + completion).
     pub total_tokens: u32,
+    /// Part of `prompt_tokens` served from the provider's prompt cache.
+    /// `None` when the provider did not report it — never estimated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u32>,
+    /// Part of `prompt_tokens` written to the provider's prompt cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u32>,
 }
 
 /// Attachment for multimodal messages (images, files, etc.)
@@ -2376,6 +2384,7 @@ fn rig_usage_to_llm(usage: &rig::completion::Usage) -> Option<LlmUsage> {
         prompt_tokens: usage.input_tokens as u32,
         completion_tokens: usage.output_tokens as u32,
         total_tokens: total as u32,
+        ..Default::default()
     })
 }
 
@@ -3266,6 +3275,7 @@ impl AnthropicUsageAcc {
             prompt_tokens: prompt,
             completion_tokens: completion,
             total_tokens: prompt + completion,
+            ..Default::default()
         })
     }
 }
@@ -3812,6 +3822,7 @@ async fn stream_kimi_agent(
                     prompt_tokens: input_tokens as u32,
                     completion_tokens: output_tokens as u32,
                     total_tokens: (input_tokens + output_tokens) as u32,
+                    ..Default::default()
                 });
             }
             WireEvent::TurnEnd => break,
@@ -6681,6 +6692,7 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 total_tokens: 15,
+                ..Default::default()
             }),
             images: vec![],
         };
@@ -6754,6 +6766,7 @@ mod tests {
             prompt_tokens: 100,
             completion_tokens: 50,
             total_tokens: 150,
+            ..Default::default()
         };
 
         let json = serde_json::to_string(&usage).unwrap();
@@ -6802,6 +6815,7 @@ mod tests {
             prompt_tokens: 1,
             completion_tokens: 2,
             total_tokens: 3,
+            ..Default::default()
         };
         let cloned = usage.clone();
         assert_eq!(cloned.total_tokens, 3);
@@ -6839,6 +6853,7 @@ mod tests {
             prompt_tokens: 10,
             completion_tokens: 5,
             total_tokens: 15,
+            ..Default::default()
         };
         let debug = format!("{:?}", usage);
         assert!(debug.contains("LlmUsage"));
@@ -6892,6 +6907,7 @@ mod tests {
                 prompt_tokens: 20,
                 completion_tokens: 10,
                 total_tokens: 30,
+                ..Default::default()
             }),
             images: vec![],
         };

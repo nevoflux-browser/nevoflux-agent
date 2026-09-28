@@ -46,7 +46,7 @@ pub fn estimate_tokens(text: &str) -> u64 {
 }
 
 /// One finished LLM call, submitted by `agent_host` when the call settles.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CallStats {
     /// This call belongs to a subagent.
     pub is_subagent: bool,
@@ -56,6 +56,10 @@ pub struct CallStats {
     pub reported_input: Option<u64>,
     /// Output tokens as reported by the provider, `None` when not reported.
     pub reported_output: Option<u64>,
+    /// Cache-read part of the input, `None` when the provider did not say.
+    pub reported_cache_read: Option<u64>,
+    /// Cache-write part of the input, `None` when the provider did not say.
+    pub reported_cache_write: Option<u64>,
     /// Estimated input, always computed so it can serve as the fallback.
     pub estimated_input: u64,
     /// Estimated output, always computed so it can serve as the fallback.
@@ -136,6 +140,12 @@ impl TurnStats {
             bucket.output += output;
             bucket.calls += 1;
             bucket.estimated |= input_est || output_est;
+            if let Some(v) = call.reported_cache_read {
+                bucket.cache_read = Some(bucket.cache_read.unwrap_or(0) + v);
+            }
+            if let Some(v) = call.reported_cache_write {
+                bucket.cache_write = Some(bucket.cache_write.unwrap_or(0) + v);
+            }
 
             if call.is_subagent {
                 continue;
@@ -204,6 +214,8 @@ mod turn_stats_tests {
             external_agent: false,
             reported_input: Some(100),
             reported_output: Some(20),
+            reported_cache_read: None,
+            reported_cache_write: None,
             estimated_input: 999,
             estimated_output: 999,
             decode_ms: Some(1000),
@@ -383,5 +395,32 @@ mod turn_stats_tests {
         let s = TurnStats::new();
         s.record(call());
         assert!(s.snapshot().unwrap().total_ms.is_some());
+    }
+
+    #[test]
+    fn snapshot_sums_cache_fields_only_from_calls_that_report_them() {
+        let stats = TurnStats::new();
+        stats.record(CallStats {
+            reported_input: Some(1000),
+            reported_cache_read: Some(800),
+            reported_cache_write: Some(0),
+            ..call()
+        });
+        stats.record(CallStats {
+            reported_input: Some(1200),
+            ..call()
+        });
+        let u = stats.snapshot().unwrap();
+        assert_eq!(u.main.cache_read, Some(800));
+        assert_eq!(u.main.cache_write, Some(0));
+        assert_eq!(u.main.input, 2200);
+    }
+
+    #[test]
+    fn snapshot_cache_fields_stay_none_when_nothing_reported_them() {
+        let stats = TurnStats::new();
+        stats.record(call());
+        let u = stats.snapshot().unwrap();
+        assert_eq!((u.main.cache_read, u.main.cache_write), (None, None));
     }
 }

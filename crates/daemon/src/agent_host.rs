@@ -241,6 +241,16 @@ fn stream_stats_to_call(
         external_agent: is_external_agent_provider(&data.provider),
         reported_input: data.reported.as_ref().map(|u| u.prompt_tokens as u64),
         reported_output: data.reported.as_ref().map(|u| u.completion_tokens as u64),
+        reported_cache_read: data
+            .reported
+            .as_ref()
+            .and_then(|u| u.cache_read_tokens)
+            .map(u64::from),
+        reported_cache_write: data
+            .reported
+            .as_ref()
+            .and_then(|u| u.cache_write_tokens)
+            .map(u64::from),
         estimated_input: data.estimated_input,
         estimated_output: crate::turn_stats::estimate_tokens(&data.output_chars),
         decode_ms,
@@ -1527,8 +1537,8 @@ fn usage_to_event(
     Some(nevoflux_protocol::session_event::TokenUsage {
         input_tokens: Some(u.prompt_tokens as u64),
         output_tokens: Some(u.completion_tokens as u64),
-        cache_read_tokens: None,
-        cache_write_tokens: None,
+        cache_read_tokens: u.cache_read_tokens.map(u64::from),
+        cache_write_tokens: u.cache_write_tokens.map(u64::from),
     })
 }
 
@@ -2479,6 +2489,16 @@ impl HostFunctions for DaemonHostFunctions {
                             .usage
                             .as_ref()
                             .map(|u| u.completion_tokens as u64),
+                        reported_cache_read: response
+                            .usage
+                            .as_ref()
+                            .and_then(|u| u.cache_read_tokens)
+                            .map(u64::from),
+                        reported_cache_write: response
+                            .usage
+                            .as_ref()
+                            .and_then(|u| u.cache_write_tokens)
+                            .map(u64::from),
                         estimated_input: estimate_request_input(&request),
                         estimated_output: crate::turn_stats::estimate_tokens(&output_chars),
                         decode_ms: None,
@@ -8875,6 +8895,7 @@ mod tests {
                 prompt_tokens: 480,
                 completion_tokens: 12,
                 total_tokens: 492,
+                ..Default::default()
             }),
             provider: "anthropic".into(),
             model: "claude-sonnet-5".into(),
@@ -8923,6 +8944,7 @@ mod tests {
                 prompt_tokens: 90,
                 completion_tokens: 4,
                 total_tokens: 94,
+                ..Default::default()
             }),
             provider: "anthropic".into(),
             model: "m".into(),
@@ -9617,6 +9639,7 @@ message = "not here"
             prompt_tokens: 100,
             completion_tokens: 23,
             total_tokens: 123,
+            ..Default::default()
         };
         let (host, budget, stream_id, _rt) = setup_budgeted_stream(
             400, // would estimate to >=100 — must NOT be used when real usage exists
@@ -11536,5 +11559,27 @@ message = "not here"
         let _host = DaemonHostFunctions::new(Arc::new(config.clone()), rt.handle().clone());
 
         assert_eq!(config.daemon.context.time_gap_threshold_minutes, 0);
+    }
+
+    #[test]
+    fn usage_to_event_carries_cache_fields() {
+        let u = crate::wasm::llm::LlmUsage {
+            prompt_tokens: 1000,
+            completion_tokens: 10,
+            total_tokens: 1010,
+            cache_read_tokens: Some(800),
+            cache_write_tokens: Some(150),
+        };
+        let e = usage_to_event(Some(&u)).unwrap();
+        assert_eq!(e.cache_read_tokens, Some(800));
+        assert_eq!(e.cache_write_tokens, Some(150));
+        let plain = crate::wasm::llm::LlmUsage {
+            prompt_tokens: 5,
+            completion_tokens: 1,
+            total_tokens: 6,
+            ..Default::default()
+        };
+        let e = usage_to_event(Some(&plain)).unwrap();
+        assert_eq!((e.cache_read_tokens, e.cache_write_tokens), (None, None));
     }
 }

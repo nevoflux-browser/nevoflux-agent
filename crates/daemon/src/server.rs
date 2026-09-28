@@ -14299,6 +14299,7 @@ mod usage_frame_tests {
                 output: 4,
                 calls: 1,
                 estimated: false,
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -14327,6 +14328,7 @@ mod usage_frame_tests {
             decode_ms: Some(1000),
             first_token_ms: Some(200),
             model: "m".into(),
+            ..Default::default()
         });
         let meta = usage_metadata(&stats).expect("a recorded call produces metadata");
         assert_eq!(meta["usage"]["main"]["input"], 120);

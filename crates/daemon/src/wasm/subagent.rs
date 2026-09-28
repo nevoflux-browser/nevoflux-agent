@@ -894,6 +894,7 @@ mod turn_stats_propagation_tests {
             decode_ms: Some(700),
             first_token_ms: Some(100),
             model: "sub-model".into(),
+            ..Default::default()
         });
         let snapshot = stats.snapshot().expect("subagent call recorded");
         let sub = snapshot.subagent.expect("subagent bucket present");

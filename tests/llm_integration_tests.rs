@@ -43,6 +43,7 @@ fn test_llm_usage_structure() {
         prompt_tokens: 100,
         completion_tokens: 50,
         total_tokens: 150,
+        ..Default::default()
     };
 
     let json = serde_json::to_string(&usage).unwrap();
@@ -150,6 +151,7 @@ fn test_llm_response_to_json_string() {
             prompt_tokens: 20,
             completion_tokens: 10,
             total_tokens: 30,
+            ..Default::default()
         }),
         images: vec![],
     };
@@ -170,6 +172,7 @@ fn test_llm_types_clone() {
         prompt_tokens: 1,
         completion_tokens: 2,
         total_tokens: 3,
+        ..Default::default()
     };
     let cloned_usage = usage.clone();
     assert_eq!(cloned_usage.total_tokens, 3);
@@ -205,6 +208,7 @@ fn test_llm_types_debug() {
         prompt_tokens: 10,
         completion_tokens: 5,
         total_tokens: 15,
+        ..Default::default()
     };
     let debug = format!("{:?}", usage);
     assert!(debug.contains("LlmUsage"));
