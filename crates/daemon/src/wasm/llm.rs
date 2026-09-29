@@ -3562,9 +3562,10 @@ where
 
                     // Anthropic SSE: `event: <name>\ndata: <json>\n\n`. We
                     // skip the `event:` line because the JSON's `"type"`
-                    // is self-describing.
-                    let data = match line.strip_prefix("data: ") {
-                        Some(d) => d.to_string(),
+                    // is self-describing. The space after `data:` is
+                    // optional in SSE, and Kimi omits it.
+                    let data = match line.strip_prefix("data:") {
+                        Some(d) => d.strip_prefix(' ').unwrap_or(d).to_string(),
                         None => continue,
                     };
                     if data == "[DONE]" {
@@ -7024,6 +7025,27 @@ mod tests {
         assert_eq!(calls[0].arguments, serde_json::json!({"url": "https://a"}));
         assert_eq!(calls[1].arguments, serde_json::json!({}));
         assert!(out.last().unwrap().done);
+    }
+
+    #[tokio::test]
+    async fn data_lines_without_a_space_after_the_colon_are_read() {
+        // Kimi's wire shape: `event:x` / `data:{...}` — SSE makes the space
+        // after the colon optional.
+        let body = [
+            serde_json::json!({"type": "message_start", "message": {"usage":
+                {"input_tokens": 20876, "output_tokens": 1}}}),
+            serde_json::json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "text_delta", "text": "hi"}}),
+            serde_json::json!({"type": "message_stop"}),
+        ]
+        .iter()
+        .map(|e| format!("event:x\ndata:{e}\n\n"))
+        .collect::<String>();
+        let out = pump(futures::stream::iter(vec![Ok(body)])).await;
+        let text: String = out.iter().filter_map(|c| c.text.clone()).collect();
+        assert_eq!(text, "hi");
+        let usage = out.last().unwrap().usage.clone().expect("usage read");
+        assert_eq!(usage.prompt_tokens, 20876);
     }
 
     #[tokio::test]
