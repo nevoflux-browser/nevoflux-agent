@@ -131,6 +131,39 @@ be the reference.
 Note: the J20 baseline ran before the cart page gained its remove button;
 only `j20-shop-cart` opens the cart, and it doesn't use removal.
 
+## P0 (prompt caching), 2026-09-29
+
+Same provider, browser and task set as the baseline; agent from
+`feat/p0-prompt-caching` (all Anthropic traffic on the raw Messages path with
+cache breakpoints, stable prompt prefix, watermark shrink).
+
+**J20, k=1** (`eval/results/p0-j20`): **20/20 (1.00)**, within δ of the
+0.95 baseline; 0 missing trials; 81 s per trial (baseline 92 s).
+
+| per trial | baseline (rig) | P0 |
+|---|---|---|
+| calls | 12.1 | 11.6 |
+| input reported | 179k | 267k |
+| of which cache reads | not reported | 262k |
+| **uncached input** | **179k** | **4.9k** |
+
+- Cache hit ratio **98.2%** over the run; every trial ≥ 95%.
+- The baseline's "input" is only the uncached part: rig's streaming usage
+  drops Kimi's `cache_read_input_tokens` and its `input_tokens` excludes
+  them. The true prompt size is the P0 column (about 23k per call, which
+  matches the daemon's own estimate of the first call, 22.9k). So the
+  comparison that matters is uncached input: 179k → 4.9k per trial.
+- No double counting: Kimi reports `input_tokens: 0` plus
+  `cache_read_input_tokens` on `message_delta`; the reported prompt equals
+  the estimate.
+- Kimi reports `cache_creation_input_tokens: 0` always, so `cache_write` is
+  0 here; that says nothing about other endpoints.
+- No J20 task loads a skill, so the skill-turn cache miss (system prompt is
+  one block) is not measured by this run.
+- The first attempt failed every trial with an empty reply: Kimi writes SSE
+  lines as `data:{…}` with no space, and the raw parser required `data: `.
+  Fixed before this run.
+
 ## Known gaps
 
 - Agent-loop tasks have no deadline on the daemon side: `wall_clock_secs`
