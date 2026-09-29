@@ -618,6 +618,13 @@ fn anthropic_body_opts(base_url: Option<&str>) -> AnthropicBodyOpts {
     }
 }
 
+/// Whether to send `Authorization: Bearer` next to `x-api-key`. Only MiMo
+/// needs it; rig sent `x-api-key` alone to everyone else, and on
+/// api.anthropic.com `Authorization` is the OAuth route.
+fn anthropic_sends_bearer(base_url: Option<&str>) -> bool {
+    is_mimo_anthropic_compat_base_url(base_url)
+}
+
 fn is_mimo_anthropic_compat_base_url(url: Option<&str>) -> bool {
     url.map(|u| {
         let lower = u.to_ascii_lowercase();
@@ -1237,33 +1244,22 @@ fn build_anthropic_messages_request_body(
                 if !msg.content.is_empty() {
                     parts.push(serde_json::json!({"type": "text", "text": msg.content}));
                 }
+                // Only the formats Anthropic accepts, typed from the bytes
+                // (declared types are often wrong), as the rig path did. A
+                // rejected image would stay in history and fail every turn.
                 for att in &msg.attachments {
-                    if !att.mime_type.starts_with("image/") {
+                    if mime_to_image_media_type(&att.mime_type).is_none() {
                         continue;
                     }
-                    // Strip optional data-URL prefix; Anthropic wants raw base64.
-                    let raw_b64 = if let Some(idx) = att.data.find(',') {
-                        if att.data.starts_with("data:") {
-                            &att.data[idx + 1..]
-                        } else {
-                            &att.data
-                        }
-                    } else {
-                        &att.data
-                    };
-                    parts.push(serde_json::json!({
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": att.mime_type,
-                            "data": raw_b64,
-                        },
-                    }));
+                    parts.push(anthropic_image_block(att));
+                }
+                // Nothing left (e.g. a PDF-only upload): skip the message, as
+                // rig did — empty content is a 400.
+                if parts.is_empty() {
+                    continue;
                 }
                 let content = if parts.len() == 1 && parts[0]["type"] == "text" {
                     parts[0]["text"].clone()
-                } else if parts.is_empty() {
-                    serde_json::Value::String(String::new())
                 } else {
                     serde_json::Value::Array(parts)
                 };
@@ -1581,15 +1577,17 @@ async fn execute_anthropic_chat_raw(
     );
 
     let client = reqwest::Client::new();
-    let response = client
+    let mut req = client
         .post(&url)
-        .bearer_auth(api_key)
         .header("x-api-key", api_key)
-        .header("anthropic-version", "2023-06-01")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| DaemonError::InternalError(format!("Anthropic-raw request failed: {}", e)))?;
+        .header("anthropic-version", "2023-06-01");
+    if anthropic_sends_bearer(base_url) {
+        req = req.bearer_auth(api_key);
+    }
+    let response =
+        req.json(&body).send().await.map_err(|e| {
+            DaemonError::InternalError(format!("Anthropic-raw request failed: {}", e))
+        })?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -2425,12 +2423,12 @@ fn mime_to_image_media_type(mime: &str) -> Option<ImageMediaType> {
 fn detect_image_media_type_from_base64(base64_data: &str, declared_mime: &str) -> ImageMediaType {
     // Base64-encoded magic byte prefixes:
     // JPEG: /9j/       (0xFF 0xD8 0xFF)
-    // PNG:  iVBORw0KGo (0x89 0x50 0x4E 0x47 = \x89PNG)
+    // PNG:  iVBORw0KGgo (\x89PNG\r\n\x1a\n)
     // GIF:  R0lGOD      (GIF87a/GIF89a)
     // WEBP: UklGR       (RIFF....WEBP)
     let detected = if base64_data.starts_with("/9j/") {
         Some(ImageMediaType::JPEG)
-    } else if base64_data.starts_with("iVBORw0KGo") {
+    } else if base64_data.starts_with("iVBORw0KGgo") {
         Some(ImageMediaType::PNG)
     } else if base64_data.starts_with("R0lGOD") {
         Some(ImageMediaType::GIF)
@@ -3429,8 +3427,6 @@ async fn stream_anthropic_raw(
     base_url: Option<&str>,
     opts: AnthropicBodyOpts,
 ) -> Result<()> {
-    use futures::StreamExt;
-
     let body = build_anthropic_messages_request_body(model, &request, true, opts);
     let url = anthropic_messages_url(base_url);
 
@@ -3441,17 +3437,16 @@ async fn stream_anthropic_raw(
     );
 
     let http_client = reqwest::Client::new();
-    let response = http_client
+    let mut req = http_client
         .post(&url)
-        .bearer_auth(api_key)
         .header("x-api-key", api_key)
-        .header("anthropic-version", "2023-06-01")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| {
-            DaemonError::InternalError(format!("Anthropic-raw stream request failed: {}", e))
-        })?;
+        .header("anthropic-version", "2023-06-01");
+    if anthropic_sends_bearer(base_url) {
+        req = req.bearer_auth(api_key);
+    }
+    let response = req.json(&body).send().await.map_err(|e| {
+        DaemonError::InternalError(format!("Anthropic-raw stream request failed: {}", e))
+    })?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -3463,12 +3458,58 @@ async fn stream_anthropic_raw(
         )));
     }
 
+    pump_anthropic_sse(
+        response.bytes_stream(),
+        &tx,
+        ANTHROPIC_FIRST_CHUNK_TIMEOUT,
+        ANTHROPIC_INTER_CHUNK_TIMEOUT,
+    )
+    .await
+}
+
+/// Like rig's stream loop: 5 minutes for the first byte (provider queues,
+/// cold starts), 2 minutes between chunks of a healthy stream.
+const ANTHROPIC_FIRST_CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+const ANTHROPIC_INTER_CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Surface a stream failure as reply text, the way the rig path did, so the
+/// turn shows it instead of passing a cut-off reply off as complete.
+async fn send_stream_error_text(tx: &mpsc::Sender<LlmStreamChunk>, text: String) {
+    let _ = tx
+        .send(LlmStreamChunk {
+            usage: None,
+            text: Some(text),
+            tool_calls: vec![],
+            done: false,
+            reasoning: None,
+            images: vec![],
+        })
+        .await;
+}
+
+/// Parse an Anthropic SSE byte stream into chunks on `tx`, ending with a
+/// `done` chunk. Timeouts and transport errors are reported as text.
+async fn pump_anthropic_sse<S, B, E>(
+    mut byte_stream: S,
+    tx: &mpsc::Sender<LlmStreamChunk>,
+    first_chunk_timeout: std::time::Duration,
+    inter_chunk_timeout: std::time::Duration,
+) -> Result<()>
+where
+    S: futures::Stream<Item = std::result::Result<B, E>> + Unpin,
+    B: AsRef<[u8]>,
+    E: std::fmt::Display,
+{
+    use futures::StreamExt;
+
     // Accumulate tool_use blocks: id+name arrive on content_block_start,
     // arguments arrive piecemeal via input_json_delta partial_json.
     struct ToolUseAccum {
         id: String,
         name: String,
         partial_input: String,
+        /// `content_block_stop` seen: the arguments are complete.
+        finished: bool,
     }
     // Ordered by content-block index, so parallel calls reach the history in
     // the order the model wrote them (a HashMap made the prefix differ).
@@ -3477,13 +3518,44 @@ async fn stream_anthropic_raw(
     // Token usage, spread across message_start and message_delta.
     let mut usage_acc = AnthropicUsageAcc::default();
 
-    let mut byte_stream = response.bytes_stream();
     let mut line_buf = String::new();
 
-    while let Some(result) = byte_stream.next().await {
+    let mut got_first_chunk = false;
+    'read: loop {
+        let timeout_dur = if got_first_chunk {
+            inter_chunk_timeout
+        } else {
+            first_chunk_timeout
+        };
+        let result = match tokio::time::timeout(timeout_dur, byte_stream.next()).await {
+            Ok(Some(result)) => result,
+            Ok(None) => break,
+            Err(_) => {
+                tracing::warn!(
+                    "Anthropic-raw stream timeout after {:?} (got_first_chunk={})",
+                    timeout_dur,
+                    got_first_chunk
+                );
+                send_stream_error_text(
+                    tx,
+                    format!(
+                        "\n\n[error] LLM provider timed out after {} seconds with no {}.",
+                        timeout_dur.as_secs(),
+                        if got_first_chunk {
+                            "new data"
+                        } else {
+                            "response"
+                        }
+                    ),
+                )
+                .await;
+                break;
+            }
+        };
+        got_first_chunk = true;
         match result {
             Ok(bytes) => {
-                line_buf.push_str(&String::from_utf8_lossy(&bytes));
+                line_buf.push_str(&String::from_utf8_lossy(bytes.as_ref()));
                 while let Some(nl_pos) = line_buf.find('\n') {
                     let line = line_buf[..nl_pos].trim_end_matches('\r').to_string();
                     line_buf.drain(..=nl_pos);
@@ -3519,6 +3591,7 @@ async fn stream_anthropic_raw(
                                         id,
                                         name,
                                         partial_input: String::new(),
+                                        finished: false,
                                     },
                                 );
                             }
@@ -3571,7 +3644,13 @@ async fn stream_anthropic_raw(
                                 _ => {}
                             }
                         }
-                        "message_stop" => break,
+                        "content_block_stop" => {
+                            let index = event["index"].as_i64().unwrap_or(0);
+                            if let Some(accum) = tool_uses.get_mut(&index) {
+                                accum.finished = true;
+                            }
+                        }
+                        "message_stop" => break 'read,
                         "error" => {
                             let err_msg = event["error"]["message"]
                                 .as_str()
@@ -3585,29 +3664,36 @@ async fn stream_anthropic_raw(
             }
             Err(e) => {
                 tracing::warn!("Anthropic-raw stream chunk error: {}", e);
+                send_stream_error_text(tx, format!("\n[Error: {}]", e)).await;
                 break;
             }
         }
     }
 
-    // Emit accumulated tool calls before `done`.
+    // Emit accumulated tool calls before `done` — only finished ones whose
+    // arguments parse. A call cut off mid-JSON must not run with `{}`.
     if !tool_uses.is_empty() {
         let mut tool_calls: Vec<LlmToolCall> = tool_uses
             .into_values()
-            .map(|tu| {
-                let arguments = if tu.partial_input.is_empty() {
-                    serde_json::Value::Object(Default::default())
+            .filter_map(|tu| {
+                let arguments = if !tu.finished {
+                    None
+                } else if tu.partial_input.is_empty() {
+                    Some(serde_json::Value::Object(Default::default()))
                 } else {
-                    serde_json::from_str(&tu.partial_input)
-                        .unwrap_or(serde_json::Value::Object(Default::default()))
+                    serde_json::from_str(&tu.partial_input).ok()
                 };
-                LlmToolCall {
+                let Some(arguments) = arguments else {
+                    tracing::warn!(tool = %tu.name, "Anthropic-raw: dropping unfinished tool_use");
+                    return None;
+                };
+                Some(LlmToolCall {
                     id: tu.id.clone(),
                     call_id: Some(tu.id),
                     name: tu.name,
                     arguments,
                     signature: None,
-                }
+                })
             })
             .collect();
         tool_calls.sort_by_key(|tc| tc.id.clone());
@@ -6797,6 +6883,186 @@ mod tests {
             (u.prompt_tokens, u.cache_read_tokens, u.cache_write_tokens),
             (100, None, None)
         );
+    }
+
+    #[test]
+    fn anthropic_bearer_header_only_for_mimo() {
+        // rig sent only `x-api-key`; the Bearer header came from the MiMo path.
+        assert!(!super::anthropic_sends_bearer(None));
+        assert!(!super::anthropic_sends_bearer(Some(
+            "https://api.kimi.com/coding/"
+        )));
+        assert!(super::anthropic_sends_bearer(Some(
+            "https://api.xiaomimimo.com/anthropic"
+        )));
+    }
+
+    fn user_with_images(images: &[(&str, &str)]) -> super::LlmMessage {
+        super::LlmMessage {
+            role: "user".into(),
+            content: "look".into(),
+            attachments: images
+                .iter()
+                .map(|(mime, data)| super::LlmAttachment {
+                    name: "x".into(),
+                    mime_type: (*mime).into(),
+                    data: (*data).into(),
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn user_images_use_the_detected_type_and_skip_unsupported_ones() {
+        let req = anth_req(vec![user_with_images(&[
+            ("image/jpg", "iVBORw0KGgo\n=="),
+            ("image/svg+xml", "PHN2Zz4="),
+            ("image/heic", "AAAA"),
+        ])]);
+        let body = super::build_anthropic_messages_request_body(
+            "m",
+            &req,
+            true,
+            super::AnthropicBodyOpts::default(),
+        );
+        let blocks = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(
+            blocks.len(),
+            2,
+            "text + the one supported image: {blocks:?}"
+        );
+        assert_eq!(blocks[1]["source"]["media_type"], "image/png");
+        assert_eq!(blocks[1]["source"]["data"], "iVBORw0KGgo==");
+    }
+
+    #[test]
+    fn empty_user_messages_are_skipped() {
+        // A PDF-only upload leaves no text and no image: Anthropic rejects
+        // empty content, and the message stays in history for every later turn.
+        let pdf_only = super::LlmMessage {
+            role: "user".into(),
+            attachments: vec![super::LlmAttachment {
+                name: "a.pdf".into(),
+                mime_type: "application/pdf".into(),
+                data: "JVBERi0=".into(),
+            }],
+            ..Default::default()
+        };
+        let asst = super::LlmMessage {
+            role: "assistant".into(),
+            content: "ok".into(),
+            ..Default::default()
+        };
+        let req = anth_req(vec![user_msg("hi"), asst, pdf_only]);
+        for cache in [false, true] {
+            let body = super::build_anthropic_messages_request_body(
+                "m",
+                &req,
+                true,
+                super::AnthropicBodyOpts {
+                    cache,
+                    ..Default::default()
+                },
+            );
+            let msgs = body["messages"].as_array().unwrap();
+            assert_eq!(msgs.len(), 2, "cache={cache}: {msgs:?}");
+        }
+    }
+
+    const FAST: std::time::Duration = std::time::Duration::from_millis(200);
+
+    fn sse(events: &[serde_json::Value]) -> String {
+        events
+            .iter()
+            .map(|e| format!("event: x\ndata: {e}\n\n"))
+            .collect()
+    }
+
+    async fn pump(
+        stream: impl futures::Stream<Item = std::result::Result<String, String>> + Unpin,
+    ) -> Vec<super::LlmStreamChunk> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        super::pump_anthropic_sse(stream, &tx, FAST, FAST)
+            .await
+            .unwrap();
+        drop(tx);
+        let mut out = Vec::new();
+        while let Some(c) = rx.recv().await {
+            out.push(c);
+        }
+        out
+    }
+
+    fn tool_start(index: i64, id: &str) -> serde_json::Value {
+        serde_json::json!({"type": "content_block_start", "index": index,
+            "content_block": {"type": "tool_use", "id": id, "name": "navigate"}})
+    }
+
+    fn tool_args(index: i64, partial: &str) -> serde_json::Value {
+        serde_json::json!({"type": "content_block_delta", "index": index,
+            "delta": {"type": "input_json_delta", "partial_json": partial}})
+    }
+
+    fn block_stop(index: i64) -> serde_json::Value {
+        serde_json::json!({"type": "content_block_stop", "index": index})
+    }
+
+    #[tokio::test]
+    async fn finished_tool_uses_are_emitted_with_their_arguments() {
+        let body = sse(&[
+            tool_start(0, "t1"),
+            tool_args(0, "{\"url\":\"https://a\"}"),
+            block_stop(0),
+            tool_start(1, "t2"),
+            block_stop(1),
+            serde_json::json!({"type": "message_stop"}),
+        ]);
+        let out = pump(futures::stream::iter(vec![Ok(body)])).await;
+        let calls: Vec<_> = out.iter().flat_map(|c| c.tool_calls.clone()).collect();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].arguments, serde_json::json!({"url": "https://a"}));
+        assert_eq!(calls[1].arguments, serde_json::json!({}));
+        assert!(out.last().unwrap().done);
+    }
+
+    #[tokio::test]
+    async fn a_tool_use_cut_off_mid_arguments_is_not_dispatched() {
+        let body = sse(&[tool_start(0, "t1"), tool_args(0, "{\"url\":\"ht")]);
+        let out = pump(futures::stream::iter(vec![Ok(body)])).await;
+        assert!(out.iter().all(|c| c.tool_calls.is_empty()), "{out:?}");
+        assert!(out.last().unwrap().done);
+    }
+
+    #[tokio::test]
+    async fn a_transport_error_is_reported_not_passed_off_as_a_reply() {
+        let first = sse(&[
+            serde_json::json!({"type": "content_block_delta", "index": 0,
+            "delta": {"type": "text_delta", "text": "partial"}}),
+        ]);
+        let out = pump(futures::stream::iter(vec![
+            Ok(first),
+            Err("connection reset".to_string()),
+        ]))
+        .await;
+        let text: String = out.iter().filter_map(|c| c.text.clone()).collect();
+        assert!(text.contains("[Error: connection reset]"), "{text:?}");
+        assert!(out.last().unwrap().done);
+    }
+
+    #[tokio::test]
+    async fn a_stalled_stream_times_out() {
+        let first = sse(&[
+            serde_json::json!({"type": "content_block_delta", "index": 0,
+            "delta": {"type": "text_delta", "text": "hi"}}),
+        ]);
+        let stream = futures::stream::iter(vec![Ok(first)]).chain(futures::stream::pending());
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), pump(Box::pin(stream)))
+            .await
+            .expect("pump must give up on a stalled stream");
+        let text: String = out.iter().filter_map(|c| c.text.clone()).collect();
+        assert!(text.contains("timed out"), "{text:?}");
+        assert!(out.last().unwrap().done);
     }
 
     #[test]
