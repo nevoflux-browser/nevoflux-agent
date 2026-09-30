@@ -484,6 +484,9 @@ pub struct Agent<H: HostFunctions> {
     artifact_counter: Cell<u32>,
     /// Whether computer use has been triggered (for progressive prompt injection).
     computer_use_triggered: Cell<bool>,
+    /// Set by `load_selector_tools`: the CSS-selector browser tools are a
+    /// fallback the model loads on purpose (design §4.5 暴露面).
+    selector_tools_loaded: Cell<bool>,
     /// Current keywords extracted from user message and LLM context, used for auto-snapshots.
     current_keywords: RefCell<Vec<String>>,
     /// Skills that have been loaded in this session (prevent redundant re-loading).
@@ -661,6 +664,7 @@ impl<H: HostFunctions> Agent<H> {
             pending_artifact: RefCell::new(None),
             artifact_counter: Cell::new(0),
             computer_use_triggered: Cell::new(false),
+            selector_tools_loaded: Cell::new(false),
             current_keywords: RefCell::new(Vec::new()),
             loaded_skills: RefCell::new(std::collections::HashSet::new()),
             local_index: RefCell::new(None),
@@ -681,6 +685,7 @@ impl<H: HostFunctions> Agent<H> {
             pending_artifact: RefCell::new(None),
             artifact_counter: Cell::new(0),
             computer_use_triggered: Cell::new(false),
+            selector_tools_loaded: Cell::new(false),
             current_keywords: RefCell::new(Vec::new()),
             loaded_skills: RefCell::new(std::collections::HashSet::new()),
             local_index: RefCell::new(None),
@@ -3157,6 +3162,11 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                     }
                 }
             }
+            // Meta-tool: the CSS-selector browser tools, for elements without an id.
+            "load_selector_tools" => {
+                self.selector_tools_loaded.set(true);
+                r#"{"success":true,"message":"Loaded for the rest of this run: browser_click {selector}, browser_type {selector, text}, browser_fill {selector, value}. Prefer the *_by_id tools when the element has an [eN] id."}"#.to_string()
+            }
             // Meta-tool: load computer use tools and trigger full prompt injection
             "load_computer_use_tools" => {
                 self.computer_use_triggered.set(true);
@@ -3503,6 +3513,7 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                 | "tool_call_dynamic"
                 | "orchestrate"
                 | "load_computer_use_tools"
+                | "load_selector_tools"
                 | "subagent_spawn"
                 | "subagent_wait_all"
                 | "subagent_status"
@@ -5028,29 +5039,31 @@ Do NOT use browser_navigate when the tab is already open — activate it instead
         });
 
         // Click by selector
-        tools.push(ToolDefinition {
-            name: "browser_click".into(),
-            description: "Click on an element by CSS selector".into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "selector": {
-                        "type": "string",
-                        "description": "CSS selector for the element to click"
+        if self.selector_tools_loaded.get() {
+            tools.push(ToolDefinition {
+                name: "browser_click".into(),
+                description: "Click on an element by CSS selector".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "selector": {
+                            "type": "string",
+                            "description": "CSS selector for the element to click"
+                        },
+                        "tab_id": {
+                            "type": "integer",
+                            "description": "Optional tab ID"
+                        }
                     },
-                    "tab_id": {
-                        "type": "integer",
-                        "description": "Optional tab ID"
-                    }
-                },
-                "required": ["selector"]
-            }),
-        });
+                    "required": ["selector"]
+                }),
+            });
+        }
 
         // Click by ID
         tools.push(ToolDefinition {
             name: "browser_click_by_id".into(),
-            description: "Click an interactive element by its [eN] ID from the page state snapshot. Only use IDs from the MOST RECENT snapshot — they change after every action.".into(),
+            description: "Click an element by its [eN] id from the page snapshot. Ids are stable while the page stays; if the element changed or is gone you get an error asking for a new snapshot. Clicking an option id of a <select> chooses that option.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -5068,28 +5081,31 @@ Do NOT use browser_navigate when the tab is already open — activate it instead
         });
 
         // Type by selector (keystrokes)
-        tools.push(ToolDefinition {
-            name: "browser_type".into(),
-            description: "Type text into an element by CSS selector (simulates keystrokes)".into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "selector": {
-                        "type": "string",
-                        "description": "CSS selector for the input element"
+        if self.selector_tools_loaded.get() {
+            tools.push(ToolDefinition {
+                name: "browser_type".into(),
+                description: "Type text into an element by CSS selector (simulates keystrokes)"
+                    .into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "selector": {
+                            "type": "string",
+                            "description": "CSS selector for the input element"
+                        },
+                        "text": {
+                            "type": "string",
+                            "description": "Text to type"
+                        },
+                        "tab_id": {
+                            "type": "integer",
+                            "description": "Optional tab ID"
+                        }
                     },
-                    "text": {
-                        "type": "string",
-                        "description": "Text to type"
-                    },
-                    "tab_id": {
-                        "type": "integer",
-                        "description": "Optional tab ID"
-                    }
-                },
-                "required": ["selector", "text"]
-            }),
-        });
+                    "required": ["selector", "text"]
+                }),
+            });
+        }
 
         // Type by ID
         tools.push(ToolDefinition {
@@ -5116,34 +5132,37 @@ Do NOT use browser_navigate when the tab is already open — activate it instead
         });
 
         // Fill by selector (set value)
-        tools.push(ToolDefinition {
-            name: "browser_fill".into(),
-            description: "Fill an input element with a value by CSS selector (sets value directly)"
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "selector": {
-                        "type": "string",
-                        "description": "CSS selector for the input element"
+        if self.selector_tools_loaded.get() {
+            tools.push(ToolDefinition {
+                name: "browser_fill".into(),
+                description:
+                    "Fill an input element with a value by CSS selector (sets value directly)"
+                        .into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "selector": {
+                            "type": "string",
+                            "description": "CSS selector for the input element"
+                        },
+                        "value": {
+                            "type": "string",
+                            "description": "Value to fill"
+                        },
+                        "tab_id": {
+                            "type": "integer",
+                            "description": "Optional tab ID"
+                        }
                     },
-                    "value": {
-                        "type": "string",
-                        "description": "Value to fill"
-                    },
-                    "tab_id": {
-                        "type": "integer",
-                        "description": "Optional tab ID"
-                    }
-                },
-                "required": ["selector", "value"]
-            }),
-        });
+                    "required": ["selector", "value"]
+                }),
+            });
+        }
 
         // Fill by ID
         tools.push(ToolDefinition {
             name: "browser_fill_by_id".into(),
-            description: "Set a form field's value by element ID. DEFAULT for form filling. Faster than type_by_id. If fill doesn't trigger expected behavior, fall back to type_by_id. (Deprecated 2026-04; prefer browser_input which handles rich text editors.)".into(),
+            description: "Set a form field's value by element ID. DEFAULT for form filling. Faster than type_by_id. If fill doesn't trigger expected behavior, fall back to type_by_id. On a <select>, pass an option's label or value. (Deprecated 2026-04; prefer browser_input which handles rich text editors.)".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -5423,6 +5442,14 @@ Set workspace_dir to the directory containing the file to allow uploads from any
             }),
         });
 
+        // Selector tools are a fallback (design §4.5 暴露面): the model acts by
+        // snapshot id, which the browser resolves to the exact node.
+        tools.push(ToolDefinition {
+            name: "load_selector_tools".into(),
+            description: "Load browser_click / browser_type / browser_fill, which act by CSS selector. Only for an element that has no [eN] id in the snapshot; prefer the *_by_id tools.".into(),
+            input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+        });
+
         // Meta-tool to load computer use tools (Browser mode only).
         // Calling this signals that computer use is needed and triggers
         // full prompt injection on the next turn.
@@ -5471,6 +5498,7 @@ Set workspace_dir to the directory containing the file to allow uploads from any
                         | "create_artifact"
                         | "switch_model"
                         | "load_computer_use_tools"
+                        | "load_selector_tools"
                         | "subagent_spawn"
                         | "subagent_wait"
                         | "subagent_wait_all"
@@ -8982,6 +9010,45 @@ mod tests {
     }
 
     #[test]
+    fn selector_tools_are_a_fallback_behind_a_loader() {
+        let agent = Agent::new(MockHostFunctions::new());
+        let names: Vec<String> = agent
+            .get_browser_tools()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        for gone in ["browser_click", "browser_type", "browser_fill"] {
+            assert!(
+                !names.iter().any(|n| n == gone),
+                "{gone} should start hidden"
+            );
+        }
+        assert!(names.iter().any(|n| n == "load_selector_tools"));
+        assert!(names.iter().any(|n| n == "browser_click_by_id"));
+    }
+
+    #[test]
+    fn loading_selector_tools_brings_them_back() {
+        let agent = Agent::new(MockHostFunctions::new());
+        let call = ToolCall {
+            id: "t".into(),
+            call_id: None,
+            name: "load_selector_tools".into(),
+            arguments: serde_json::json!({}),
+            signature: None,
+        };
+        let result = agent.execute_tool(&call).unwrap();
+        assert!(result.success);
+        assert!(result.content.contains("browser_click"));
+        let names: Vec<String> = agent
+            .get_browser_tools()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert!(names.iter().any(|n| n == "browser_click"));
+    }
+
+    #[test]
     fn test_computer_mouse_move_no_click_param() {
         let mock = MockHostFunctions::new();
         let agent = Agent::new(mock);
@@ -9074,13 +9141,14 @@ mod tests {
         assert!(browser_tools.len() > chat_tools.len());
         // Browser tools should include all 13 browser-specific tools
         assert!(browser_tools.iter().any(|t| t.name == "browser_navigate"));
-        assert!(browser_tools.iter().any(|t| t.name == "browser_click"));
+        // Selector twins sit behind load_selector_tools (J20-B).
+        assert!(browser_tools
+            .iter()
+            .any(|t| t.name == "load_selector_tools"));
         assert!(browser_tools
             .iter()
             .any(|t| t.name == "browser_click_by_id"));
-        assert!(browser_tools.iter().any(|t| t.name == "browser_type"));
         assert!(browser_tools.iter().any(|t| t.name == "browser_type_by_id"));
-        assert!(browser_tools.iter().any(|t| t.name == "browser_fill"));
         assert!(browser_tools.iter().any(|t| t.name == "browser_fill_by_id"));
         assert!(browser_tools
             .iter()
@@ -9636,7 +9704,9 @@ mod tests {
         // browser_get_tabs moved INTO get_chat_tools() (so chat can list tabs);
         // it is now part of the chat baseline (inherited by browser/agent) and
         // no longer browser-specific — hence back to +24, was +25.
-        assert_eq!(browser_tools.len(), chat_tools.len() + 24);
+        // J20-B: browser_click/type/fill moved behind load_selector_tools
+        // (-3 +1) — hence +22, was +24.
+        assert_eq!(browser_tools.len(), chat_tools.len() + 22);
     }
 
     #[test]
