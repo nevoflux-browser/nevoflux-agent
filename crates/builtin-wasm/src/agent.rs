@@ -1595,6 +1595,22 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
     /// Return `full` unchanged when `unlocked`, otherwise with the
     /// operate-on-existing-artifact canvas tools filtered out. Cheap: the
     /// rebuild happens at most twice per turn (start + first creation).
+    /// The CSS-selector browser tools (design §4.5 暴露面): withheld from the
+    /// request until the model calls `load_selector_tools`, then offered for
+    /// the rest of the turn.
+    const SELECTOR_TOOLS: &'static [&'static str] =
+        &["browser_click", "browser_type", "browser_fill"];
+
+    fn gate_selector_tools(full: &[ToolDefinition], unlocked: bool) -> Vec<ToolDefinition> {
+        if unlocked {
+            return full.to_vec();
+        }
+        full.iter()
+            .filter(|t| !Self::SELECTOR_TOOLS.contains(&t.name.as_str()))
+            .cloned()
+            .collect()
+    }
+
     fn gate_canvas_tools(full: &[ToolDefinition], unlocked: bool) -> Vec<ToolDefinition> {
         if unlocked {
             return full.to_vec();
@@ -1794,13 +1810,17 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
         // no way to read or stop it.
         let network_on = network_named || network_armed;
         let console_named = Self::wants_console(&input.user_message);
-        let mut active_tools = Self::gate_network_tools(
-            &Self::gate_speech_tools(
-                &Self::gate_canvas_tools(tools, canvas_unlocked),
-                canvas_unlocked || speech_useful,
+        let mut selector_unlocked = self.selector_tools_loaded.get();
+        let mut active_tools = Self::gate_selector_tools(
+            &Self::gate_network_tools(
+                &Self::gate_speech_tools(
+                    &Self::gate_canvas_tools(tools, canvas_unlocked),
+                    canvas_unlocked || speech_useful,
+                ),
+                network_on,
+                console_named,
             ),
-            network_on,
-            console_named,
+            selector_unlocked,
         );
 
         // On-device, tool-result budgets follow the context the engine was
@@ -2098,10 +2118,13 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                 // case where narration becomes worth offering.
                 // 第三道门要跟着重建 —— 否则同回合创建 artifact 会把一个
                 // 没被点名的工具悄悄放回请求里。
-                active_tools = Self::gate_network_tools(
-                    &Self::gate_speech_tools(&Self::gate_canvas_tools(tools, true), true),
-                    network_on,
-                    console_named,
+                active_tools = Self::gate_selector_tools(
+                    &Self::gate_network_tools(
+                        &Self::gate_speech_tools(&Self::gate_canvas_tools(tools, true), true),
+                        network_on,
+                        console_named,
+                    ),
+                    selector_unlocked,
                 );
                 // On-device that rebuild is wrong on its own: `tools` is the
                 // turn-START slice (search entry point plus residents), so it
@@ -2112,19 +2135,40 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                 }
             }
 
+            // load_selector_tools ran this iteration: offer the selector tools
+            // from the next request on, in this same turn.
+            if !selector_unlocked && self.selector_tools_loaded.get() {
+                selector_unlocked = true;
+                if self.local_index.borrow().is_some() {
+                    self.local_tools_changed.set(true);
+                } else {
+                    active_tools = Self::gate_network_tools(
+                        &Self::gate_speech_tools(
+                            &Self::gate_canvas_tools(tools, canvas_unlocked),
+                            canvas_unlocked || speech_useful,
+                        ),
+                        network_on,
+                        console_named,
+                    );
+                }
+            }
+
             // On-device: a `tool_search` this iteration changed what is loaded,
             // so the next request has to advertise the new set. It goes through
-            // the same three gates as the initial list — a tool that arrived
+            // the same gates as the initial list — a tool that arrived
             // mid-turn is not exempt from them.
             if self.local_tools_changed.replace(false) {
                 let refreshed = self.local_active_tools(&input.tab_ids);
-                active_tools = Self::gate_network_tools(
-                    &Self::gate_speech_tools(
-                        &Self::gate_canvas_tools(&refreshed, canvas_unlocked),
-                        canvas_unlocked || speech_useful,
+                active_tools = Self::gate_selector_tools(
+                    &Self::gate_network_tools(
+                        &Self::gate_speech_tools(
+                            &Self::gate_canvas_tools(&refreshed, canvas_unlocked),
+                            canvas_unlocked || speech_useful,
+                        ),
+                        network_on,
+                        console_named,
                     ),
-                    network_on,
-                    console_named,
+                    selector_unlocked,
                 );
             }
 
@@ -3165,7 +3209,7 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
             // Meta-tool: the CSS-selector browser tools, for elements without an id.
             "load_selector_tools" => {
                 self.selector_tools_loaded.set(true);
-                r#"{"success":true,"message":"Loaded for the rest of this run: browser_click {selector}, browser_type {selector, text}, browser_fill {selector, value}. Prefer the *_by_id tools when the element has an [eN] id."}"#.to_string()
+                r#"{"success":true,"message":"browser_click {selector}, browser_type {selector, text} and browser_fill {selector, value} are available from your next step on. Prefer the *_by_id tools when the element has an [eN] id."}"#.to_string()
             }
             // Meta-tool: load computer use tools and trigger full prompt injection
             "load_computer_use_tools" => {
@@ -5039,26 +5083,24 @@ Do NOT use browser_navigate when the tab is already open — activate it instead
         });
 
         // Click by selector
-        if self.selector_tools_loaded.get() {
-            tools.push(ToolDefinition {
-                name: "browser_click".into(),
-                description: "Click on an element by CSS selector".into(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "selector": {
-                            "type": "string",
-                            "description": "CSS selector for the element to click"
-                        },
-                        "tab_id": {
-                            "type": "integer",
-                            "description": "Optional tab ID"
-                        }
+        tools.push(ToolDefinition {
+            name: "browser_click".into(),
+            description: "Click on an element by CSS selector".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "selector": {
+                        "type": "string",
+                        "description": "CSS selector for the element to click"
                     },
-                    "required": ["selector"]
-                }),
-            });
-        }
+                    "tab_id": {
+                        "type": "integer",
+                        "description": "Optional tab ID"
+                    }
+                },
+                "required": ["selector"]
+            }),
+        });
 
         // Click by ID
         tools.push(ToolDefinition {
@@ -5081,31 +5123,28 @@ Do NOT use browser_navigate when the tab is already open — activate it instead
         });
 
         // Type by selector (keystrokes)
-        if self.selector_tools_loaded.get() {
-            tools.push(ToolDefinition {
-                name: "browser_type".into(),
-                description: "Type text into an element by CSS selector (simulates keystrokes)"
-                    .into(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "selector": {
-                            "type": "string",
-                            "description": "CSS selector for the input element"
-                        },
-                        "text": {
-                            "type": "string",
-                            "description": "Text to type"
-                        },
-                        "tab_id": {
-                            "type": "integer",
-                            "description": "Optional tab ID"
-                        }
+        tools.push(ToolDefinition {
+            name: "browser_type".into(),
+            description: "Type text into an element by CSS selector (simulates keystrokes)".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "selector": {
+                        "type": "string",
+                        "description": "CSS selector for the input element"
                     },
-                    "required": ["selector", "text"]
-                }),
-            });
-        }
+                    "text": {
+                        "type": "string",
+                        "description": "Text to type"
+                    },
+                    "tab_id": {
+                        "type": "integer",
+                        "description": "Optional tab ID"
+                    }
+                },
+                "required": ["selector", "text"]
+            }),
+        });
 
         // Type by ID
         tools.push(ToolDefinition {
@@ -5132,32 +5171,29 @@ Do NOT use browser_navigate when the tab is already open — activate it instead
         });
 
         // Fill by selector (set value)
-        if self.selector_tools_loaded.get() {
-            tools.push(ToolDefinition {
-                name: "browser_fill".into(),
-                description:
-                    "Fill an input element with a value by CSS selector (sets value directly)"
-                        .into(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "selector": {
-                            "type": "string",
-                            "description": "CSS selector for the input element"
-                        },
-                        "value": {
-                            "type": "string",
-                            "description": "Value to fill"
-                        },
-                        "tab_id": {
-                            "type": "integer",
-                            "description": "Optional tab ID"
-                        }
+        tools.push(ToolDefinition {
+            name: "browser_fill".into(),
+            description: "Fill an input element with a value by CSS selector (sets value directly)"
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "selector": {
+                        "type": "string",
+                        "description": "CSS selector for the input element"
                     },
-                    "required": ["selector", "value"]
-                }),
-            });
-        }
+                    "value": {
+                        "type": "string",
+                        "description": "Value to fill"
+                    },
+                    "tab_id": {
+                        "type": "integer",
+                        "description": "Optional tab ID"
+                    }
+                },
+                "required": ["selector", "value"]
+            }),
+        });
 
         // Fill by ID
         tools.push(ToolDefinition {
@@ -9009,43 +9045,69 @@ mod tests {
         assert!(tool_names.contains(&"load_computer_use_tools"));
     }
 
+    /// End-to-end: the selector tools are withheld from the request until the
+    /// model calls load_selector_tools, and then offered in the SAME run — the
+    /// J20 run showed a model told "loaded" that still could not call them,
+    /// because the loop's tool list was fixed at the start of the turn.
     #[test]
-    fn selector_tools_are_a_fallback_behind_a_loader() {
-        let agent = Agent::new(MockHostFunctions::new());
-        let names: Vec<String> = agent
-            .get_browser_tools()
-            .into_iter()
-            .map(|t| t.name)
-            .collect();
+    fn run_loop_withholds_selector_tools_until_loaded() {
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(LlmResponse {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "s1".into(),
+                call_id: Some("s1".into()),
+                name: "load_selector_tools".into(),
+                arguments: serde_json::json!({}),
+                signature: None,
+            }],
+            reasoning: None,
+        });
+        mock.add_llm_response(says("done"));
+        let config = AgentConfig {
+            max_iterations: 5,
+            use_streaming: false,
+            suppress_streaming: false,
+            is_subagent: false,
+        };
+        let agent = Agent::with_config(mock, config);
+        let tools = agent.get_browser_tools();
+        let input = AgentInput {
+            session_id: "t".into(),
+            mode: AgentMode::Browser,
+            user_message: "click the thing".into(),
+            history: vec![],
+            attachments: vec![],
+            local_files: vec![],
+            custom_system_prompt: None,
+            skills_filter: None,
+            tab_id: None,
+            tab_ids: vec![],
+            skill_context: None,
+            available_models: vec![],
+            mcp_servers: vec![],
+            soul_context: None,
+            tools_config: None,
+            os_platform: None,
+            local: None,
+        };
+
+        agent.run_loop(&input, "system", &tools).unwrap();
+
+        let captured = agent.host.captured_tool_names.borrow();
+        assert_eq!(captured.len(), 2, "expected two LLM calls");
         for gone in ["browser_click", "browser_type", "browser_fill"] {
             assert!(
-                !names.iter().any(|n| n == gone),
-                "{gone} should start hidden"
+                !captured[0].contains(&gone.to_string()),
+                "{gone} must start withheld"
+            );
+            assert!(
+                captured[1].contains(&gone.to_string()),
+                "{gone} must be offered after load_selector_tools"
             );
         }
-        assert!(names.iter().any(|n| n == "load_selector_tools"));
-        assert!(names.iter().any(|n| n == "browser_click_by_id"));
-    }
-
-    #[test]
-    fn loading_selector_tools_brings_them_back() {
-        let agent = Agent::new(MockHostFunctions::new());
-        let call = ToolCall {
-            id: "t".into(),
-            call_id: None,
-            name: "load_selector_tools".into(),
-            arguments: serde_json::json!({}),
-            signature: None,
-        };
-        let result = agent.execute_tool(&call).unwrap();
-        assert!(result.success);
-        assert!(result.content.contains("browser_click"));
-        let names: Vec<String> = agent
-            .get_browser_tools()
-            .into_iter()
-            .map(|t| t.name)
-            .collect();
-        assert!(names.iter().any(|n| n == "browser_click"));
+        assert!(captured[0].contains(&"load_selector_tools".to_string()));
+        assert!(captured[0].contains(&"browser_click_by_id".to_string()));
     }
 
     #[test]
@@ -9704,9 +9766,9 @@ mod tests {
         // browser_get_tabs moved INTO get_chat_tools() (so chat can list tabs);
         // it is now part of the chat baseline (inherited by browser/agent) and
         // no longer browser-specific — hence back to +24, was +25.
-        // J20-B: browser_click/type/fill moved behind load_selector_tools
-        // (-3 +1) — hence +22, was +24.
-        assert_eq!(browser_tools.len(), chat_tools.len() + 22);
+        // J20-B: + load_selector_tools (the selector tools stay in the full
+        // list and are gated per request in run_loop) — hence +25, was +24.
+        assert_eq!(browser_tools.len(), chat_tools.len() + 25);
     }
 
     #[test]
