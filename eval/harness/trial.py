@@ -23,7 +23,9 @@ class TrialConfig:
     keep_dirs: bool = False
 
 
-_PROVIDER_ERROR = re.compile(r"^\s*\[Error: ProviderError")
+# rig's providers say "ProviderError"; the daemon's raw HTTP paths (all
+# Anthropic-wire traffic since P0) say "Internal error: <Provider>-raw …".
+_PROVIDER_ERROR = re.compile(r"^\s*\[Error: (ProviderError|Internal error: \w+-raw\b)")
 
 
 def classify_status(last: dict, timed_out: bool) -> str:

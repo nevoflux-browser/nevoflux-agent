@@ -70,6 +70,17 @@ class StatusTest(unittest.TestCase):
                 "turn_outputs": ["[Error: ProviderError: 429 ...]", "fine"]}
         self.assertEqual(classify_status(last, timed_out=False), "provider_error")
 
+    def test_raw_path_provider_error_is_not_an_agent_result(self):
+        # Since P0 the Anthropic wire goes through the daemon's raw path, whose
+        # errors read "Internal error: Anthropic-raw …" instead of rig's
+        # "ProviderError" — a quota 403 was counted as an agent failure.
+        from eval.harness.trial import classify_status
+        last = {"status": "succeeded",
+                "output": '[Error: Internal error: Anthropic-raw stream HTTP 403 Forbidden: '
+                          '{"error":{"type":"permission_error","message":"You\'ve reached your '
+                          '5-hour usage limit."}}]'}
+        self.assertEqual(classify_status(last, timed_out=False), "provider_error")
+
     def test_timeout_and_normal_status(self):
         from eval.harness.trial import classify_status
         self.assertEqual(classify_status({"status": "running"}, timed_out=True), "timeout")
