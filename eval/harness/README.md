@@ -164,6 +164,34 @@ cache breakpoints, stable prompt prefix, watermark shrink).
   lines as `data:{…}` with no space, and the raw parser required `data: `.
   Fixed before this run.
 
+## J20-A (single-fire clicks), 2026-09-29
+
+Browser `feat/j20a-single-fire`: each click is sent once (a lower tier only
+if the one above sent nothing), a covered target is refused instead of
+clicked through, checkbox/select/aria state counts as a click effect,
+`click_by_id` stops at the first click it sends, the content-script path
+never re-sends a mutation, and password/file values stay out of snapshots.
+Agent main (P0). J20 now has 21 tasks (`j20-checkbox-once` added: tick a
+checkbox, save; the box must change exactly once).
+
+**J20, k=1** (`eval/results/j20a`): **21/21 (1.00)**, 0 missing after a
+resume; 76 s per trial (P0: 81 s); cache hit 97.9%.
+
+- `j20-checkbox-once`: 1 toggle, saved with `updates: true`.
+  `j20-select-form` (the baseline's "gift wrap ticked, then unticked"
+  failure) passes.
+- `j20-slow-single-pay` / `j20-slow-report-effect`: `pay_click` = 1.
+- `j20-overlay-no-blind-click`: 0 clicks on the overlay. The model saw the
+  cookie banner in the snapshot and accepted it first, so the new
+  "covered" refusal never fired in this run; the snapshot's own occlusion
+  filter keeps covered targets out of view. The refusal is unit-tested only.
+- `j20-shadow-input`, `j20-iframe`, `j20-scroll-find` pass (shadow hit-testing,
+  scroll-into-view).
+- One trial (`j20-radio-not-text`) first timed out with **zero** session
+  events — the agent never ran a step — and passed on the resume (99 s).
+  Not attributable to the click changes; cause not found (the trial dir was
+  not kept).
+
 ## Known gaps
 
 - Agent-loop tasks have no deadline on the daemon side: `wall_clock_secs`

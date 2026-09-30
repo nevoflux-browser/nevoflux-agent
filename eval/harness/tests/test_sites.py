@@ -7,7 +7,7 @@ import unittest
 SITES = pathlib.Path(__file__).resolve().parents[1] / "sites"
 EXPECTED = {
     "widgets": ["overlay.html", "slow.html", "shadow.html", "select.html",
-                "combobox.html", "scroll.html", "decoy.html", "iframe.html"],
+                "combobox.html", "scroll.html", "decoy.html", "iframe.html", "toggle.html"],
     "shop": ["index.html", "search.html", "product.html", "cart.html", "checkout.html"],
     "flights": ["index.html", "results.html"],
     "messenger": ["index.html"],

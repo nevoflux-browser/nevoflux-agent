@@ -1,0 +1,27 @@
+{
+ "id": "j20-checkbox-once",
+ "set": "j20",
+ "lang": "en",
+ "site": "widgets",
+ "task": "Open {base}/toggle.html, turn on \"Email me product updates\" and save.",
+ "checks": [
+  {
+   "type": "event",
+   "kind": "settings_save",
+   "where": {
+    "updates": true
+   }
+  },
+  {
+   "type": "event_count",
+   "kind": "updates_toggle",
+   "op": "==",
+   "n": 1
+  }
+ ],
+ "tags": [
+  "j20",
+  "form"
+ ],
+ "timeout_secs": 300
+}
