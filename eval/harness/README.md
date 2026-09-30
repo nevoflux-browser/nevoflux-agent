@@ -192,6 +192,40 @@ resume; 76 s per trial (P0: 81 s); cache hit 97.9%.
   Not attributable to the click changes; cause not found (the trial dir was
   not kept).
 
+## J20-B (real roles, node-bound ids, select options), 2026-09-30
+
+Browser `feat/j20b-identity`: a11y roles read from Gecko (the old
+role-number table matched no Gecko, so the a11y half of every snapshot was
+dead), a retry when a fresh page's accessible tree is not built yet, ids
+from an actor-side registry (a node keeps its id; nothing written into the
+page), `actOnRef` acting on exactly that node after a staleness check,
+every `<select>` option listed as a target, a waits-for-options step after
+opening a popup, and a capped `## text` section of visible text. Agent
+`feat/j20b-exposure`: `browser_click/type/fill` (CSS selector) moved
+behind `load_selector_tools`.
+
+**J20, k=1** (`eval/results/j20b2`): **21/21**, 0 missing, 64 s per trial,
+cache hit 98.0%.
+
+| per run (21 trials) | J20-A | J20-B, first run | J20-B |
+|---|---|---|---|
+| `browser_eval_js` calls | 120 | 96 | **60** |
+| snapshot lines `?tag` | 1464 | 1608 | **165** |
+| snapshot lines with a role | 58 | 392 | **951** |
+| select option lines | 0 | 36 | 32 |
+| stale-id refusals | – | 5 (all false) | 0 |
+| `load_selector_tools` calls | – | 4 | 4 |
+| s per trial | 75.6 | 67.4 | 64.1 |
+
+- The first J20-B run (`eval/results/j20b`, also 21/21) exposed two
+  defects, fixed before the second: the staleness fingerprint read the
+  a11y role, which Gecko creates lazily, so five actions were refused as
+  "now a combobox/textbox" when nothing had changed (the kind now comes
+  from the DOM); and the first snapshot of every page was all `?tag`
+  because the accessible tree was not built yet (one retry after ≤150 ms).
+- One first-run trial (`j20-select-form`) timed out with zero session
+  events — the same startup hang as in the J20-A run — and passed on resume.
+
 ## Known gaps
 
 - Agent-loop tasks have no deadline on the daemon side: `wall_clock_secs`
