@@ -226,6 +226,18 @@ cache hit 98.0%.
 - One first-run trial (`j20-select-form`) timed out with zero session
   events — the same startup hang as in the J20-A run — and passed on resume.
 
+**After the final review's fixes** (`eval/results/j20b3`; selector tools
+offered in the same run once loaded, shadow-DOM controls kept by the
+occlusion filter, one a11y walk per snapshot, a viewport-pruned text walk,
+✓/☐ on toggles, the element's label in the staleness fingerprint):
+**21/21**, 43 s per trial, cache hit 96.7%, `browser_eval_js` 48 (J20-A
+120), `?tag` lines 58 (J20-A 1464), 0 stale refusals, 56 ☐ marks.
+`j20-shadow-input` is now done by id alone (2 × `fill_by_id`, 2 ×
+`click_by_id`); `j20-iframe` still goes through `eval_js` — iframe controls
+get no ids yet (they need frame-offset clicking). The run was resumed twice
+across Kimi's 5-hour quota window; the harness now counts the raw path's
+"Internal error: Anthropic-raw …" as a provider error.
+
 ## Known gaps
 
 - Agent-loop tasks have no deadline on the daemon side: `wall_clock_secs`
