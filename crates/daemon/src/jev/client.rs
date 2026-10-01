@@ -29,6 +29,23 @@ pub fn egress_allowed(latched: bool, endpoint: &str) -> bool {
     !latched || crate::local::latch::is_loopback_url(endpoint)
 }
 
+/// Redirects are never followed (the latch approved the configured endpoint,
+/// not wherever it points), and a loopback endpoint never goes through a
+/// system proxy — that would carry the state and the key off the machine
+/// with the LocalOnly latch on (same rule as `wasm/local_llm.rs`, R30/R33).
+/// Remote endpoints keep the system proxy: some users need it to reach them.
+fn http_policy(b: reqwest::ClientBuilder, endpoint: &str) -> reqwest::ClientBuilder {
+    let b = b.redirect(reqwest::redirect::Policy::none());
+    if crate::local::latch::is_loopback_url(endpoint) {
+        b.no_proxy()
+    } else {
+        b
+    }
+}
+
+/// A request left running after its caller gave up is still cut off here.
+const ORPHAN_CAP: Duration = Duration::from_secs(30);
+
 #[derive(Clone)]
 pub struct JevClient {
     http: reqwest::Client,
@@ -48,11 +65,13 @@ impl std::fmt::Debug for JevClient {
 
 impl JevClient {
     pub fn new(endpoint: &str, api_key: &str, model: &str) -> Self {
-        let http = reqwest::Client::builder()
+        let builder = reqwest::Client::builder()
             .pool_idle_timeout(Duration::from_secs(90))
             .tcp_keepalive(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(5))
             .user_agent(concat!("nevoflux-agent/", env!("CARGO_PKG_VERSION")))
+            .timeout(ORPHAN_CAP);
+        let http = http_policy(builder, endpoint)
             .build()
             .expect("reqwest client");
         Self {
@@ -84,39 +103,58 @@ impl JevClient {
         if !egress_allowed(crate::local::latch::is_on(), &self.endpoint) {
             return Err(JevError::Refused("on-device mode is on".into()));
         }
+        if self
+            .endpoint
+            .trim_start()
+            .to_ascii_lowercase()
+            .starts_with("http://")
+            && !crate::local::latch::is_loopback_url(&self.endpoint)
+        {
+            return Err(JevError::Refused(
+                "a remote Jev endpoint must use https".into(),
+            ));
+        }
         let req = JevRequest {
             state,
             model: self.model.clone(),
             questions,
         };
-        let resp = self
+        let pending = self
             .http
             .post(&self.endpoint)
             .bearer_auth(&self.key)
-            .json(&req)
-            .timeout(timeout)
-            .send()
-            .await
-            .map_err(|e| {
+            .json(&req);
+        // The request runs on its own task: when the caller's deadline passes
+        // it keeps going, so a cold connection still finishes its handshake
+        // and reaches the pool for the next decision point (a dropped request
+        // would abort it, and every cold start would time out again).
+        let task = tokio::spawn(async move {
+            let resp = pending.send().await.map_err(|e| {
                 if e.is_timeout() {
                     JevError::Timeout
                 } else {
                     JevError::Transport(without_url(e))
                 }
             })?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(JevError::Http {
-                status: status.as_u16(),
-            });
-        }
-        resp.json::<JevResponse>().await.map_err(|e| {
-            if e.is_timeout() {
-                JevError::Timeout
-            } else {
-                JevError::Decode(without_url(e))
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(JevError::Http {
+                    status: status.as_u16(),
+                });
             }
-        })
+            resp.json::<JevResponse>().await.map_err(|e| {
+                if e.is_timeout() {
+                    JevError::Timeout
+                } else {
+                    JevError::Decode(without_url(e))
+                }
+            })
+        });
+        match tokio::time::timeout(timeout, task).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(join)) => Err(JevError::Transport(join.to_string())),
+            Err(_) => Err(JevError::Timeout),
+        }
     }
 }
 
@@ -238,6 +276,114 @@ mod tests {
         c.ask(serde_json::json!({}), one_noul(), Duration::from_secs(5))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_loopback_endpoint_never_goes_through_a_proxy() {
+        // With the latch on, a loopback endpoint is the only one allowed; a
+        // system proxy would carry the state and the key off the machine.
+        let app = Router::new().route(
+            "/v1/systemone",
+            post(|| async { axum::Json(serde_json::json!({"answers": {}, "usage": {}})) }),
+        );
+        let url = spawn(app).await;
+        let builder = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all("http://127.0.0.1:9").expect("valid proxy url"));
+        let http = http_policy(builder, &url).build().unwrap();
+        let resp = http.post(&url).json(&serde_json::json!({})).send().await;
+        assert!(resp.is_ok(), "the proxy must be bypassed: {:?}", resp.err());
+    }
+
+    #[tokio::test]
+    async fn a_redirect_is_not_followed() {
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let h = hits.clone();
+        let elsewhere = spawn(Router::new().route(
+            "/v1/systemone",
+            post(move || {
+                h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { axum::Json(serde_json::json!({"answers": {}, "usage": {}})) }
+            }),
+        ))
+        .await;
+        let app = Router::new().route(
+            "/v1/systemone",
+            post(move || {
+                let to = elsewhere.clone();
+                async move {
+                    (
+                        axum::http::StatusCode::TEMPORARY_REDIRECT,
+                        [(axum::http::header::LOCATION, to)],
+                    )
+                }
+            }),
+        );
+        let url = spawn(app).await;
+        let c = JevClient::new(&url, "k", "jev-latest");
+        let e = c
+            .ask(serde_json::json!({}), one_noul(), Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(matches!(e, JevError::Http { status: 307 }), "{e:?}");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_request_still_warms_the_connection() {
+        // A cold request that misses its deadline must still finish, so its
+        // connection reaches the pool for the next decision point.
+        let peers = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let p = peers.clone();
+        let first = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let app = Router::new().route(
+            "/v1/systemone",
+            post(
+                move |axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<
+                    std::net::SocketAddr,
+                >| {
+                    let p = p.clone();
+                    let first = first.clone();
+                    async move {
+                        p.lock().unwrap().push(addr);
+                        if first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                            tokio::time::sleep(Duration::from_millis(300)).await;
+                        }
+                        axum::Json(serde_json::json!({"answers": {}, "usage": {}}))
+                    }
+                },
+            ),
+        );
+        let url = spawn(app).await;
+        let c = JevClient::new(&url, "k", "jev-latest");
+        let e = c
+            .ask(
+                serde_json::json!({}),
+                one_noul(),
+                Duration::from_millis(100),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(e, JevError::Timeout), "{e:?}");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        c.ask(serde_json::json!({}), one_noul(), Duration::from_secs(5))
+            .await
+            .unwrap();
+        let peers = peers.lock().unwrap();
+        assert_eq!(peers.len(), 2);
+        assert_eq!(
+            peers[0], peers[1],
+            "the second ask reuses the first connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_key_never_goes_to_a_remote_endpoint_in_clear_text() {
+        let c = JevClient::new("http://jev.example.invalid/v1/systemone", "k", "jev-latest");
+        let e = c
+            .ask(serde_json::json!({}), one_noul(), Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(matches!(e, JevError::Refused(_)), "{e:?}");
     }
 
     #[test]
