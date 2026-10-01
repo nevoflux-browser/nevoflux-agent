@@ -314,12 +314,7 @@ fn extract_best_selector(elem: &serde_json::Value) -> String {
                 }
             }
         }
-        // Fallback: first selector of any type
-        if let Some(first) = selectors.first() {
-            if let Some(val) = first.get("value").and_then(|v| v.as_str()) {
-                return val.to_string();
-            }
-        }
+        // No CSS selector: an a11y: locator is not one, so report none.
     }
     // Legacy format: "selector" string
     elem.get("selector")
@@ -10244,6 +10239,19 @@ mod tests {
     // =========================================================================
     // Elements caching tests
     // =========================================================================
+
+    #[test]
+    fn element_cache_keeps_only_css_selectors() {
+        // An a11y: locator is not CSS; showing it as `selector` invited the
+        // model to pass it to a selector tool that cannot resolve it.
+        let raw = serde_json::json!({"selectors": [{"type": "a11y", "value": "a11y:button/Save"}]});
+        assert_eq!(super::extract_best_selector(&raw), "");
+        let raw = serde_json::json!({"selectors": [
+            {"type": "a11y", "value": "a11y:x/y"},
+            {"type": "css", "value": "#save"}
+        ]});
+        assert_eq!(super::extract_best_selector(&raw), "#save");
+    }
 
     #[test]
     fn test_parse_elements_from_data_refs_format() {
