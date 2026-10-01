@@ -1,5 +1,10 @@
 //! `usage.export_calls`: the per-call usage rows as CSV, for the cost
 //! breakdown that fixes G2's X (spec §9 M4).
+//!
+//! The static-vs-history split of cached input is computed offline from these
+//! rows: within a turn, the first `main` call's `cache_read` approximates the
+//! static prefix (system prompt + tools). A precise split needs the agent to
+//! report its prefix size, which is deferred.
 
 pub use nevoflux_storage::repositories::LlmCallRow;
 
