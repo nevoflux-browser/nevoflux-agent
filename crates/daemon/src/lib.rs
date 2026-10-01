@@ -49,6 +49,7 @@ pub mod health;
 pub mod http;
 pub mod init_brain;
 pub mod interrupt;
+pub mod jev;
 pub mod kb_wizard;
 pub mod learning;
 pub mod llm_gateway;
