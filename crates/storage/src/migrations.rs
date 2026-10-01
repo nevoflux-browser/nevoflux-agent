@@ -100,6 +100,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "029_session_events",
         include_str!("migrations/029_session_events.sql"),
     ),
+    (
+        "030_llm_calls",
+        include_str!("migrations/030_llm_calls.sql"),
+    ),
 ];
 
 /// Run all pending migrations on the given connection.
@@ -598,6 +602,20 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 1, "Index {} should exist", idx);
         }
+    }
+
+    #[test]
+    fn migrations_create_llm_calls() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_all(&mut conn).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='llm_calls'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "llm_calls table must exist after migrations");
     }
 
     #[test]

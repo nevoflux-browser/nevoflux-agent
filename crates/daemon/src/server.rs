@@ -9039,6 +9039,9 @@ async fn handle_chat_message(
                     crate::local::rpc::handle_set_config(&params, shared_config).await
                 }
                 "jev.test" => crate::jev::rpc::handle_test(&params, shared_config).await,
+                "usage.export_calls" => {
+                    crate::jev::export::handle_export(&params, &services.database)
+                }
                 "kb.wizard.status" => crate::kb_wizard::handle_status(&params).await,
                 "kb.wizard.install_bun" => crate::kb_wizard::handle_install_bun(&params).await,
                 "kb.wizard.install_gbrain" => {

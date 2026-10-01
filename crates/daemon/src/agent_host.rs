@@ -449,6 +449,7 @@ impl DaemonHostFunctions {
     /// Add services to enable tool search and dynamic tool calls.
     pub fn with_services(mut self, services: HostServices) -> Self {
         self.services = Some(services);
+        self.attach_call_sink();
         self
     }
 
@@ -514,6 +515,7 @@ impl DaemonHostFunctions {
     /// Set the session ID for browser tool requests.
     pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
         self.session_id = Some(session_id.into());
+        self.attach_call_sink();
         self
     }
 
@@ -577,7 +579,34 @@ impl DaemonHostFunctions {
     /// reply cost. Leave unset for hosts nobody reads stats from.
     pub fn with_turn_stats(mut self, stats: Arc<crate::turn_stats::TurnStats>) -> Self {
         self.turn_stats = Some(stats);
+        self.attach_call_sink();
         self
+    }
+
+    /// Once the turn's stats, the services (database) and the session are all
+    /// known, write every LLM and Jev call to `llm_calls` (M4, the cost
+    /// breakdown). Builder order varies, so each builder tries; the stats keep
+    /// the first sink, so subagent hosts sharing them add none. Errors are
+    /// logged, never raised.
+    fn attach_call_sink(&self) {
+        let (Some(stats), Some(services), Some(session_id)) =
+            (&self.turn_stats, &self.services, &self.session_id)
+        else {
+            return;
+        };
+        if session_id.is_empty() || stats.has_sink() {
+            return;
+        }
+        let db = services.database.clone();
+        let session_id = session_id.clone();
+        stats.set_sink(Arc::new(move |row: &crate::turn_stats::LlmCallRow| {
+            let mut row = row.clone();
+            row.session_id = session_id.clone();
+            if let Err(e) = nevoflux_storage::repositories::LlmCallRepository::new(&db).append(&row)
+            {
+                tracing::warn!(error = %e, "llm_calls append failed");
+            }
+        }));
     }
 
     /// The per-reply accumulator, for passing down to spawned subagents.
@@ -9093,6 +9122,36 @@ mod tests {
             1,
             "settling removes the entry, so close is a no-op"
         );
+    }
+
+    #[tokio::test]
+    async fn a_hosts_calls_are_written_to_llm_calls_under_its_session() {
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        let stats = crate::turn_stats::TurnStats::new();
+        // Builder order varies between call sites; the sink attaches once all
+        // three are known.
+        let _host = super::DaemonHostFunctions::new(
+            std::sync::Arc::new(crate::config::AgentConfig::default()),
+            tokio::runtime::Handle::current(),
+        )
+        .with_turn_stats(stats.clone())
+        .with_session_id("chat-7")
+        .with_services(crate::wasm::services::HostServices::new(db.clone()));
+        stats.record(crate::turn_stats::CallStats {
+            reported_input: Some(40),
+            reported_output: Some(4),
+            model: "k3".into(),
+            ..Default::default()
+        });
+        stats.record_jev(9, 1);
+        let rows = nevoflux_storage::repositories::LlmCallRepository::new(&db)
+            .list_since(0)
+            .unwrap();
+        let got: Vec<_> = rows
+            .iter()
+            .map(|r| (r.session_id.as_str(), r.role.as_str(), r.input))
+            .collect();
+        assert_eq!(got, vec![("chat-7", "main", 40), ("chat-7", "jev", 9)]);
     }
 
     fn host_with_prompt_held_by(pack: &str) -> super::DaemonHostFunctions {

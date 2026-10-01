@@ -7,8 +7,20 @@
 //! browser repo for the full design.
 
 use nevoflux_protocol::{TurnUsage, UsageBucket};
-use std::sync::{Arc, Mutex};
+pub use nevoflux_storage::repositories::LlmCallRow;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
+
+/// Receives one row per LLM or Jev call (the `llm_calls` table, M4). The row's
+/// `session_id` is left empty: the sink knows its session and fills it.
+pub type CallSink = Arc<dyn Fn(&LlmCallRow) + Send + Sync>;
+
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
 
 /// Whether a character counts as one whole token.
 ///
@@ -94,6 +106,7 @@ pub struct TurnStats {
     started: Instant,
     calls: Mutex<Vec<CallStats>>,
     jev: Mutex<UsageBucket>,
+    sink: OnceLock<CallSink>,
 }
 
 impl TurnStats {
@@ -103,7 +116,19 @@ impl TurnStats {
             started: Instant::now(),
             calls: Mutex::new(Vec::new()),
             jev: Mutex::new(UsageBucket::default()),
+            sink: OnceLock::new(),
         })
+    }
+
+    /// Attach the per-call sink. The first one wins: the turn's stats are
+    /// shared by the main agent and its subagents, and each host offers one.
+    pub fn set_sink(&self, sink: CallSink) {
+        let _ = self.sink.set(sink);
+    }
+
+    /// Whether a sink is attached.
+    pub fn has_sink(&self) -> bool {
+        self.sink.get().is_some()
     }
 
     /// One Jev request's tokens (spec §9 M2 `jev` role; user-paid, shown in
@@ -114,10 +139,38 @@ impl TurnStats {
             j.output += output_tokens;
             j.calls += 1;
         }
+        if let Some(sink) = self.sink.get() {
+            sink(&LlmCallRow {
+                ts: now_millis(),
+                session_id: String::new(),
+                role: "jev".into(),
+                model: String::new(),
+                input: input_tokens,
+                output: output_tokens,
+                cache_read: None,
+                cache_write: None,
+                estimated: false,
+            });
+        }
     }
 
     /// Record one finished LLM call.
     pub fn record(&self, call: CallStats) {
+        if let Some(sink) = self.sink.get() {
+            let (input, input_est) = resolve(call.reported_input, call.estimated_input);
+            let (output, output_est) = resolve(call.reported_output, call.estimated_output);
+            sink(&LlmCallRow {
+                ts: now_millis(),
+                session_id: String::new(),
+                role: if call.is_subagent { "subagent" } else { "main" }.into(),
+                model: call.model.clone(),
+                input,
+                output,
+                cache_read: call.reported_cache_read,
+                cache_write: call.reported_cache_write,
+                estimated: input_est || output_est,
+            });
+        }
         if let Ok(mut calls) = self.calls.lock() {
             calls.push(call);
         }
@@ -221,6 +274,49 @@ mod estimate_tests {
 #[cfg(test)]
 mod turn_stats_tests {
     use super::*;
+
+    #[test]
+    fn turn_stats_sink_sees_every_call() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s2 = seen.clone();
+        let stats = TurnStats::new();
+        stats.set_sink(Arc::new(move |row: &LlmCallRow| {
+            s2.lock().unwrap().push((row.role.clone(), row.input))
+        }));
+        stats.record(CallStats {
+            reported_input: Some(10),
+            ..Default::default()
+        });
+        stats.record(CallStats {
+            reported_input: Some(20),
+            is_subagent: true,
+            ..Default::default()
+        });
+        stats.record_jev(30, 1);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                ("main".to_string(), 10),
+                ("subagent".to_string(), 20),
+                ("jev".to_string(), 30)
+            ]
+        );
+    }
+
+    #[test]
+    fn the_first_sink_wins() {
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let h = hits.clone();
+        let stats = TurnStats::new();
+        stats.set_sink(Arc::new(move |_: &LlmCallRow| {
+            h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        stats.set_sink(Arc::new(|_: &LlmCallRow| {
+            panic!("second sink must not replace the first")
+        }));
+        stats.record_jev(1, 1);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn jev_spend_has_its_own_bucket() {
