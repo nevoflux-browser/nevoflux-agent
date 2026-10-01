@@ -259,6 +259,16 @@ pub enum SessionEventPayload {
         /// Byte length of the full result.
         bytes: u64,
     },
+    /// A Jev decision point fell back to its local rule (spec §5.8).
+    #[serde(rename = "jev/fallback")]
+    JevFallback {
+        /// The decision point (`tools`, `skills`, `visibility`, …).
+        point: String,
+        /// Why: `timeout`, `http 429`, `refused`, …
+        reason: String,
+        /// Time spent before falling back.
+        elapsed_ms: u64,
+    },
 }
 
 impl SessionEventPayload {
@@ -284,6 +294,7 @@ impl SessionEventPayload {
             Self::PackPromptRestore { .. } => "pack/prompt-restore",
             Self::ContextCompact { .. } => "context/compact",
             Self::ToolSpill { .. } => "tool/spill",
+            Self::JevFallback { .. } => "jev/fallback",
         }
     }
 }
@@ -331,6 +342,21 @@ pub fn tools_hash(names: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jev_fallback_event_wire_shape() {
+        let p = SessionEventPayload::JevFallback {
+            point: "visibility".into(),
+            reason: "timeout".into(),
+            elapsed_ms: 801,
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["type"], "jev/fallback");
+        assert_eq!(v["point"], "visibility");
+        assert_eq!(p.type_str(), "jev/fallback");
+        let back: SessionEventPayload = serde_json::from_value(v).unwrap();
+        assert_eq!(back, p);
+    }
 
     /// dsh's SessionEventMap 8 core event strings. Aligning with them is the
     /// entire cost of ADR A3 — one typo and the session interchange it buys is
