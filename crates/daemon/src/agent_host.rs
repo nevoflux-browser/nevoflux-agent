@@ -4614,6 +4614,14 @@ impl HostFunctions for DaemonHostFunctions {
         // full probe → decide → execute → verify pipeline runs in-daemon
         // instead of forwarding a single request to the browser extension.
         if let Some(route) = dynamic_browser_route(tool_name) {
+            // The native loop's permission gate lives in the host functions;
+            // this path orchestrates directly, so it must ask here.
+            if route_needs_permission(route) {
+                self.check_tool_permission(
+                    tool_name,
+                    &serde_json::to_string(arguments).unwrap_or_default(),
+                )?;
+            }
             let services = self.services.as_ref().ok_or_else(|| HostError {
                 code: 1,
                 message: "Services not available".into(),
@@ -8859,6 +8867,13 @@ enum DynamicBrowserRoute {
     Upload,
 }
 
+/// Whether an orchestrated browser tool goes through the user's permission
+/// gate: input and upload change the page (upload also reads a local file);
+/// probe only reads.
+fn route_needs_permission(route: DynamicBrowserRoute) -> bool {
+    !matches!(route, DynamicBrowserRoute::Probe)
+}
+
 fn dynamic_browser_route(name: &str) -> Option<DynamicBrowserRoute> {
     match name {
         "browser_input" => Some(DynamicBrowserRoute::Input),
@@ -8889,6 +8904,30 @@ mod tests {
             Some(DynamicBrowserRoute::Upload)
         );
         assert_eq!(dynamic_browser_route("browser_click"), None);
+    }
+
+    /// The native loop's permission gate runs inside the host functions; the
+    /// tool_call_dynamic intercept called the orchestration directly, so an
+    /// upload (or an input) skipped the user's execution-tier setting.
+    #[test]
+    fn input_and_upload_ask_permission_probe_does_not() {
+        use super::{route_needs_permission, DynamicBrowserRoute};
+        assert!(route_needs_permission(DynamicBrowserRoute::Input));
+        assert!(route_needs_permission(DynamicBrowserRoute::Upload));
+        assert!(!route_needs_permission(DynamicBrowserRoute::Probe));
+    }
+
+    #[test]
+    fn the_dynamic_browser_intercept_checks_permission() {
+        let src = include_str!("agent_host.rs");
+        let start = src
+            .find("if let Some(route) = dynamic_browser_route(tool_name) {")
+            .unwrap();
+        let head: String = src[start..].chars().take(900).collect();
+        assert!(
+            head.contains("self.check_tool_permission("),
+            "intercept must gate before orchestrating"
+        );
     }
 
     // ------------------------------------------------------------------
