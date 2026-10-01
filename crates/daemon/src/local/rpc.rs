@@ -83,7 +83,7 @@ use crate::local::sync;
 use crate::models::fetch;
 use crate::server::SharedAgentConfig;
 
-fn request_id(params: &serde_json::Value) -> String {
+pub(crate) fn request_id(params: &serde_json::Value) -> String {
     params
         .get("request_id")
         .and_then(|v| v.as_str())

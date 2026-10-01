@@ -3,6 +3,7 @@
 pub mod client;
 pub mod oracle;
 pub mod privacy;
+pub mod rpc;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod wire;
