@@ -256,6 +256,19 @@ selectors. Plus the J20-B minors.
 solved by id (2 × `browser_navigate`, 2 × `browser_click_by_id`; J20-B:
 10 × `browser_eval_js` + 4 screenshots).
 
+**After the review fixes** (`eval/results/j20c2`): 20/21. `j20-zh-messenger`
+picked the decoy "Zhang Sanfeng", and `browser_eval_js` rose to 102. The
+display had switched to 125% scaling (viewport 955 → 717 tall), and the a11y
+walk was subtracting CSS-pixel `mozInnerScreenX/Y` from device-pixel
+`getBounds()`. The occlusion sampling therefore landed too low and dropped
+the top of lists as "occluded" (`stats.occluded: 2`; the real contact was not
+in the snapshot). Fixed by `a11yBoundsToViewport`.
+
+**Final** (`eval/results/j20c3`, 125% scaling): **21/21**, 49 s per trial,
+cache hit 98.0%, `browser_eval_js` 26 (same count method as above).
+Rule: if a rerun regresses with no code cause, compare the snapshot's
+`viewport:` line and `stats.occluded` against the passing run first.
+
 ## Known gaps
 
 - Agent-loop tasks have no deadline on the daemon side: `wall_clock_secs`
