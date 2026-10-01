@@ -79,6 +79,10 @@ pub struct AgentConfig {
     /// Headless remote-control service (`--remote-control`).
     #[serde(default)]
     pub remote_control: RemoteControlConfig,
+
+    /// The Jev decision oracle (TypeSafe System One). Off by default.
+    #[serde(default)]
+    pub jev: JevConfig,
 }
 
 /// `[remote_control]` — what the headless remote-control head is set to.
@@ -541,6 +545,11 @@ impl AgentConfig {
 
     /// Merge with another configuration, preferring non-default values from other.
     pub fn merge(&mut self, other: &AgentConfig) {
+        // The [jev] section is taken whole when it differs from the default.
+        if other.jev != JevConfig::default() {
+            self.jev = other.jev.clone();
+        }
+
         // Merge daemon config
         if other.daemon.port_range_start != DaemonConfig::default().port_range_start {
             self.daemon.port_range_start = other.daemon.port_range_start;
@@ -1710,6 +1719,82 @@ impl SubagentConfig {
 
 // ==================== LearningConfig ====================
 
+/// Env var that overrides an empty `[jev] api_key` (spec §5.1).
+pub const JEV_KEY_ENV: &str = "NEVOFLUX_API_KEY_TYPESAFE";
+
+/// `[jev]`: the Jev (TypeSafe System One) decision oracle. Off by default; off
+/// means no request is ever sent and the agent behaves as without Jev.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct JevConfig {
+    pub enabled: bool,
+    pub endpoint: String,
+    /// The user's own key (spec Q7). Empty → `NEVOFLUX_API_KEY_TYPESAFE`.
+    pub api_key: String,
+    pub timeout_ms: u64,
+    pub model: String,
+    pub points: JevPoints,
+    /// Domains the user adds to the built-in sensitive-site list (§5.8).
+    pub sensitive_domains: Vec<String>,
+}
+
+impl Default for JevConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: "https://api.typesafe.ai/v1/systemone".into(),
+            api_key: String::new(),
+            timeout_ms: 800,
+            model: "jev-latest".into(),
+            points: JevPoints::default(),
+            sensitive_domains: Vec::new(),
+        }
+    }
+}
+
+impl JevConfig {
+    /// The key to send: config value, else the env var; `None` if neither.
+    pub fn resolved_api_key(&self) -> Option<String> {
+        let cfg = self.api_key.trim();
+        if !cfg.is_empty() {
+            return Some(cfg.to_string());
+        }
+        std::env::var(JEV_KEY_ENV)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    }
+
+    /// Enabled, with an endpoint and a key.
+    pub fn is_usable(&self) -> bool {
+        self.enabled && !self.endpoint.trim().is_empty() && self.resolved_api_key().is_some()
+    }
+}
+
+/// `[jev.points]`: which decision points may ask Jev (spec §5.1).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct JevPoints {
+    pub tools: bool,
+    pub skills: bool,
+    pub visibility: bool,
+    pub rebuild: bool,
+    /// J14, off by default.
+    pub permissions: bool,
+}
+
+impl Default for JevPoints {
+    fn default() -> Self {
+        Self {
+            tools: true,
+            skills: true,
+            visibility: true,
+            rebuild: true,
+            permissions: false,
+        }
+    }
+}
+
 /// Configuration for the self-learning system.
 ///
 /// Controls how the agent learns from interactions, validates learned
@@ -2144,6 +2229,70 @@ impl Default for AuthConfig {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn jev_section_defaults_to_off_with_spec_values() {
+        let cfg: AgentConfig = toml::from_str("").unwrap();
+        let j = &cfg.jev;
+        assert!(!j.enabled);
+        assert_eq!(j.endpoint, "https://api.typesafe.ai/v1/systemone");
+        assert_eq!(j.timeout_ms, 800);
+        assert_eq!(j.model, "jev-latest");
+        assert!(j.points.tools && j.points.skills && j.points.visibility && j.points.rebuild);
+        assert!(!j.points.permissions);
+        assert!(j.sensitive_domains.is_empty());
+    }
+
+    #[test]
+    fn jev_section_parses_partial_toml() {
+        let cfg: AgentConfig = toml::from_str(
+            "[jev]
+enabled = true
+timeout_ms = 1200
+[jev.points]
+permissions = true
+",
+        )
+        .unwrap();
+        assert!(cfg.jev.enabled);
+        assert_eq!(cfg.jev.timeout_ms, 1200);
+        assert!(cfg.jev.points.permissions);
+        assert!(cfg.jev.points.tools, "unset points keep their defaults");
+    }
+
+    #[test]
+    fn jev_key_comes_from_config_then_env_and_is_never_saved_from_env() {
+        let _g = crate::local::latch::test_serial(); // serialises env mutation
+        std::env::remove_var(JEV_KEY_ENV);
+        let mut j = JevConfig::default();
+        assert_eq!(j.resolved_api_key(), None);
+        assert!(!j.is_usable());
+        std::env::set_var(JEV_KEY_ENV, "env-key");
+        assert_eq!(j.resolved_api_key().as_deref(), Some("env-key"));
+        j.api_key = "cfg-key".into();
+        assert_eq!(j.resolved_api_key().as_deref(), Some("cfg-key"));
+        j.api_key.clear();
+        let saved = toml::to_string_pretty(&AgentConfig {
+            jev: j,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!saved.contains("env-key"));
+        std::env::remove_var(JEV_KEY_ENV);
+    }
+
+    #[test]
+    fn jev_merge_takes_a_non_default_section() {
+        let mut base = AgentConfig::default();
+        let mut other = AgentConfig::default();
+        base.merge(&other);
+        assert_eq!(base.jev, JevConfig::default());
+        other.jev.enabled = true;
+        other.jev.timeout_ms = 1200;
+        base.merge(&other);
+        assert!(base.jev.enabled);
+        assert_eq!(base.jev.timeout_ms, 1200);
+    }
 
     #[test]
     fn test_hand_written_custom_provider_toml_parses() {
