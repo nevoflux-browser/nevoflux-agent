@@ -582,6 +582,10 @@ pub struct TurnUsage {
     /// hides tok/s.
     #[serde(default, skip_serializing_if = "is_false")]
     pub external_agent: bool,
+    /// Jev (decision oracle) requests, absent when none ran. `calls` counts
+    /// requests; the tokens are billed by TypeSafe, not the LLM provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jev: Option<UsageBucket>,
 }
 
 /// Account information
@@ -1226,6 +1230,23 @@ mod turn_usage_tests {
     use super::*;
 
     #[test]
+    fn jev_bucket_is_omitted_when_absent_and_round_trips() {
+        let v = serde_json::to_value(TurnUsage::default()).unwrap();
+        assert!(v.get("jev").is_none(), "jev must be omitted: {v}");
+        let usage = TurnUsage {
+            jev: Some(UsageBucket {
+                input: 500,
+                output: 25,
+                calls: 2,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&usage).unwrap();
+        assert_eq!(serde_json::from_str::<TurnUsage>(&json).unwrap(), usage);
+    }
+
+    #[test]
     fn absent_optional_fields_are_omitted_from_json() {
         let usage = TurnUsage {
             main: UsageBucket {
@@ -1278,6 +1299,7 @@ mod turn_usage_tests {
             total_ms: Some(28400),
             model: Some("claude-sonnet-5".into()),
             external_agent: false,
+            jev: None,
         };
         let json = serde_json::to_string(&usage).unwrap();
         assert_eq!(serde_json::from_str::<TurnUsage>(&json).unwrap(), usage);

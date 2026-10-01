@@ -30,6 +30,13 @@ class CalibrateTest(unittest.TestCase):
         self.assertEqual(s["cost"]["input"], 400)
         self.assertAlmostEqual(s["cost"]["estimated_share"], 0.5)
 
+    def test_jev_spend_is_summed_separately(self):
+        r = row(0, "a", True, inp=1000)
+        r["usage"][0]["jev"] = {"input": 300, "output": 20, "calls": 2}
+        s = summarize([r, row(0, "b", True, inp=1000)])
+        self.assertEqual(s["cost"]["input"], 2000, "Jev is not LLM input")
+        self.assertEqual((s["cost"]["jev_input"], s["cost"]["jev_output"], s["cost"]["jev_calls"]), (300, 20, 2))
+
     def test_cache_totals_and_hit_ratio(self):
         r = row(0, "a", True, inp=1000)
         r["usage"][0]["main"]["cache_read"] = 800

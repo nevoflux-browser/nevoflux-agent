@@ -93,6 +93,7 @@ fn resolve(reported: Option<u64>, estimated: u64) -> (u64, bool) {
 pub struct TurnStats {
     started: Instant,
     calls: Mutex<Vec<CallStats>>,
+    jev: Mutex<UsageBucket>,
 }
 
 impl TurnStats {
@@ -101,7 +102,18 @@ impl TurnStats {
         Arc::new(Self {
             started: Instant::now(),
             calls: Mutex::new(Vec::new()),
+            jev: Mutex::new(UsageBucket::default()),
         })
+    }
+
+    /// One Jev request's tokens (spec §9 M2 `jev` role; user-paid, shown in
+    /// the sidebar in P2-5).
+    pub fn record_jev(&self, input_tokens: u64, output_tokens: u64) {
+        if let Ok(mut j) = self.jev.lock() {
+            j.input += input_tokens;
+            j.output += output_tokens;
+            j.calls += 1;
+        }
     }
 
     /// Record one finished LLM call.
@@ -170,6 +182,9 @@ impl TurnStats {
         if has_decode {
             usage.decode_ms = Some(decode_total);
         }
+        if let Ok(j) = self.jev.lock() {
+            usage.jev = (j.calls > 0).then(|| j.clone());
+        }
         Some(usage)
     }
 }
@@ -206,6 +221,32 @@ mod estimate_tests {
 #[cfg(test)]
 mod turn_stats_tests {
     use super::*;
+
+    #[test]
+    fn jev_spend_has_its_own_bucket() {
+        let stats = TurnStats::new();
+        stats.record(CallStats {
+            reported_input: Some(100),
+            reported_output: Some(10),
+            ..Default::default()
+        });
+        stats.record_jev(300, 20);
+        stats.record_jev(200, 5);
+        let u = stats.snapshot().unwrap();
+        let j = u.jev.expect("jev bucket");
+        assert_eq!((j.input, j.output, j.calls), (500, 25, 2));
+        assert_eq!(u.main.input, 100, "Jev spend is not counted as main");
+    }
+
+    #[test]
+    fn no_jev_calls_means_no_jev_bucket() {
+        let stats = TurnStats::new();
+        stats.record(CallStats {
+            reported_input: Some(1),
+            ..Default::default()
+        });
+        assert!(stats.snapshot().unwrap().jev.is_none());
+    }
 
     /// A main-agent streaming call; tests override what they care about.
     fn call() -> CallStats {

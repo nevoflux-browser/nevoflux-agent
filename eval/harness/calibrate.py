@@ -42,6 +42,10 @@ def summarize(rows) -> dict:
             "cache_read": cache_read,
             "cache_write": sum(b.get("cache_write") or 0 for b in buckets),
             "cache_hit_ratio": cache_read / total_input if total_input else 0.0,
+            # Jev is billed by TypeSafe, separately from the LLM.
+            "jev_input": sum((u.get("jev") or {}).get("input", 0) for u in turns),
+            "jev_output": sum((u.get("jev") or {}).get("output", 0) for u in turns),
+            "jev_calls": sum((u.get("jev") or {}).get("calls", 0) for u in turns),
             "estimated_share": (sum(bool(u.get("main", {}).get("estimated")) for u in turns) / len(turns)
                                 if turns else 0.0),
         },
