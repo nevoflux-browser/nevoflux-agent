@@ -129,35 +129,9 @@ fn without_url(e: reqwest::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jev::test_support::{one_noul, spawn};
     use axum::{routing::post, Router};
-    use std::future::IntoFuture;
     use std::sync::Arc;
-
-    async fn spawn(app: Router) -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(
-            axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-            )
-            .into_future(),
-        );
-        format!("http://{addr}/v1/systemone")
-    }
-
-    fn one_noul() -> BTreeMap<String, Question> {
-        let mut q = BTreeMap::new();
-        q.insert(
-            "x".into(),
-            Question::Noul {
-                instructions: "i".into(),
-                when_true: "t".into(),
-                when_false: "f".into(),
-            },
-        );
-        q
-    }
 
     #[tokio::test]
     async fn asks_and_parses_and_sends_the_key_only_in_the_header() {
