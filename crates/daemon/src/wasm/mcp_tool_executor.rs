@@ -1305,7 +1305,7 @@ pub async fn execute_browser_input_orchestrated(
 ///
 /// Mirrors the logic in `BrowserTool::run_browser_upload_from_args` (tools.rs)
 /// but operates on the BrowserContext available in the MCP executor path.
-async fn execute_browser_upload_orchestrated(
+pub(crate) async fn execute_browser_upload_orchestrated(
     arguments: &serde_json::Value,
     browser_ctx: &BrowserContext,
 ) -> Result<String, String> {

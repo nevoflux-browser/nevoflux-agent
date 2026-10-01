@@ -1601,6 +1601,42 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
     const SELECTOR_TOOLS: &'static [&'static str] =
         &["browser_click", "browser_type", "browser_fill"];
 
+    /// The selector a selector-based browser tool sends: the CSS `selector`
+    /// if given, else the snapshot id as `ref:eN`, which the browser resolves
+    /// to that exact node (design §4.5: ids first, selectors as fallback).
+    fn selector_or_ref(args: &serde_json::Value) -> Option<String> {
+        if let Some(s) = args
+            .get("selector")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            return Some(s.to_string());
+        }
+        args.get("element_id")
+            .and_then(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .or_else(|| v.as_i64().map(|n| n.to_string()))
+            })
+            .filter(|s| !s.is_empty())
+            .map(|id| format!("ref:{id}"))
+    }
+
+    /// The tool's arguments with `selector` set from `selector`/`element_id`,
+    /// or the JSON error to return when neither was given.
+    fn with_target(args: &serde_json::Value) -> Result<serde_json::Value, String> {
+        match Self::selector_or_ref(args) {
+            Some(sel) => {
+                let mut out = args.clone();
+                out["selector"] = serde_json::Value::String(sel);
+                Ok(out)
+            }
+            None => {
+                Err(r#"{"success":false,"error":"element_id or selector required"}"#.to_string())
+            }
+        }
+    }
+
     fn gate_selector_tools(full: &[ToolDefinition], unlocked: bool) -> Vec<ToolDefinition> {
         if unlocked {
             return full.to_vec();
@@ -2970,23 +3006,26 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
             //
             // browser_input is an interaction tool → auto_snapshot is desirable.
             // browser_probe is read-only → no auto_snapshot needed.
-            "browser_input" => {
-                let tab_id = tool_call.arguments["tab_id"].as_i64();
-                let result_str = self
-                    .host
-                    .tool_call_dynamic("browser_input", &tool_call.arguments)?;
-                self.auto_snapshot_after_action(&result_str, "interaction", tab_id)
-            }
-            "browser_probe" => self
-                .host
-                .tool_call_dynamic("browser_probe", &tool_call.arguments)?,
-            "browser_upload_file" => {
-                let tab_id = tool_call.arguments["tab_id"].as_i64();
-                let result_str = self
-                    .host
-                    .tool_call_dynamic("browser_upload_file", &tool_call.arguments)?;
-                self.auto_snapshot_after_action(&result_str, "interaction", tab_id)
-            }
+            "browser_input" => match Self::with_target(&tool_call.arguments) {
+                Ok(args) => {
+                    let tab_id = tool_call.arguments["tab_id"].as_i64();
+                    let result_str = self.host.tool_call_dynamic("browser_input", &args)?;
+                    self.auto_snapshot_after_action(&result_str, "interaction", tab_id)
+                }
+                Err(e) => e,
+            },
+            "browser_probe" => match Self::with_target(&tool_call.arguments) {
+                Ok(args) => self.host.tool_call_dynamic("browser_probe", &args)?,
+                Err(e) => e,
+            },
+            "browser_upload_file" => match Self::with_target(&tool_call.arguments) {
+                Ok(args) => {
+                    let tab_id = tool_call.arguments["tab_id"].as_i64();
+                    let result_str = self.host.tool_call_dynamic("browser_upload_file", &args)?;
+                    self.auto_snapshot_after_action(&result_str, "interaction", tab_id)
+                }
+                Err(e) => e,
+            },
             "browser_get_content" => {
                 let tab_id = tool_call.arguments["tab_id"].as_i64();
                 let result = self.host.browser_get_content(tab_id)?;
@@ -3074,7 +3113,8 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                 self.auto_snapshot_after_action(&result_str, "scroll", tab_id)
             }
             "browser_wait_for" => {
-                let selector = tool_call.arguments["selector"].as_str().unwrap_or("");
+                let target = Self::selector_or_ref(&tool_call.arguments).unwrap_or_default();
+                let selector = target.as_str();
                 let timeout_ms = tool_call.arguments["timeout_ms"].as_u64().unwrap_or(10000);
                 let tab_id = tool_call.arguments["tab_id"].as_i64();
                 let result = self.host.browser_wait_for(selector, timeout_ms, tab_id)?;
@@ -5237,10 +5277,14 @@ and browser_type_by_id when targeting rich text editors** (Twitter/X compose, \
 Facebook/Threads, LinkedIn, Discord, Reddit new compose, ProseMirror/Slate/Draft.js/Lexical). \
 Probes the element, picks a strategy based on framework detection, executes, and verifies. \
 Fixes 'silent success' on contentEditable div editors where legacy fill_by_id did nothing. \
-Use mode='fill' to replace content, mode='type' to append. Use a CSS selector (not element_id).".into(),
+Use mode='fill' to replace content, mode='type' to append. Target the element by element_id (preferred) or a CSS selector.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
+                    "element_id": {
+                        "type": "string",
+                        "description": "[eN] id from the page snapshot (preferred). Use selector only for an element with no id."
+                    },
                     "selector": {
                         "type": "string",
                         "description": "CSS selector for the target input / contentEditable element"
@@ -5263,7 +5307,7 @@ Use mode='fill' to replace content, mode='type' to append. Use a CSS selector (n
                         "description": "Optional tab ID"
                     }
                 },
-                "required": ["selector", "text"]
+                "required": ["text"]
             }),
         });
 
@@ -5279,6 +5323,10 @@ picked a particular path."
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
+                    "element_id": {
+                        "type": "string",
+                        "description": "[eN] id from the page snapshot (preferred). Use selector only for an element with no id."
+                    },
                     "selector": {
                         "type": "string",
                         "description": "CSS selector for the element to probe"
@@ -5288,7 +5336,7 @@ picked a particular path."
                         "description": "Optional tab ID"
                     }
                 },
-                "required": ["selector"]
+                "required": []
             }),
         });
 
@@ -5302,6 +5350,10 @@ Set workspace_dir to the directory containing the file to allow uploads from any
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
+                    "element_id": {
+                        "type": "string",
+                        "description": "[eN] id from the page snapshot (preferred). Use selector only for an element with no id."
+                    },
                     "selector": {
                         "type": "string",
                         "description": "CSS selector for the <input type=\"file\"> element"
@@ -5319,7 +5371,7 @@ Set workspace_dir to the directory containing the file to allow uploads from any
                         "description": "Optional tab ID"
                     }
                 },
-                "required": ["selector", "file_path"]
+                "required": ["file_path"]
             }),
         });
 
@@ -5378,6 +5430,10 @@ Set workspace_dir to the directory containing the file to allow uploads from any
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
+                    "element_id": {
+                        "type": "string",
+                        "description": "[eN] id from the page snapshot (preferred). Use selector only for an element with no id."
+                    },
                     "selector": {
                         "type": "string",
                         "description": "CSS selector for the element to wait for"
@@ -5392,7 +5448,7 @@ Set workspace_dir to the directory containing the file to allow uploads from any
                         "description": "Optional tab ID"
                     }
                 },
-                "required": ["selector"]
+                "required": []
             }),
         });
 
@@ -9034,6 +9090,49 @@ mod tests {
         assert!(tool_names.contains(&"computer_mouse_up"));
         assert!(tool_names.contains(&"computer_hold_key"));
         assert!(tool_names.contains(&"computer_wait"));
+    }
+
+    #[test]
+    fn selector_tools_accept_an_element_id() {
+        assert_eq!(
+            Agent::<MockHostFunctions>::selector_or_ref(&serde_json::json!({"element_id": "e7"})),
+            Some("ref:e7".to_string())
+        );
+        assert_eq!(
+            Agent::<MockHostFunctions>::selector_or_ref(
+                &serde_json::json!({"selector": "#q", "element_id": "e7"})
+            ),
+            Some("#q".to_string())
+        );
+        assert_eq!(
+            Agent::<MockHostFunctions>::selector_or_ref(&serde_json::json!({})),
+            None
+        );
+        let agent = Agent::new(MockHostFunctions::new());
+        for name in [
+            "browser_input",
+            "browser_probe",
+            "browser_upload_file",
+            "browser_wait_for",
+        ] {
+            let tool = agent
+                .get_browser_tools()
+                .into_iter()
+                .find(|t| t.name == name)
+                .unwrap();
+            assert!(
+                tool.input_schema["properties"]["element_id"].is_object(),
+                "{name}"
+            );
+            let required = tool.input_schema["required"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            assert!(
+                !required.contains(&serde_json::json!("selector")),
+                "{name} must not require selector"
+            );
+        }
     }
 
     #[test]

@@ -4613,7 +4613,7 @@ impl HostFunctions for DaemonHostFunctions {
         // (execute_browser_input_orchestrated in mcp_tool_executor) so the
         // full probe → decide → execute → verify pipeline runs in-daemon
         // instead of forwarding a single request to the browser extension.
-        if tool_name == "browser_input" || tool_name == "browser_probe" {
+        if let Some(route) = dynamic_browser_route(tool_name) {
             let services = self.services.as_ref().ok_or_else(|| HostError {
                 code: 1,
                 message: "Services not available".into(),
@@ -4626,21 +4626,32 @@ impl HostFunctions for DaemonHostFunctions {
             // The orchestration helper is async, so block_in_place + block_on
             // is required — same pattern as the MCP fallthrough below.
             let runtime = self.runtime.clone();
-            let action = if tool_name == "browser_input" {
-                nevoflux_protocol::BrowserToolAction::Input
-            } else {
-                nevoflux_protocol::BrowserToolAction::Probe
-            };
             let args = arguments.clone();
 
             let result = tokio::task::block_in_place(|| {
                 runtime.block_on(async move {
-                    crate::wasm::mcp_tool_executor::execute_browser_input_orchestrated(
-                        action,
-                        &args,
-                        &browser_ctx,
-                    )
-                    .await
+                    match route {
+                        DynamicBrowserRoute::Upload => {
+                            crate::wasm::mcp_tool_executor::execute_browser_upload_orchestrated(
+                                &args,
+                                &browser_ctx,
+                            )
+                            .await
+                        }
+                        DynamicBrowserRoute::Input | DynamicBrowserRoute::Probe => {
+                            let action = if route == DynamicBrowserRoute::Input {
+                                nevoflux_protocol::BrowserToolAction::Input
+                            } else {
+                                nevoflux_protocol::BrowserToolAction::Probe
+                            };
+                            crate::wasm::mcp_tool_executor::execute_browser_input_orchestrated(
+                                action,
+                                &args,
+                                &browser_ctx,
+                            )
+                            .await
+                        }
+                    }
                 })
             });
 
@@ -8839,8 +8850,47 @@ async fn write_audio_to_composition(
     Ok(())
 }
 
+/// Selector-based browser tools the daemon orchestrates itself instead of
+/// forwarding to an MCP server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DynamicBrowserRoute {
+    Input,
+    Probe,
+    Upload,
+}
+
+fn dynamic_browser_route(name: &str) -> Option<DynamicBrowserRoute> {
+    match name {
+        "browser_input" => Some(DynamicBrowserRoute::Input),
+        "browser_probe" => Some(DynamicBrowserRoute::Probe),
+        "browser_upload_file" => Some(DynamicBrowserRoute::Upload),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// browser_upload_file reached tool_call_dynamic from the native loop and
+    /// fell through to the MCP manager ("No server provides tool"): it is
+    /// orchestrated in-daemon like browser_input / browser_probe.
+    #[test]
+    fn upload_is_routed_like_input_and_probe() {
+        use super::{dynamic_browser_route, DynamicBrowserRoute};
+        assert_eq!(
+            dynamic_browser_route("browser_input"),
+            Some(DynamicBrowserRoute::Input)
+        );
+        assert_eq!(
+            dynamic_browser_route("browser_probe"),
+            Some(DynamicBrowserRoute::Probe)
+        );
+        assert_eq!(
+            dynamic_browser_route("browser_upload_file"),
+            Some(DynamicBrowserRoute::Upload)
+        );
+        assert_eq!(dynamic_browser_route("browser_click"), None);
+    }
+
     // ------------------------------------------------------------------
     // Taking a pack out of a session. A pack whose rules are in force is
     // restraining the model making the call, so the model does not get to
