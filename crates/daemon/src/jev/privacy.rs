@@ -52,6 +52,9 @@ pub const BUILTIN_SENSITIVE_DOMAINS: &[&str] = &[
     "usa.gov",
 ];
 
+/// Suffixes that only resolve inside a private network.
+const INTRANET_SUFFIXES: &[&str] = &["local", "internal", "lan", "corp", "home.arpa", "intranet"];
+
 /// What Jev may see of a page at `url`. Unparseable URLs are treated as
 /// sensitive: when unsure, send nothing private.
 pub fn scope_for(url: &str, extra_domains: &[String]) -> Scope {
@@ -61,18 +64,32 @@ pub fn scope_for(url: &str, extra_domains: &[String]) -> Scope {
     let Some(host) = parsed.host_str() else {
         return Scope::MetadataOnly;
     };
+    // `www.paypal.com.` is the same host as `www.paypal.com`.
     let host = host
         .trim_start_matches('[')
         .trim_end_matches(']')
+        .trim_end_matches('.')
         .to_ascii_lowercase();
-    if host == "localhost" || host.ends_with(".localhost") || is_private_ip(&host) {
+    if host.parse::<IpAddr>().is_ok() {
+        return if is_private_ip(&host) {
+            Scope::MetadataOnly
+        } else {
+            Scope::Full
+        };
+    }
+    // `localhost`, single-label intranet names (`http://jira/`) and
+    // private-network suffixes.
+    if !host.contains('.') || has_suffix(&host, "localhost") {
+        return Scope::MetadataOnly;
+    }
+    if INTRANET_SUFFIXES.iter().any(|d| has_suffix(&host, d)) {
         return Scope::MetadataOnly;
     }
     let listed = BUILTIN_SENSITIVE_DOMAINS
         .iter()
         .map(|d| d.to_string())
-        .chain(extra_domains.iter().map(|d| d.trim().to_ascii_lowercase()))
-        .any(|d| !d.is_empty() && (host == d || host.ends_with(&format!(".{d}"))));
+        .chain(extra_domains.iter().map(|d| normalise_domain(d)))
+        .any(|d| !d.is_empty() && has_suffix(&host, &d));
     if listed {
         Scope::MetadataOnly
     } else {
@@ -80,11 +97,46 @@ pub fn scope_for(url: &str, extra_domains: &[String]) -> Scope {
     }
 }
 
+/// `host` is `domain` or one of its subdomains.
+fn has_suffix(host: &str, domain: &str) -> bool {
+    host == domain || host.ends_with(&format!(".{domain}"))
+}
+
+/// A user-typed domain entry as a bare host: `*.acme.com`, `.acme.com`,
+/// `acme.com.`, `https://acme.com/` and ` ACME.com ` all mean `acme.com`.
+fn normalise_domain(entry: &str) -> String {
+    let mut d = entry.trim().to_ascii_lowercase();
+    if let Some(i) = d.find("://") {
+        d = d[i + 3..].to_string();
+    }
+    if let Some(i) = d.find('/') {
+        d.truncate(i);
+    }
+    d.trim_start_matches("*.")
+        .trim_start_matches('.')
+        .trim_end_matches('.')
+        .to_string()
+}
+
+fn is_private_v4(v4: std::net::Ipv4Addr) -> bool {
+    let [a, b, ..] = v4.octets();
+    v4.is_private()
+        || v4.is_loopback()
+        || v4.is_link_local()
+        || v4.is_unspecified()
+        // CGNAT 100.64.0.0/10 (Tailscale and carrier-grade NAT).
+        || (a == 100 && (64..128).contains(&b))
+}
+
 fn is_private_ip(host: &str) -> bool {
     match host.parse::<IpAddr>() {
-        Ok(IpAddr::V4(v4)) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
+        Ok(IpAddr::V4(v4)) => is_private_v4(v4),
         Ok(IpAddr::V6(v6)) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_private_v4(v4);
+            }
             v6.is_loopback()
+                || v6.is_unspecified()
                 || (v6.segments()[0] & 0xfe00) == 0xfc00
                 || (v6.segments()[0] & 0xffc0) == 0xfe80
         }
@@ -115,6 +167,46 @@ mod tests {
         ] {
             assert_eq!(scope_for(url, &[]), Scope::MetadataOnly, "{url}");
         }
+    }
+
+    #[test]
+    fn host_spellings_that_reach_the_same_place_are_still_sensitive() {
+        for url in [
+            "https://www.paypal.com./",
+            "http://[::ffff:192.168.1.1]/",
+            "http://0.0.0.0:8080/",
+            "http://[::]/",
+            "http://100.101.102.103/",
+            "http://jira/browse/X-1",
+            "http://printer.local/",
+            "https://git.corp.internal/",
+            "http://nas.lan/",
+            "http://wiki.corp/",
+            "http://router.home.arpa/",
+        ] {
+            assert_eq!(scope_for(url, &[]), Scope::MetadataOnly, "{url}");
+        }
+    }
+
+    #[test]
+    fn user_domains_are_normalised() {
+        for entry in [
+            "*.acme.com",
+            ".acme.com",
+            "acme.com.",
+            "https://acme.com/",
+            " ACME.com ",
+        ] {
+            assert_eq!(
+                scope_for("https://wiki.acme.com/x", &[entry.to_string()]),
+                Scope::MetadataOnly,
+                "{entry}"
+            );
+        }
+        assert_eq!(
+            scope_for("https://notacme.com/", &["acme.com".into()]),
+            Scope::Full
+        );
     }
 
     #[test]
