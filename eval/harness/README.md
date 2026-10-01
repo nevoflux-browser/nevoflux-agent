@@ -238,6 +238,24 @@ get no ids yet (they need frame-offset clicking). The run was resumed twice
 across Kimi's 5-hour quota window; the harness now counts the raw path's
 "Internal error: Anthropic-raw …" as a provider error.
 
+## J20-C (iframe ids, ids for the selector-only tools), 2026-10-01
+
+Browser `feat/j20c-frames`: same-origin iframe controls are listed (rects
+in top coordinates, occlusion tested in their own frame) and acted on in
+their own document/window; `actOnRef` also runs probe/paste/rich fill/text/
+wait/upload; background routes the reserved `ref:eN` selector to it; fill
+accepts `text` (fixes `browser_input` on plain inputs). Agent
+`feat/j20c-ids`: `element_id` on `browser_input`/`browser_probe`/
+`browser_upload_file`/`browser_wait_for`; upload routed in the native loop
+(it fell through to MCP before); the element cache shows only CSS
+selectors. Plus the J20-B minors.
+
+**J20, k=1** (`eval/results/j20c`): **21/21**, 0 missing, 53 s per trial
+(run-to-run variance; J20-B final 43 s), cache hit 96.7%,
+`browser_eval_js` 36 (J20-B final 48, J20-A 120). `j20-iframe` is now
+solved by id (2 × `browser_navigate`, 2 × `browser_click_by_id`; J20-B:
+10 × `browser_eval_js` + 4 screenshots).
+
 ## Known gaps
 
 - Agent-loop tasks have no deadline on the daemon side: `wall_clock_secs`
