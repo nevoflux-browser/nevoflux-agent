@@ -9,7 +9,7 @@ use nevoflux_protocol::session_event::SessionEventPayload;
 
 use super::client;
 use super::oracle::{DecisionOracle, JevOracle, OracleContext, Verdict};
-use super::privacy::Scope;
+use super::privacy::{scope_for, Scope};
 use super::visibility::{
     combine, page_kind, parts, pseudo_lines, questions, render as render_level, Level, Meta,
     PageKind, SMALL,
@@ -23,8 +23,9 @@ const RECALL_BYTES: usize = 32_000;
 /// The daemon side of one render.
 pub struct RenderEnv<'a> {
     pub jev: &'a crate::config::JevConfig,
-    /// The page navigated to this turn, if any (`current_browser_url`).
-    pub current_url: Option<String>,
+    /// For a browser result: the URLs of the tabs it may come from, as the
+    /// browser reported them just now (`None` when that is not known).
+    pub page_urls: Option<Vec<String>>,
     pub events: Option<Arc<SessionEventWriter>>,
     pub stats: Option<Arc<TurnStats>>,
     /// Writes the full text under the chunk id; false when it could not, and
@@ -38,18 +39,28 @@ pub async fn render(env: &RenderEnv<'_>, req: &RenderRequest<'_>) -> Option<Stri
     if content.len() <= SMALL {
         return None;
     }
-    if !(env.store)(req.tool_call_id, content) {
+    // The chunk id is ours, not the provider's: Gemini reuses the function
+    // name as its call id, so two results could share one file.
+    let chunk = mint_chunk_id();
+    if !(env.store)(&chunk, content) {
         return None;
     }
     let started = Instant::now();
     let lines = pseudo_lines(content);
     let timeout = Duration::from_millis(env.jev.timeout_ms);
-    let ctx = match page_kind(
-        &req.call.name,
-        &req.call.arguments,
-        env.current_url.as_deref(),
-        req.turn_tab_url,
-    ) {
+    let ctx = match page_kind(&req.call.name, &req.call.arguments) {
+        // Only when every tab it may come from is known and ordinary.
+        PageKind::Browser => match &env.page_urls {
+            Some(urls)
+                if !urls.is_empty()
+                    && urls
+                        .iter()
+                        .all(|u| scope_for(u, &env.jev.sensitive_domains) == Scope::Full) =>
+            {
+                OracleContext::page("visibility", urls[0].clone(), timeout)
+            }
+            _ => OracleContext::unknown_page("visibility", timeout),
+        },
         PageKind::Url(u) => OracleContext::page("visibility", u, timeout),
         PageKind::Unknown => OracleContext::unknown_page("visibility", timeout),
         PageKind::None => OracleContext::no_page("visibility", timeout),
@@ -59,6 +70,7 @@ pub async fn render(env: &RenderEnv<'_>, req: &RenderRequest<'_>) -> Option<Stri
         return Some(finish(
             env,
             req,
+            &chunk,
             Level::Short,
             &lines,
             &[],
@@ -70,6 +82,7 @@ pub async fn render(env: &RenderEnv<'_>, req: &RenderRequest<'_>) -> Option<Stri
         return Some(finish(
             env,
             req,
+            &chunk,
             Level::Short,
             &lines,
             &[],
@@ -83,7 +96,7 @@ pub async fn render(env: &RenderEnv<'_>, req: &RenderRequest<'_>) -> Option<Stri
         env.events.clone(),
         env.stats.clone(),
     );
-    let (ps, _ungraded) = parts(&lines);
+    let (ps, _ungraded) = parts(&lines, req.query);
     let asks = ps.iter().map(|p| {
         let (state, qs) = questions(req.query, p);
         let oracle = &oracle;
@@ -99,6 +112,7 @@ pub async fn render(env: &RenderEnv<'_>, req: &RenderRequest<'_>) -> Option<Stri
                 return Some(finish(
                     env,
                     req,
+                    &chunk,
                     Level::Short,
                     &lines,
                     &[],
@@ -110,12 +124,13 @@ pub async fn render(env: &RenderEnv<'_>, req: &RenderRequest<'_>) -> Option<Stri
     }
     let grade = combine(&ps, &answers);
     if grade.level == Level::Full && content.len() <= req.max_bytes {
-        log(env, req, Level::Full, 0, "jev", started);
+        log(env, req, &chunk, Level::Full, 0, "jev", started);
         return None;
     }
     Some(finish(
         env,
         req,
+        &chunk,
         grade.level,
         &lines,
         &grade.kept,
@@ -127,6 +142,7 @@ pub async fn render(env: &RenderEnv<'_>, req: &RenderRequest<'_>) -> Option<Stri
 fn finish(
     env: &RenderEnv<'_>,
     req: &RenderRequest<'_>,
+    chunk: &str,
     level: Level,
     lines: &[String],
     kept: &[std::ops::Range<usize>],
@@ -134,7 +150,7 @@ fn finish(
     started: Instant,
 ) -> String {
     let meta = Meta {
-        id: req.tool_call_id,
+        id: chunk,
         tool: &req.call.name,
         bytes: req.content.len(),
         graded_by,
@@ -144,13 +160,22 @@ fn finish(
     } else {
         0
     };
-    log(env, req, level, kept_lines as u64, graded_by, started);
+    log(
+        env,
+        req,
+        chunk,
+        level,
+        kept_lines as u64,
+        graded_by,
+        started,
+    );
     render_level(level, req.content, lines, kept, &meta, req.max_bytes)
 }
 
 fn log(
     env: &RenderEnv<'_>,
     req: &RenderRequest<'_>,
+    chunk: &str,
     level: Level,
     kept_lines: u64,
     graded_by: &str,
@@ -158,7 +183,7 @@ fn log(
 ) {
     if let Some(w) = &env.events {
         w.append(SessionEventPayload::JevVisibility {
-            id: req.tool_call_id.to_string(),
+            id: chunk.to_string(),
             tool: req.call.name.clone(),
             bytes: req.content.len() as u64,
             level: level.as_str().to_string(),
@@ -167,6 +192,18 @@ fn log(
             elapsed_ms: started.elapsed().as_millis() as u64,
         });
     }
+}
+
+/// A chunk id unique in this process and, through the time part, across
+/// restarts: `c` + millis (hex) + a per-process counter.
+fn mint_chunk_id() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    format!("c{ms:x}{n:x}")
 }
 
 /// Up to [`RECALL_BYTES`] of `full` from byte `offset`, with a note naming
@@ -260,7 +297,7 @@ mod tests {
         };
         let env = RenderEnv {
             jev: j,
-            current_url: None,
+            page_urls: tab.map(|u| vec![u.to_string()]),
             events,
             stats: None,
             store: &store,
@@ -331,12 +368,10 @@ mod tests {
         let out = r.out.expect("rendered");
         assert!(out.contains("line 25") && out.contains("line 49"), "{out}");
         assert!(!out.contains("line 50 "), "{out}");
-        assert!(out.contains("recall(\"call_1\")"));
         assert_eq!(bodies.lock().unwrap().len(), 1);
-        assert_eq!(
-            r.stored.get("call_1").map(String::as_str),
-            Some(content.as_str())
-        );
+        let (chunk, stored) = r.stored.iter().next().expect("stored");
+        assert!(out.contains(&format!("recall(\"{chunk}\")")), "{out}");
+        assert_eq!(stored, &content);
     }
 
     #[tokio::test]
@@ -455,6 +490,90 @@ mod tests {
         .await;
         assert!(r.out.is_none());
         assert!(bodies.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_dynamic_mcp_result_is_never_sent() {
+        let (url, bodies) = answering(answer("full", &[]), Duration::ZERO).await;
+        let args = serde_json::json!({"tool_name": "search_mail", "arguments": {}});
+        let r = run(
+            &jev(&url, 2000),
+            "tool_call_dynamic",
+            args,
+            None,
+            &hundred_lines(),
+            true,
+            None,
+        )
+        .await;
+        assert!(r.out.expect("rendered").contains("graded by sensitive"));
+        assert!(bodies.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_browser_result_without_known_tabs_is_never_sent() {
+        let (url, bodies) = answering(answer("full", &[]), Duration::ZERO).await;
+        let r = run(
+            &jev(&url, 2000),
+            "browser_get_markdown",
+            serde_json::json!({}),
+            None,
+            &hundred_lines(),
+            true,
+            None,
+        )
+        .await;
+        assert!(r.out.expect("rendered").contains("graded by sensitive"));
+        assert!(bodies.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_browser_result_is_sent_when_its_tab_is_ordinary() {
+        let (url, bodies) = answering(answer("hide", &[]), Duration::ZERO).await;
+        let r = run(
+            &jev(&url, 2000),
+            "browser_get_markdown",
+            serde_json::json!({}),
+            Some("https://en.wikipedia.org/wiki/Rust"),
+            &hundred_lines(),
+            true,
+            None,
+        )
+        .await;
+        assert!(r.out.expect("rendered").contains("hide"));
+        assert_eq!(bodies.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn two_results_with_the_same_call_id_get_distinct_chunks() {
+        // Review I1: Gemini reuses the function name as the call id.
+        let (url, _) = answering(answer("hide", &[]), Duration::ZERO).await;
+        let a = run(
+            &jev(&url, 2000),
+            "read",
+            serde_json::json!({}),
+            None,
+            &hundred_lines(),
+            true,
+            None,
+        )
+        .await;
+        let other: String = hundred_lines().replace("line", "LINE");
+        let b = run(
+            &jev(&url, 2000),
+            "read",
+            serde_json::json!({}),
+            None,
+            &other,
+            true,
+            None,
+        )
+        .await;
+        let ka: Vec<_> = a.stored.keys().cloned().collect();
+        let kb: Vec<_> = b.stored.keys().cloned().collect();
+        assert_eq!((ka.len(), kb.len()), (1, 1));
+        assert_ne!(ka[0], kb[0]);
+        assert!(a.out.unwrap().contains(&format!("recall(\"{}\")", ka[0])));
     }
 
     #[test]

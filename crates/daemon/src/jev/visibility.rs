@@ -16,9 +16,17 @@ pub const BLOCK_LINES: usize = 25;
 pub const KEEP_THRESHOLD: f64 = 0.3;
 /// A long grade keeping fewer lines than this is shown short (Q26).
 pub const MIN_KEPT_LINES: usize = 3;
-/// Content per request part. The content is sent twice (state and block
-/// questions), so two of these stay under the 64k-token request cap.
-pub const PART_TOKENS: u64 = 26_000;
+/// Estimated tokens per request: 70% of the 64k cap, because the estimate
+/// (chars/4) under-counts JSON, code and numbers. Content is counted twice
+/// (state and block questions) plus a fixed cost per block.
+pub const REQUEST_TOKENS: u64 = 44_800;
+/// The query as repeated inside every block question is cut to this many
+/// chars; the state carries it whole once.
+const QUERY_NOUL_CHARS: usize = 600;
+/// Instructions, criteria and JSON keys of one block question, in tokens.
+const NOUL_OVERHEAD: u64 = 60;
+/// The visibility question and the state wrapper, in tokens.
+const REQUEST_OVERHEAD: u64 = 300;
 /// Parts asked in parallel; content beyond them is not graded.
 pub const MAX_PARTS: usize = 4;
 /// Longer lines are split, so one minified line cannot fill a block.
@@ -85,19 +93,27 @@ pub fn pseudo_lines(content: &str) -> Vec<String> {
     out
 }
 
-/// Split into at most [`MAX_PARTS`] parts of at most [`PART_TOKENS`] each;
-/// also returns how many trailing lines were left ungraded.
-pub fn parts(lines: &[String]) -> (Vec<Part>, usize) {
+/// Split into at most [`MAX_PARTS`] parts, each of which assembles into a
+/// request under [`REQUEST_TOKENS`] (content twice, the query once in the
+/// state and once per block question, plus fixed overheads); also returns how
+/// many trailing lines were left ungraded.
+pub fn parts(lines: &[String], query: &str) -> (Vec<Part>, usize) {
+    let query_noul: String = query.chars().take(QUERY_NOUL_CHARS).collect();
+    let per_block = estimate_tokens(&query_noul) + NOUL_OVERHEAD;
+    let base = estimate_tokens(query) + REQUEST_OVERHEAD;
     let mut out: Vec<Part> = Vec::new();
     let mut current = Part {
         first_line: 0,
         lines: Vec::new(),
     };
-    let mut tokens = 0u64;
+    let (mut content, mut blocks) = (0u64, 0u64);
     for (i, line) in lines.iter().enumerate() {
         // One line is at most LINE_MAX_CHARS chars, far under the budget.
         let cost = estimate_tokens(line) + 1;
-        if !current.lines.is_empty() && tokens + cost > PART_TOKENS {
+        let opens_block = current.lines.is_empty() || i % BLOCK_LINES == 0;
+        let next_blocks = blocks + u64::from(opens_block);
+        let total = base + 2 * (content + cost) + next_blocks * per_block;
+        if !current.lines.is_empty() && total > REQUEST_TOKENS {
             out.push(std::mem::replace(
                 &mut current,
                 Part {
@@ -105,13 +121,17 @@ pub fn parts(lines: &[String]) -> (Vec<Part>, usize) {
                     lines: Vec::new(),
                 },
             ));
-            tokens = 0;
+            content = 0;
+            blocks = 0;
             if out.len() == MAX_PARTS {
                 return (out, lines.len() - i);
             }
+            blocks += 1; // this line opens a block in the new part
+        } else {
+            blocks = next_blocks;
         }
         current.lines.push(line.clone());
-        tokens += cost;
+        content += cost;
     }
     if !current.lines.is_empty() {
         out.push(current);
@@ -171,6 +191,7 @@ pub fn questions(query: &str, part: &Part) -> (serde_json::Value, BTreeMap<Strin
         "query": query,
         "tool_result": part.lines.join("\n"),
     });
+    let query_noul: String = query.chars().take(QUERY_NOUL_CHARS).collect();
     let mut qs = BTreeMap::new();
     qs.insert("visibility".to_string(), visibility_question());
     for (key, range) in part_blocks(part) {
@@ -186,8 +207,8 @@ pub fn questions(query: &str, part: &Part) -> (serde_json::Value, BTreeMap<Strin
             key,
             Question::Noul {
                 instructions: format!(
-                    "Query: \"{query}\"\nDo these lines contain information that helps answer \
-                     the query?\n---\n{}",
+                    "Query: \"{query_noul}\"\nDo these lines contain information that helps \
+                     answer the query?\n---\n{}",
                     block.join("\n")
                 ),
                 when_true: "These lines help answer the query.".into(),
@@ -369,35 +390,85 @@ pub fn render(
 /// Which page a tool result shows, for the privacy scope (spec §5.8).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PageKind {
+    /// A browser tab: the host looks up the tab's actual URL.
+    Browser,
+    /// Content fetched from this URL.
     Url(String),
     /// Page or third-party content from an unknown source: metadata only.
     Unknown,
-    /// Not page content (local files, shell, the agent's own tools).
+    /// Not page content (local files, shell, the agent's own reasoning).
     None,
 }
 
-/// `current_url` is the page navigated to this turn; `turn_tab_url` the tab
-/// active when the turn started.
-pub fn page_kind(
-    tool: &str,
-    args: &serde_json::Value,
-    current_url: Option<&str>,
-    turn_tab_url: Option<&str>,
-) -> PageKind {
-    let known = |u: Option<&str>| u.filter(|u| !u.trim().is_empty()).map(str::to_string);
-    if tool.starts_with("browser_") {
-        return known(current_url)
-            .or_else(|| known(turn_tab_url))
-            .map_or(PageKind::Unknown, PageKind::Url);
-    }
-    if tool == "web_fetch" {
-        return known(args.get("url").and_then(|u| u.as_str()))
-            .map_or(PageKind::Unknown, PageKind::Url);
-    }
-    if tool.contains("__") || tool.starts_with("mcp_") || tool.starts_with("mcp:") {
+/// Tools whose results are local, never page or third-party content. Every
+/// other tool is `Unknown` until proven otherwise (MCP results, subagents,
+/// flows, memory and knowledge tools all stay out of Jev).
+const NO_PAGE_TOOLS: &[&str] = &[
+    "think",
+    "plan",
+    "web_search",
+    "read",
+    "write",
+    "edit",
+    "bash",
+    "glob",
+    "grep",
+    "tool_search",
+    "skill_load",
+];
+
+/// The page kind of a call. `tool_call_dynamic` is judged by the tool it
+/// wraps: that is how MCP results reach a cloud turn.
+pub fn page_kind(tool: &str, args: &serde_json::Value) -> PageKind {
+    if tool == "tool_call_dynamic" {
+        let inner = args.get("tool_name").and_then(|t| t.as_str()).unwrap_or("");
+        if inner.starts_with("browser_") || inner == "web_fetch" {
+            let inner_args = args.get("arguments").unwrap_or(&serde_json::Value::Null);
+            return page_kind(inner, inner_args);
+        }
         return PageKind::Unknown;
     }
-    PageKind::None
+    if tool.starts_with("browser_") {
+        return PageKind::Browser;
+    }
+    if tool == "web_fetch" {
+        return args
+            .get("url")
+            .and_then(|u| u.as_str())
+            .filter(|u| !u.trim().is_empty())
+            .map_or(PageKind::Unknown, |u| PageKind::Url(u.to_string()));
+    }
+    if NO_PAGE_TOOLS.contains(&tool) {
+        return PageKind::None;
+    }
+    PageKind::Unknown
+}
+
+/// URLs of the tabs a browser result may come from, from a `list_tabs`
+/// result: the tab named by `tab_id`, else every active tab. `None` when that
+/// cannot be told (no list, tab not found, a candidate without a URL).
+pub fn candidate_urls(tabs: &serde_json::Value, args: &serde_json::Value) -> Option<Vec<String>> {
+    let list = tabs.get("tabs").and_then(|t| t.as_array())?;
+    let url_of = |t: &serde_json::Value| {
+        t.get("url")
+            .and_then(|u| u.as_str())
+            .filter(|u| !u.trim().is_empty())
+            .map(str::to_string)
+    };
+    if let Some(id) = args.get("tab_id").and_then(|i| i.as_i64()) {
+        let tab = list
+            .iter()
+            .find(|t| t.get("id").and_then(|i| i.as_i64()) == Some(id))?;
+        return url_of(tab).map(|u| vec![u]);
+    }
+    let active: Vec<&serde_json::Value> = list
+        .iter()
+        .filter(|t| t.get("active").and_then(|a| a.as_bool()) == Some(true))
+        .collect();
+    if active.is_empty() {
+        return None;
+    }
+    active.into_iter().map(url_of).collect()
 }
 
 #[cfg(test)]
@@ -438,11 +509,14 @@ mod tests {
     #[test]
     fn cjk_parts_respect_the_token_budget() {
         let lines: Vec<String> = (0..2000).map(|_| "中文内容测试".repeat(10)).collect();
-        let (ps, rest) = parts(&lines);
+        let (ps, rest) = parts(&lines, "q");
         assert!(ps.len() <= MAX_PARTS);
         for p in &ps {
+            let (state, qs) = questions("q", p);
+            let body = serde_json::to_string(&serde_json::json!({"state": state, "questions": qs}))
+                .unwrap();
             assert!(
-                crate::turn_stats::estimate_tokens(&p.lines.join("\n")) <= PART_TOKENS,
+                crate::turn_stats::estimate_tokens(&body) <= REQUEST_TOKENS,
                 "part over budget"
             );
         }
@@ -452,7 +526,7 @@ mod tests {
     #[test]
     fn small_inputs_are_one_part_with_nothing_left_over() {
         let lines = numbered(60);
-        let (ps, rest) = parts(&lines);
+        let (ps, rest) = parts(&lines, "q");
         assert_eq!((ps.len(), rest), (1, 0));
         assert_eq!(ps[0].first_line, 0);
     }
@@ -460,7 +534,7 @@ mod tests {
     #[test]
     fn questions_carry_the_visibility_choice_and_one_noul_per_block() {
         let lines = numbered(60);
-        let (ps, _) = parts(&lines);
+        let (ps, _) = parts(&lines, "q");
         let (state, qs) = questions("find line 30", &ps[0]);
         assert_eq!(state["query"], "find line 30");
         assert!(state["tool_result"].as_str().unwrap().contains("line 59"));
@@ -473,7 +547,7 @@ mod tests {
     #[test]
     fn combine_takes_the_highest_level_and_the_blocks_over_threshold() {
         let lines = numbered(60);
-        let (ps, _) = parts(&lines);
+        let (ps, _) = parts(&lines, "q");
         let g = combine(
             &ps,
             &[resp(
@@ -488,7 +562,7 @@ mod tests {
     #[test]
     fn long_with_fewer_than_three_kept_lines_is_short() {
         let lines = numbered(52); // last block has 2 lines
-        let (ps, _) = parts(&lines);
+        let (ps, _) = parts(&lines, "q");
         let g = combine(
             &ps,
             &[resp("long", &[("b000", 0.0), ("b001", 0.0), ("b002", 0.9)])],
@@ -499,7 +573,7 @@ mod tests {
     #[test]
     fn a_malformed_choice_keeps_the_content() {
         let lines = numbered(30);
-        let (ps, _) = parts(&lines);
+        let (ps, _) = parts(&lines, "q");
         let mut r = resp("long", &[]);
         r.answers.insert(
             "visibility".into(),
@@ -568,45 +642,92 @@ mod tests {
     #[test]
     fn page_kind_by_tool() {
         let none = serde_json::json!({});
-        assert_eq!(
-            page_kind(
-                "browser_get_markdown",
-                &none,
-                Some("https://a.example/"),
-                None
-            ),
-            PageKind::Url("https://a.example/".into())
-        );
-        assert_eq!(
-            page_kind(
-                "browser_get_markdown",
-                &none,
-                None,
-                Some("https://b.example/")
-            ),
-            PageKind::Url("https://b.example/".into())
-        );
-        assert_eq!(
-            page_kind("browser_click_by_id", &none, None, None),
-            PageKind::Unknown
-        );
+        assert_eq!(page_kind("browser_get_markdown", &none), PageKind::Browser);
         assert_eq!(
             page_kind(
                 "web_fetch",
-                &serde_json::json!({"url": "https://c.example/"}),
-                None,
-                None
+                &serde_json::json!({"url": "https://c.example/"})
             ),
             PageKind::Url("https://c.example/".into())
         );
+        assert_eq!(page_kind("web_fetch", &none), PageKind::Unknown);
+        assert_eq!(page_kind("read", &none), PageKind::None);
+        assert_eq!(page_kind("bash", &none), PageKind::None);
+    }
+
+    #[test]
+    fn anything_not_known_to_be_local_is_unknown() {
+        // Review C1: MCP results arrive as tool_call_dynamic, never as `x__y`.
+        let none = serde_json::json!({});
+        for tool in [
+            "tool_call_dynamic",
+            "gmail__search",
+            "memory_search",
+            "run_flow",
+            "orchestrate",
+            "subagent_wait",
+        ] {
+            assert_eq!(page_kind(tool, &none), PageKind::Unknown, "{tool}");
+        }
+        let gmail = serde_json::json!({"tool_name": "search_mail", "arguments": {"q": "x"}});
+        assert_eq!(page_kind("tool_call_dynamic", &gmail), PageKind::Unknown);
+        let browser = serde_json::json!({"tool_name": "browser_get_markdown", "arguments": {}});
+        assert_eq!(page_kind("tool_call_dynamic", &browser), PageKind::Browser);
+        let fetch = serde_json::json!({"tool_name": "web_fetch", "arguments": {"url": "https://d.example/"}});
         assert_eq!(
-            page_kind("gmail__search", &none, None, None),
-            PageKind::Unknown
+            page_kind("tool_call_dynamic", &fetch),
+            PageKind::Url("https://d.example/".into())
+        );
+    }
+
+    #[test]
+    fn the_target_tab_is_the_named_one_or_every_active_one() {
+        let tabs = serde_json::json!({"tabs": [
+            {"id": 1, "url": "https://news.example/", "active": true},
+            {"id": 2, "url": "https://www.paypal.com/x", "active": false},
+            {"id": 3, "url": "https://other.example/", "active": true}
+        ]});
+        assert_eq!(
+            candidate_urls(&tabs, &serde_json::json!({"tab_id": 2})),
+            Some(vec!["https://www.paypal.com/x".to_string()])
         );
         assert_eq!(
-            page_kind("mcp_gmail_search", &none, None, None),
-            PageKind::Unknown
+            candidate_urls(&tabs, &serde_json::json!({})),
+            Some(vec![
+                "https://news.example/".to_string(),
+                "https://other.example/".to_string()
+            ])
         );
-        assert_eq!(page_kind("read", &none, None, None), PageKind::None);
+        assert_eq!(
+            candidate_urls(&tabs, &serde_json::json!({"tab_id": 9})),
+            None
+        );
+        assert_eq!(
+            candidate_urls(&serde_json::json!({"tabs": []}), &serde_json::json!({})),
+            None
+        );
+        assert_eq!(
+            candidate_urls(&serde_json::json!(null), &serde_json::json!({})),
+            None
+        );
+    }
+
+    #[test]
+    fn an_assembled_request_stays_under_the_cap_with_a_long_query_and_short_lines() {
+        // Review I2: per-block overhead and the repeated query count too.
+        let query = "please summarise ".repeat(150); // ~2.5k chars
+        let lines: Vec<String> = (0..40_000).map(|i| format!("{i:06}")).collect();
+        let (ps, _) = parts(&lines, &query);
+        assert!(!ps.is_empty());
+        for p in &ps {
+            let (state, qs) = questions(&query, p);
+            let body = serde_json::to_string(&serde_json::json!({"state": state, "questions": qs}))
+                .unwrap();
+            assert!(
+                crate::turn_stats::estimate_tokens(&body) <= REQUEST_TOKENS,
+                "request of {} estimated tokens",
+                crate::turn_stats::estimate_tokens(&body)
+            );
+        }
     }
 }

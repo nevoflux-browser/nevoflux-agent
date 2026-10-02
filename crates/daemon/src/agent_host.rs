@@ -1510,6 +1510,41 @@ impl DaemonHostFunctions {
         }
     }
 
+    /// The browser's tab list, asked directly (no tool-call log, no site
+    /// adaptation): for judging which page a result came from. `None` when
+    /// there is no browser or it does not answer within 5 s.
+    fn list_tabs_quietly(&self) -> Option<serde_json::Value> {
+        use crate::wasm::services::BrowserRequest;
+        let services = self.services.as_ref()?;
+        let sender = services.browser_sender.as_ref()?.clone();
+        let request = BrowserRequest {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            session_id: self.session_id.clone().unwrap_or_else(|| "default".into()),
+            tab_id: None,
+            action: nevoflux_protocol::BrowserToolAction::ListTabs,
+            params: serde_json::json!({}),
+            timeout_ms: 5_000,
+            client_identity: services.client_identity.clone(),
+            proxy_id: services.proxy_id.clone(),
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let runtime = self.runtime.clone();
+        let response = tokio::task::block_in_place(|| {
+            runtime.block_on(async {
+                sender.send((request, tx)).await.ok()?;
+                tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+                    .await
+                    .ok()?
+                    .ok()
+            })
+        })?;
+        if response.success {
+            response.result
+        } else {
+            None
+        }
+    }
+
     /// Where a tool result of this session is spilled: one file per tool id,
     /// both path segments sanitised, so an id can only name a file in this
     /// session's directory. `None` without services or a session.
@@ -2107,9 +2142,29 @@ impl HostFunctions for DaemonHostFunctions {
 
     fn render_tool_result(&self, req: &nevoflux_builtin_wasm::RenderRequest<'_>) -> Option<String> {
         let store = |id: &str, content: &str| self.spill_tool_result(id, content).is_some();
+        // A browser result is judged by the tab the browser says it is on now;
+        // the last navigate URL goes stale after a click or a redirect.
+        let page_urls = if req.content.len() > crate::jev::visibility::SMALL
+            && crate::jev::visibility::page_kind(&req.call.name, &req.call.arguments)
+                == crate::jev::visibility::PageKind::Browser
+        {
+            let args = if req.call.name == "tool_call_dynamic" {
+                req.call
+                    .arguments
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null)
+            } else {
+                req.call.arguments.clone()
+            };
+            self.list_tabs_quietly()
+                .and_then(|tabs| crate::jev::visibility::candidate_urls(&tabs, &args))
+        } else {
+            None
+        };
         let env = crate::jev::render::RenderEnv {
             jev: &self.config.jev,
-            current_url: self.current_browser_url.lock().ok().and_then(|u| u.clone()),
+            page_urls,
             events: self.event_writer().map(Arc::new),
             stats: self.turn_stats.clone(),
             store: &store,

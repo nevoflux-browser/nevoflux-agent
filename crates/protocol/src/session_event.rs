@@ -272,7 +272,8 @@ pub enum SessionEventPayload {
     /// A large tool result was graded for the model's context (spec §5.6).
     #[serde(rename = "jev/visibility")]
     JevVisibility {
-        /// Tool call id, which is also the chunk id `recall` takes.
+        /// Chunk id `recall` takes (minted by the daemon, not the provider's
+        /// tool call id).
         id: String,
         /// Tool name.
         tool: String,

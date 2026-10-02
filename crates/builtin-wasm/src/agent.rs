@@ -482,6 +482,8 @@ pub struct Agent<H: HostFunctions> {
     /// Set by `load_selector_tools`: the CSS-selector browser tools are a
     /// fallback the model loads on purpose (design §4.5 暴露面).
     selector_tools_loaded: Cell<bool>,
+    /// Jev visibility is on for the current run (`recall` is a builtin only then).
+    visibility_on: Cell<bool>,
     /// Current keywords extracted from user message and LLM context, used for auto-snapshots.
     current_keywords: RefCell<Vec<String>>,
     /// Skills that have been loaded in this session (prevent redundant re-loading).
@@ -660,6 +662,7 @@ impl<H: HostFunctions> Agent<H> {
             artifact_counter: Cell::new(0),
             computer_use_triggered: Cell::new(false),
             selector_tools_loaded: Cell::new(false),
+            visibility_on: Cell::new(false),
             current_keywords: RefCell::new(Vec::new()),
             loaded_skills: RefCell::new(std::collections::HashSet::new()),
             local_index: RefCell::new(None),
@@ -681,6 +684,7 @@ impl<H: HostFunctions> Agent<H> {
             artifact_counter: Cell::new(0),
             computer_use_triggered: Cell::new(false),
             selector_tools_loaded: Cell::new(false),
+            visibility_on: Cell::new(false),
             current_keywords: RefCell::new(Vec::new()),
             loaded_skills: RefCell::new(std::collections::HashSet::new()),
             local_index: RefCell::new(None),
@@ -1862,6 +1866,7 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
         };
         // Jev visibility (spec §5.6): cloud turns only (§3.2), asked once.
         let visibility = input.local.is_none() && self.host.visibility_active();
+        self.visibility_on.set(visibility);
 
         let mut iterations = 0;
         let mut final_text = String::new();
@@ -2113,7 +2118,11 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                 let source = rendered.as_deref().unwrap_or(&result.content);
 
                 let trimmed = truncate_tool_result_with(&messages, source, budget);
-                let content = if trimmed.len() < source.len() {
+                let content = if trimmed.len() < source.len() && rendered.is_some() {
+                    // A rendition already points at its stored original
+                    // (its first line); spilling it would overwrite that.
+                    trimmed
+                } else if trimmed.len() < source.len() {
                     match self.host.spill_tool_result(&result.tool_call_id, source) {
                         Some(path) => format!(
                             "{trimmed}\n\n[full output saved to {} ({} bytes) — use `read` with that path to continue]",
@@ -2537,7 +2546,7 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
         }
 
         let content = match normalized_name {
-            "recall" => {
+            "recall" if self.visibility_on.get() => {
                 let id = tool_call.arguments["chunk_id"].as_str().unwrap_or("");
                 let offset = tool_call.arguments["offset"].as_u64().unwrap_or(0);
                 self.host.tool_recall(id, offset)?
@@ -3637,10 +3646,14 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
 
     fn is_builtin_tool(&self, name: &str) -> bool {
         let name = Self::normalize_tool_name(name);
+        if name == "recall" {
+            // Jev's recall only while visibility is on; otherwise an MCP
+            // server's own `recall` stays reachable.
+            return self.visibility_on.get();
+        }
         matches!(
             name,
-            "recall"
-                | "think"
+            "think"
                 | "plan"
                 | "create_artifact"
                 | "switch_model"
@@ -8440,6 +8453,63 @@ mod tests {
             big.len(),
             "the oldest result was shrunk"
         );
+    }
+
+    #[test]
+    fn a_rendered_result_is_never_spilled_over_the_stored_original() {
+        // Review C3: under context pressure the rendition gets truncated; it
+        // must not be spilled, which would overwrite the stored full text.
+        let mock = MockHostFunctions::new();
+        mock.visibility.set(true);
+        *mock.render_with.borrow_mut() =
+            Some("[c · think · long] — recall(\"c\")\n".to_string() + &"r".repeat(30_000));
+        mock.add_llm_response(LlmResponse {
+            text: "".into(),
+            tool_calls: calls(12, "think"),
+            reasoning: None,
+        });
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        agent.run(&session_log_input("go")).unwrap();
+        assert!(
+            agent.host.spills.borrow().is_empty(),
+            "spilled: {:?}",
+            agent.host.spills.borrow()
+        );
+        let req = agent.host.captured_requests.borrow()[1].clone();
+        let last = req
+            .messages
+            .iter()
+            .filter(|m| matches!(m.role, MessageRole::Tool))
+            .last()
+            .unwrap();
+        assert!(
+            last.content.len() < 30_000,
+            "the last rendition was not trimmed"
+        );
+        assert!(
+            last.content.contains("recall("),
+            "{}",
+            &last.content[..200.min(last.content.len())]
+        );
+    }
+
+    #[test]
+    fn with_visibility_off_recall_is_not_a_builtin() {
+        // Review I4: an MCP server's own `recall` must still be reachable.
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(LlmResponse {
+            text: "".into(),
+            tool_calls: vec![a_tool_call(
+                "tool_call_dynamic",
+                serde_json::json!({"tool_name": "recall", "arguments": {"q": "x"}}),
+            )],
+            reasoning: None,
+        });
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        agent.run(&session_log_input("go")).unwrap();
+        assert!(agent.host.recalls.borrow().is_empty());
     }
 
     fn a_tool_call(name: &str, args: serde_json::Value) -> ToolCall {
