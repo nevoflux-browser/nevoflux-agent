@@ -45,7 +45,7 @@ async fn main() {
     let key = derive_channel_key(&code, &channel).expect("key derivation");
     let (tx, mut rx) = mpsc::unbounded_channel::<Wire>();
     let gateway = Arc::new(McpGateway::new(
-        Some(key),
+        key,
         Arc::new(ChannelSink(tx)),
         Arc::new(StubBrowserBackend),
         &channel,

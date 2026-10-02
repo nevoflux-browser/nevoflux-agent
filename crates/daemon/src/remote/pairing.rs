@@ -83,6 +83,8 @@ pub struct Pairing {
 }
 
 impl Pairing {
+    /// Whether this pairing is an AI agent's single MCP channel rather than a
+    /// device's control + data pair. Decides which gateway serves the channel.
     pub fn is_agent(&self) -> bool {
         self.kind == PairingKind::Agent
     }
@@ -141,6 +143,21 @@ impl PairingStore {
         crate::paths::resolve_from_daemon()
             .data_dir
             .join("pairings.json")
+    }
+
+    /// Where agent pairings live: beside [`Self::default_path`], in a file of
+    /// their own.
+    ///
+    /// Separate because an agent row carries every field a pre-agent daemon
+    /// requires of a device. Kept in `pairings.json`, a downgraded daemon on
+    /// the same data directory would load it as a phone and serve full device
+    /// control on the agent's channel with the agent's key. An older daemon
+    /// never reads this file, so a downgrade leaves agents unserved, not
+    /// promoted.
+    pub fn default_agent_path() -> PathBuf {
+        crate::paths::resolve_from_daemon()
+            .data_dir
+            .join("agent-pairings.json")
     }
 
     /// Every pairing, oldest first.

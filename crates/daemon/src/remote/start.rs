@@ -410,8 +410,11 @@ pub struct ControlDeps {
     pub tracker: Arc<super::runtime_state::RuntimeTracker>,
     /// Where the session list's rows come from.
     pub sessions: Arc<dyn super::control_gateway::SessionSource>,
-    /// The paired devices on disk.
+    /// The paired devices on disk (`pairings.json`).
     pub pairings: Arc<super::pairing::PairingStore>,
+    /// The paired agents on disk (`agent-pairings.json`). Never mixed into
+    /// `pairings`: see [`super::pairing::PairingStore::default_agent_path`].
+    pub agent_pairings: Arc<super::pairing::PairingStore>,
     /// For re-resolving what a session is allowed to do when a device switches
     /// to it. Asked per attach, never inherited — see `SessionAuthority`.
     pub database: Arc<nevoflux_storage::Database>,
@@ -465,6 +468,11 @@ pub async fn open_mcp_channel_with_token(
     account_token: Option<String>,
     registry: &Arc<Mutex<GatewayRegistry>>,
 ) -> Result<ChannelHandle, OpenError> {
+    // An agent channel has no plaintext mode (design §5.1): without a key
+    // there is nothing to open, and nothing is registered or dialled.
+    let key = pairing
+        .control_key()
+        .ok_or_else(|| OpenError::JwtMint("the agent pairing has no usable key".into()))?;
     let account_token = account_token.ok_or(OpenError::NotLoggedIn)?;
     let base = std::env::var("NEVOFLUX_ACCOUNT_URL")
         .unwrap_or_else(|_| "https://nevoflux.app".to_string());
@@ -475,7 +483,7 @@ pub async fn open_mcp_channel_with_token(
     let channel_id = pairing.control_channel_id.clone();
     let sink = Arc::new(super::ws::WsSink::new());
     let gateway = Arc::new(super::mcp_gateway::McpGateway::new(
-        pairing.control_key(),
+        key,
         sink.clone(),
         backend,
         &channel_id,
@@ -518,7 +526,7 @@ pub async fn pair_agent(
         .await
         .ok_or_else(|| OpenError::JwtMint("could not derive the channel key".into()))?;
     let handle = open_for_pairing(deps, &pairing).await?;
-    if let Err(e) = deps.pairings.add(pairing.clone()) {
+    if let Err(e) = store_pairing(deps, &pairing) {
         handle.close().await;
         return Err(OpenError::JwtMint(format!(
             "could not store the pairing: {e}"
@@ -527,11 +535,46 @@ pub async fn pair_agent(
     Ok((pairing, code))
 }
 
+/// Persist a pairing in the store its kind belongs in: agents never land in
+/// `pairings.json`, where a pre-agent daemon would read them as devices.
+fn store_pairing(
+    deps: &ControlDeps,
+    pairing: &super::pairing::Pairing,
+) -> Result<(), super::pairing::PairingError> {
+    let store = if pairing.is_agent() {
+        &deps.agent_pairings
+    } else {
+        &deps.pairings
+    };
+    store.add(pairing.clone())
+}
+
+/// Every pairing this daemon serves: devices first, then agents.
+///
+/// A store that cannot be read is logged and contributes nothing; it never
+/// costs the other store its entries, and neither file is rewritten here —
+/// see `PairingStore::load`.
+pub fn all_pairings(deps: &ControlDeps) -> Vec<super::pairing::Pairing> {
+    let mut all = Vec::new();
+    for (what, store) in [
+        ("devices", &deps.pairings),
+        ("agents", &deps.agent_pairings),
+    ] {
+        match store.load() {
+            Ok(p) => all.extend(p),
+            Err(e) => tracing::error!(target: "remote", "could not read the paired {what}: {e}"),
+        }
+    }
+    all
+}
+
 /// Bring up one pairing's control channel.
 pub async fn open_for_pairing(
     deps: &ControlDeps,
     pairing: &super::pairing::Pairing,
 ) -> Result<ChannelHandle, OpenError> {
+    // Routed by kind wherever the row came from: an agent row found in the
+    // device store is still served as an agent, never as a device.
     if pairing.is_agent() {
         // M1: the channel and handshake are real; tools arrive in M2.
         return open_mcp_channel(
@@ -647,14 +690,8 @@ async fn open_data_channel(
 /// A pairing that cannot be brought up is logged and skipped rather than
 /// failing the rest: one bad entry must not cost somebody every other device.
 pub async fn restore_pairings(deps: &ControlDeps) -> usize {
-    let pairings = match deps.pairings.load() {
-        Ok(p) => p,
-        Err(e) => {
-            // Never regenerated on a parse failure — see `PairingStore::load`.
-            tracing::error!(target: "remote", "could not read the paired devices: {e}");
-            return 0;
-        }
-    };
+    // Never regenerated on a parse failure — see `PairingStore::load`.
+    let pairings = all_pairings(deps);
     if pairings.is_empty() {
         return 0;
     }
@@ -688,7 +725,7 @@ pub async fn pair_device(
     // Brought up before it is stored: a pairing that cannot connect is worse
     // than a clear failure, because by then the code is already on screen.
     let handle = open_for_pairing(deps, &pairing).await?;
-    if let Err(e) = deps.pairings.add(pairing.clone()) {
+    if let Err(e) = store_pairing(deps, &pairing) {
         // Nothing was saved, so nothing may be left dialling either.
         handle.close().await;
         return Err(OpenError::JwtMint(format!(
@@ -698,16 +735,19 @@ pub async fn pair_device(
     Ok((pairing, code))
 }
 
-/// Forget a device and take its channel down.
+/// Forget a device or an agent and take its channel down.
+///
+/// The id is removed from both stores, so a row that ever ended up in the
+/// wrong one is forgotten all the same.
 pub async fn unpair_device(deps: &ControlDeps, control_channel_id: &str) -> bool {
     let closed = close_channel(control_channel_id).await;
-    let removed = deps
-        .pairings
-        .remove(control_channel_id)
-        .unwrap_or_else(|e| {
+    let mut removed = false;
+    for store in [&deps.pairings, &deps.agent_pairings] {
+        removed |= store.remove(control_channel_id).unwrap_or_else(|e| {
             tracing::error!(target: "remote", "could not remove a pairing: {e}");
             false
         });
+    }
     closed || removed
 }
 
@@ -866,6 +906,171 @@ mod tests {
             registry.lock().await.is_empty(),
             "nothing registered on refusal"
         );
+    }
+
+    fn deps(dir: &std::path::Path) -> ControlDeps {
+        let database = Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        let (msg_tx, _rx) = mpsc::channel(8);
+        ControlDeps {
+            tracker: Arc::new(crate::remote::runtime_state::RuntimeTracker::new()),
+            sessions: Arc::new(crate::remote::control_gateway::StorageSessions::new(
+                database.clone(),
+            )),
+            pairings: Arc::new(crate::remote::pairing::PairingStore::new(
+                dir.join("pairings.json"),
+            )),
+            agent_pairings: Arc::new(crate::remote::pairing::PairingStore::new(
+                dir.join("agent-pairings.json"),
+            )),
+            database,
+            vapid_public: None,
+            msg_tx,
+            injector_proxy_id: "remote-control".into(),
+            registry: Arc::new(Mutex::new(GatewayRegistry::new())),
+        }
+    }
+
+    fn device(id: &str) -> crate::remote::pairing::Pairing {
+        crate::remote::pairing::Pairing {
+            control_channel_id: id.into(),
+            data_channel_id: format!("{id}-data"),
+            control_key: "aa".repeat(32),
+            data_key: "bb".repeat(32),
+            created_at: 1,
+            label: None,
+            push: None,
+            kind: crate::remote::pairing::PairingKind::Device,
+        }
+    }
+
+    fn agent(id: &str) -> crate::remote::pairing::Pairing {
+        crate::remote::pairing::Pairing {
+            control_channel_id: id.into(),
+            data_channel_id: String::new(),
+            control_key: "cc".repeat(32),
+            data_key: String::new(),
+            created_at: 2,
+            label: None,
+            push: None,
+            kind: crate::remote::pairing::PairingKind::Agent,
+        }
+    }
+
+    #[test]
+    fn an_agent_pairing_is_stored_in_its_own_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps(dir.path());
+        store_pairing(&deps, &agent("a1")).unwrap();
+        assert_eq!(deps.agent_pairings.load().unwrap(), vec![agent("a1")]);
+        assert!(deps.pairings.load().unwrap().is_empty());
+        assert!(dir.path().join("agent-pairings.json").exists());
+        assert!(!dir.path().join("pairings.json").exists());
+    }
+
+    #[test]
+    fn the_device_file_never_carries_an_agent_row() {
+        // A pre-agent daemon on the same data dir reads pairings.json and would
+        // take any row in it for a phone.
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps(dir.path());
+        store_pairing(&deps, &agent("a1")).unwrap();
+        store_pairing(&deps, &device("d1")).unwrap();
+        let text = std::fs::read_to_string(dir.path().join("pairings.json")).unwrap();
+        assert!(text.contains("\"d1\""), "{text}");
+        assert!(!text.contains("a1"), "{text}");
+        assert!(!text.contains("agent"), "{text}");
+    }
+
+    #[test]
+    fn both_stores_are_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps(dir.path());
+        store_pairing(&deps, &device("d1")).unwrap();
+        store_pairing(&deps, &agent("a1")).unwrap();
+        assert_eq!(all_pairings(&deps), vec![device("d1"), agent("a1")]);
+    }
+
+    #[test]
+    fn a_corrupt_agent_store_does_not_hide_the_devices() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps(dir.path());
+        store_pairing(&deps, &device("d1")).unwrap();
+        std::fs::write(dir.path().join("agent-pairings.json"), "{ nope").unwrap();
+        assert_eq!(all_pairings(&deps), vec![device("d1")]);
+        // And the bad file is left to be looked at.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("agent-pairings.json")).unwrap(),
+            "{ nope"
+        );
+    }
+
+    #[tokio::test]
+    async fn unpairing_an_agent_removes_it_from_the_agent_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps(dir.path());
+        store_pairing(&deps, &device("d1")).unwrap();
+        store_pairing(&deps, &agent("a1")).unwrap();
+        assert!(unpair_device(&deps, "a1").await);
+        assert!(deps.agent_pairings.load().unwrap().is_empty());
+        assert_eq!(deps.pairings.load().unwrap(), vec![device("d1")]);
+        assert!(
+            !unpair_device(&deps, "a1").await,
+            "a second unpair is a no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn unpairing_finds_an_agent_row_in_the_device_store_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps(dir.path());
+        deps.pairings.add(agent("stray")).unwrap();
+        assert!(unpair_device(&deps, "stray").await);
+        assert!(deps.pairings.load().unwrap().is_empty());
+    }
+
+    /// Observed through the agent path's own refusal rather than a registered
+    /// `mcp:` id: a successful open needs the account service and the relay.
+    /// A keyless agent pairing is refused by the agent branch before any token
+    /// or network is touched; the device branch has no such check and would
+    /// fail on the token or the account service instead.
+    #[tokio::test]
+    async fn an_agent_pairing_takes_the_agent_branch_wherever_it_was_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps(dir.path());
+        let keyless = crate::remote::pairing::Pairing {
+            control_key: "not hex".into(),
+            ..agent("a1")
+        };
+        match err_of(open_for_pairing(&deps, &keyless).await) {
+            OpenError::JwtMint(m) => assert_eq!(m, "the agent pairing has no usable key"),
+            other => panic!("not the agent branch: {other}"),
+        }
+        assert!(deps.registry.lock().await.is_empty());
+        assert!(!open_channels().await.contains(&"a1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn an_agent_channel_without_a_key_is_refused_before_anything_is_registered() {
+        // A token is supplied, so the refusal can only be the missing key: the
+        // channel has no plaintext mode to fall back to.
+        let registry = Arc::new(Mutex::new(GatewayRegistry::new()));
+        let pairing = crate::remote::pairing::Pairing {
+            control_key: "zz".repeat(32),
+            ..agent("a2")
+        };
+        let outcome = open_mcp_channel_with_token(
+            &pairing,
+            Arc::new(crate::remote::mcp_tools::UnavailableBackend),
+            Some("token".into()),
+            &registry,
+        )
+        .await;
+        match err_of(outcome) {
+            OpenError::JwtMint(m) => assert_eq!(m, "the agent pairing has no usable key"),
+            other => panic!("unexpected: {other}"),
+        }
+        assert!(registry.lock().await.is_empty(), "nothing registered");
+        assert!(!open_channels().await.contains(&"a2".to_string()));
     }
 
     #[test]

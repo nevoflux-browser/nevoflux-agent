@@ -1155,7 +1155,7 @@ mod tests {
 
         let sink = Arc::new(WsSink::new());
         let gw = Arc::new(McpGateway::new(
-            None,
+            [0u8; 32],
             sink.clone(),
             Arc::new(UnavailableBackend),
             "c-1",

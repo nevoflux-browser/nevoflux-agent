@@ -2,7 +2,7 @@
 //! design §8.2). If one of these fails, the two sides disagree about the wire.
 
 use nevoflux_daemon::remote::channel_codec;
-use nevoflux_daemon::remote::envelope::InboundVerifier;
+use nevoflux_daemon::remote::envelope::{self, InboundVerifier};
 use nevoflux_daemon::remote::mcp_server::PROTOCOL;
 use nevoflux_daemon::remote::relay_protocol::WireMessage;
 use nevoflux_daemon::remote::session::Wire;
@@ -102,6 +102,14 @@ fn envelope_cases_match_the_verifier() {
             case["name"]
         );
     }
+}
+
+#[test]
+fn the_refusal_budget_matches_the_verifier() {
+    assert_eq!(
+        json("envelope.json")["bad_frame_limit"].as_u64(),
+        Some(u64::from(envelope::BAD_FRAME_LIMIT))
+    );
 }
 
 #[test]

@@ -37,7 +37,8 @@ struct Live {
 
 pub struct McpGateway {
     id: String,
-    key: Option<[u8; 32]>,
+    /// Always present: an agent channel has no plaintext mode (design §5.1).
+    key: [u8; 32],
     sink: Arc<dyn WireSink>,
     backend: Arc<dyn AgentToolBackend>,
     live: Mutex<Option<Live>>,
@@ -46,7 +47,7 @@ pub struct McpGateway {
 
 impl McpGateway {
     pub fn new(
-        key: Option<[u8; 32]>,
+        key: [u8; 32],
         sink: Arc<dyn WireSink>,
         backend: Arc<dyn AgentToolBackend>,
         channel_id: &str,
@@ -66,19 +67,24 @@ impl McpGateway {
         if let Wire::Text(text) = wire {
             if let Some(n) = peer_count(text) {
                 self.on_presence(n).await;
-                return;
+            } else {
+                // The relay's presence notice is the only plaintext this
+                // channel carries. Anything else in text is outside the seal:
+                // never parsed, never counted toward the refusal budget, so
+                // whoever can write to the relay can neither speak for the
+                // agent nor spend its session.
+                tracing::debug!(target: "remote", channel = %self.id, "plaintext agent frame dropped");
             }
+            return;
         }
         let Some(WireMessage::Frame { frame, .. }) =
-            super::channel_codec::decode(self.key.as_ref(), wire)
+            super::channel_codec::decode(Some(&self.key), wire)
         else {
-            if matches!(wire, Wire::Binary(_)) {
-                tracing::warn!(
-                    target: "remote",
-                    channel = %self.id,
-                    "a sealed agent frame would not open; the pairing code may not match"
-                );
-            }
+            tracing::warn!(
+                target: "remote",
+                channel = %self.id,
+                "a sealed agent frame would not open; the pairing code may not match"
+            );
             return;
         };
 
@@ -161,7 +167,7 @@ impl McpGateway {
         let (in_tx, in_rx) = mpsc::channel::<RxJsonRpcMessage<RoleServer>>(BUFFER);
 
         // The challenge goes out before anything else can.
-        send_sealed(&self.sink, self.key.as_ref(), sealer.challenge_frame()).await;
+        send_sealed(&self.sink, &self.key, sealer.challenge_frame()).await;
 
         {
             let (sink, key, cancel, id) =
@@ -173,7 +179,7 @@ impl McpGateway {
                         _ = cancel.cancelled() => break,
                         next = out_rx.next() => match next {
                             Some(msg) => match serde_json::to_value(&msg) {
-                                Ok(v) => send_sealed(&sink, key.as_ref(), sealer.wrap(v)).await,
+                                Ok(v) => send_sealed(&sink, &key, sealer.wrap(v)).await,
                                 Err(e) => tracing::warn!(target: "remote", channel = %id, "could not serialise an MCP message: {e}"),
                             },
                             None => break,
@@ -208,8 +214,8 @@ impl McpGateway {
     }
 }
 
-async fn send_sealed(sink: &Arc<dyn WireSink>, key: Option<&[u8; 32]>, frame: Value) {
-    let wire = super::channel_codec::encode(key, &WireMessage::Frame { seq: None, frame });
+async fn send_sealed(sink: &Arc<dyn WireSink>, key: &[u8; 32], frame: Value) {
+    let wire = super::channel_codec::encode(Some(key), &WireMessage::Frame { seq: None, frame });
     sink.send(wire).await;
 }
 
@@ -263,7 +269,7 @@ mod tests {
     fn build() -> (Arc<McpGateway>, Arc<Collect>) {
         let sink = Arc::new(Collect::default());
         let gw = Arc::new(McpGateway::new(
-            Some(KEY),
+            KEY,
             sink.clone(),
             Arc::new(StubBrowserBackend),
             "chan-1",
@@ -303,7 +309,7 @@ mod tests {
     }
 
     async fn wait_for(sink: &Collect, pred: impl Fn(&Value) -> bool) -> Option<Value> {
-        for _ in 0..100 {
+        for _ in 0..250 {
             if let Some(f) = sink.frames().into_iter().find(|f| pred(f)) {
                 return Some(f);
             }
@@ -579,10 +585,32 @@ mod tests {
             .expect("unaffected");
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn plaintext_envelopes_are_never_read_and_never_spend_the_session() {
+        let (gw, sink) = build();
+        let (ch, n) = handshake(&gw, &sink, 1).await;
+        // A well-formed envelope with the right challenge and counter, but in
+        // text: outside the seal. More of them than the refusal budget.
+        for i in 0..(crate::remote::envelope::BAD_FRAME_LIMIT as u64 * 2) {
+            let frame = json!({"d": "c2h", "n": n + i, "ch": ch, "m": request(300 + i, "tools/list", json!({}))});
+            let text = serde_json::to_string(&WireMessage::Frame { seq: None, frame }).unwrap();
+            gw.on_wire_in(&Wire::Text(text)).await;
+        }
+        // Positive control: the same counter, sealed, is still fresh and answered.
+        gw.on_wire_in(&c2h(n, &ch, request(13, "tools/list", json!({}))))
+            .await;
+        wait_for(&sink, |f| f["m"]["id"] == json!(13))
+            .await
+            .expect("the session survived the plaintext");
+        for i in 0..(crate::remote::envelope::BAD_FRAME_LIMIT as u64 * 2) {
+            assert_eq!(answers(&sink, 300 + i), 0, "plaintext was answered");
+        }
+    }
+
     #[test]
     fn the_gateway_id_names_the_channel() {
         let sink = Arc::new(Collect::default());
-        let gw = McpGateway::new(None, sink, Arc::new(StubBrowserBackend), "abc");
+        let gw = McpGateway::new(KEY, sink, Arc::new(StubBrowserBackend), "abc");
         assert_eq!(RemoteGateway::id(&gw), "mcp:abc");
     }
 }

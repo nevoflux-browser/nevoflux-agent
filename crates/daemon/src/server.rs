@@ -2028,6 +2028,11 @@ pub async fn start_server(
         let pairings = Arc::new(crate::remote::pairing::PairingStore::new(
             crate::remote::pairing::PairingStore::default_path(),
         ));
+        // Agents get a file of their own, so a downgraded daemon reading
+        // pairings.json can never take one for a phone.
+        let agent_pairings = Arc::new(crate::remote::pairing::PairingStore::new(
+            crate::remote::pairing::PairingStore::default_agent_path(),
+        ));
         let vapid_public = match crate::remote::web_push::VapidStore::new(
             crate::remote::web_push::VapidStore::default_path(),
         )
@@ -2048,6 +2053,7 @@ pub async fn start_server(
                 services.database.clone(),
             )),
             pairings,
+            agent_pairings,
             database: services.database.clone(),
             vapid_public,
             msg_tx: msg_tx.clone(),
@@ -9392,7 +9398,7 @@ async fn handle_chat_message(
                 //     can reach this machine", which needs no secret.
                 "remote.pairings" => {
                     let rows = crate::remote::start::control_deps()
-                        .map(|deps| deps.pairings.load().unwrap_or_default())
+                        .map(crate::remote::start::all_pairings)
                         .unwrap_or_default()
                         .into_iter()
                         .map(|p| {
