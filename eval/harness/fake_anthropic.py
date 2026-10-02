@@ -16,8 +16,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 URL = re.compile(r"https?://[^\s\"')]+")
 
 
-def script(step: int, user_text: str):
-    """(kind, payload) for the step-th assistant turn."""
+def script(step: int, user_text: str, turn: int = 0):
+    """(kind, payload) for the step-th assistant message of the turn-th turn."""
+    if turn > 0:
+        follow = [("tool", "browser_get_markdown", {})]
+        if step < len(follow):
+            return follow[step]
+        return ("text", "The direct one is NF752.\nANSWER: NF752", None)
     m = URL.search(user_text)
     url = m.group(0) if m else "about:blank"
     plan = [
@@ -48,6 +53,28 @@ def assistant_turns(body) -> int:
     return sum(1 for m in body.get("messages", []) if m.get("role") == "assistant")
 
 
+def _is_user_text(m) -> bool:
+    """A user message the person wrote (not a tool_result carrier)."""
+    if m.get("role") != "user":
+        return False
+    c = m.get("content")
+    if isinstance(c, str):
+        return True
+    return any(isinstance(b, dict) and b.get("type") == "text" for b in c or [])
+
+
+def position(body):
+    """(turn, step): which user turn this is, and how many assistant
+    messages it already has."""
+    msgs = body.get("messages", [])
+    users = [i for i, m in enumerate(msgs) if _is_user_text(m)]
+    if not users:
+        return 0, assistant_turns(body)
+    last = users[-1]
+    step = sum(1 for m in msgs[last + 1:] if m.get("role") == "assistant")
+    return len(users) - 1, step
+
+
 def sse(event, data):
     return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode()
 
@@ -58,8 +85,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get("content-length") or 0)
         body = json.loads(self.rfile.read(n) or b"{}")
-        step = assistant_turns(body)
-        kind, a, b = script(step, first_user_text(body))
+        turn, step = position(body)
+        kind, a, b = script(step, first_user_text(body), turn)
         usage = {"input_tokens": 100, "output_tokens": 10}
         if kind == "tool":
             block = {"type": "tool_use", "id": f"toolu_{step}", "name": a, "input": b}

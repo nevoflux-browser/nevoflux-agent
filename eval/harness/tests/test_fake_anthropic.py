@@ -1,6 +1,6 @@
 import unittest
 
-from eval.harness.fake_anthropic import assistant_turns, first_user_text, script
+from eval.harness.fake_anthropic import assistant_turns, first_user_text, position, script
 
 
 class FakeAnthropicTest(unittest.TestCase):
@@ -19,6 +19,24 @@ class FakeAnthropicTest(unittest.TestCase):
         ]}
         self.assertEqual(assistant_turns(body), 1)
         self.assertEqual(first_user_text(body), "go to http://a.example/")
+
+
+class FollowUpTest(unittest.TestCase):
+    def test_a_follow_up_turn_reads_then_answers(self):
+        self.assertEqual(script(0, "x", turn=1)[1], "browser_get_markdown")
+        self.assertIn("ANSWER: NF752", script(1, "x", turn=1)[1])
+
+    def test_position_counts_the_turn_and_its_steps(self):
+        body = {"messages": [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "a", "name": "x", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "a", "content": "r"}]},
+            {"role": "assistant", "content": "answer one"},
+            {"role": "user", "content": "follow-up"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "b", "name": "x", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "b", "content": "r"}]},
+        ]}
+        self.assertEqual(position(body), (1, 1))
 
 
 if __name__ == "__main__":

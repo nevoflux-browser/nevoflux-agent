@@ -53,3 +53,19 @@ class SiteHostTest(unittest.TestCase):
     def test_trial_base_uses_the_site_host(self):
         from eval.harness.trial import site_base
         self.assertEqual(site_base("localtest.me", 5123, "shop"), "http://localtest.me:5123/shop")
+
+
+class FreshAgentTest(unittest.TestCase):
+    def test_a_binary_older_than_the_code_is_refused(self):
+        import os
+        import tempfile
+        from eval.harness.run import check_agent_fresh
+        with tempfile.TemporaryDirectory() as d:
+            exe = os.path.join(d, "agent.exe")
+            open(exe, "w").close()
+            os.utime(exe, (1_000, 1_000))
+            with self.assertRaises(SystemExit):
+                check_agent_fresh(exe, d, commit_time=2_000)
+            check_agent_fresh(exe, d, commit_time=500)
+            with self.assertRaises(SystemExit):
+                check_agent_fresh(os.path.join(d, "missing.exe"), d, commit_time=0)
