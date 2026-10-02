@@ -26,6 +26,24 @@ impl std::fmt::Display for HostError {
 
 impl std::error::Error for HostError {}
 
+/// A tool result the host may render before it enters the model's context
+/// (Jev visibility, spec §5.6). The full text has already been recorded.
+pub struct RenderRequest<'a> {
+    pub call: &'a ToolCall,
+    /// The id the result is sent back under; also the `recall` chunk id.
+    pub tool_call_id: &'a str,
+    pub ctx: &'a ToolContext,
+    /// URL of the tab active when the turn started, if any. Carried here,
+    /// not in `ctx.tab_url`: site rules judge `ctx.tab_url`, and a stale
+    /// turn-start tab must not change what they decide.
+    pub turn_tab_url: Option<&'a str>,
+    /// The user's request driving this run.
+    pub query: &'a str,
+    pub content: &'a str,
+    /// The loop's per-result size cap.
+    pub max_bytes: usize,
+}
+
 /// Host function interface.
 ///
 /// This trait defines all host functions available to the Wasm guest.
@@ -985,6 +1003,28 @@ pub trait HostFunctions {
         result
     }
 
+    /// Whether large tool results are graded and rendered by the host this
+    /// run (Jev visibility). Asked once per run; while true the loop adds
+    /// `recall` and stops shrinking aged results (spec §5.6.7).
+    fn visibility_active(&self) -> bool {
+        false
+    }
+
+    /// The text to show the model instead of `req.content`, or `None` to
+    /// keep it. Called after the result was recorded in full.
+    fn render_tool_result(&self, _req: &RenderRequest<'_>) -> Option<String> {
+        None
+    }
+
+    /// The full text of an earlier result shown shortened or hidden, from
+    /// byte `offset`.
+    fn tool_recall(&self, _chunk_id: &str, _offset: u64) -> HostResult<String> {
+        Err(HostError {
+            code: 404,
+            message: "recall is not available".into(),
+        })
+    }
+
     // =========================================================================
     // /schedule skill tool functions (Task 1.6)
     // =========================================================================
@@ -1143,6 +1183,14 @@ pub struct MockHostFunctions {
     /// tools in real life. Local mode discovers tools through this call, so a
     /// test cannot exercise that path while the mock always answers empty.
     pub tool_search_results: std::cell::RefCell<Vec<ToolSearchResult>>,
+    /// What `visibility_active` answers.
+    pub visibility: std::cell::Cell<bool>,
+    /// Results `render_tool_result` saw, as (tool name, content length).
+    pub rendered: std::cell::RefCell<Vec<(String, usize)>>,
+    /// What `render_tool_result` returns.
+    pub render_with: std::cell::RefCell<Option<String>>,
+    /// `tool_recall` calls, as (chunk id, offset).
+    pub recalls: std::cell::RefCell<Vec<(String, u64)>>,
 }
 
 #[cfg(test)]
@@ -1174,6 +1222,10 @@ impl MockHostFunctions {
             active_packs: std::cell::RefCell::new(vec![]),
             prompt_override: std::cell::RefCell::new(None),
             tool_search_results: std::cell::RefCell::new(vec![]),
+            visibility: std::cell::Cell::new(false),
+            rendered: std::cell::RefCell::new(vec![]),
+            render_with: std::cell::RefCell::new(None),
+            recalls: std::cell::RefCell::new(vec![]),
         }
     }
 
@@ -1273,6 +1325,24 @@ impl HostFunctions for MockHostFunctions {
             .borrow_mut()
             .push(call.arguments.clone());
         result
+    }
+
+    fn visibility_active(&self) -> bool {
+        self.visibility.get()
+    }
+
+    fn render_tool_result(&self, req: &RenderRequest<'_>) -> Option<String> {
+        self.rendered
+            .borrow_mut()
+            .push((req.call.name.clone(), req.content.len()));
+        self.render_with.borrow().clone()
+    }
+
+    fn tool_recall(&self, chunk_id: &str, offset: u64) -> HostResult<String> {
+        self.recalls
+            .borrow_mut()
+            .push((chunk_id.to_string(), offset));
+        Ok("FULL TEXT".into())
     }
 
     fn record_turn_boundary(&self, turn: u32, start: bool) {

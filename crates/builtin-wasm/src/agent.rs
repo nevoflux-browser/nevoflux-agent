@@ -1860,6 +1860,8 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
             Some(local) => ResultBudget::for_local(local.n_ctx),
             None => ResultBudget::CLOUD,
         };
+        // Jev visibility (spec §5.6): cloud turns only (§3.2), asked once.
+        let visibility = input.local.is_none() && self.host.visibility_active();
 
         let mut iterations = 0;
         let mut final_text = String::new();
@@ -1903,16 +1905,29 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
             // "make the sky bluer" is a follow-up that feeds the previous image
             // back in. Audio has no such turn; an image does, and taking it
             // away breaks editing silently.
-            shrink_aged_tool_results_with(&mut messages, budget);
+            // With Jev visibility on, large results are already graded at
+            // insertion and reachable with `recall`; aged-shrink is off
+            // (spec §5.6.7).
+            if !visibility {
+                shrink_aged_tool_results_with(&mut messages, budget);
+            }
+
+            // `recall` rides on every request while visibility is on; the
+            // gates above rebuild `active_tools` and would drop it.
+            let offered = if visibility {
+                Self::with_recall(&active_tools)
+            } else {
+                active_tools.clone()
+            };
 
             // Use streaming or non-streaming LLM based on config
             let response = if self.config.use_streaming && !self.config.suppress_streaming {
-                self.call_llm_streaming(&messages, &active_tools)?
+                self.call_llm_streaming(&messages, &offered)?
             } else {
                 // Call LLM non-streaming
                 let request = LlmRequest {
                     messages: messages.clone(),
-                    tools: active_tools.clone(),
+                    tools: offered.clone(),
                     stream: false,
                 };
                 self.host.llm_chat(&request)?
@@ -2076,16 +2091,34 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                 // it: the host writes the full text somewhere and the model is
                 // told where, so a long page or a big file is still reachable
                 // with `read` instead of being silently cut off.
-                let trimmed = truncate_tool_result_with(&messages, &result.content, budget);
-                let content = if trimmed.len() < result.content.len() {
-                    match self
-                        .host
-                        .spill_tool_result(&result.tool_call_id, &result.content)
-                    {
+                // Jev visibility: the host may show a graded rendition instead
+                // of the full text it just recorded. `recall` output is what
+                // the model asked for, so it is never graded again.
+                let rendered = if visibility && tool_call.name != "recall" {
+                    self.host.render_tool_result(&crate::host::RenderRequest {
+                        call: &effective_call,
+                        tool_call_id: &result.tool_call_id,
+                        ctx: &ctx,
+                        turn_tab_url: active_tab_info
+                            .as_ref()
+                            .map(|t| t.url.as_str())
+                            .filter(|u| !u.is_empty()),
+                        query: &input.user_message,
+                        content: &result.content,
+                        max_bytes: budget.max_single,
+                    })
+                } else {
+                    None
+                };
+                let source = rendered.as_deref().unwrap_or(&result.content);
+
+                let trimmed = truncate_tool_result_with(&messages, source, budget);
+                let content = if trimmed.len() < source.len() {
+                    match self.host.spill_tool_result(&result.tool_call_id, source) {
                         Some(path) => format!(
                             "{trimmed}\n\n[full output saved to {} ({} bytes) — use `read` with that path to continue]",
                             path,
-                            result.content.len()
+                            source.len()
                         ),
                         // Nowhere to write: the truncation stands. Spilling
                         // improves on truncation, it is not required for it.
@@ -2504,6 +2537,11 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
         }
 
         let content = match normalized_name {
+            "recall" => {
+                let id = tool_call.arguments["chunk_id"].as_str().unwrap_or("");
+                let offset = tool_call.arguments["offset"].as_u64().unwrap_or(0);
+                self.host.tool_recall(id, offset)?
+            }
             "think" => {
                 // Think tool: no side effects, just returns acknowledgment.
                 // The thought content is recorded in trace via the tool_call arguments.
@@ -3566,11 +3604,43 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
     }
 
     /// Check if a tool name is handled by execute_tool (not an MCP tool).
+    /// `tools` plus `recall` (Jev visibility). An empty list stays empty:
+    /// it means tools are disabled for this run.
+    fn with_recall(tools: &[ToolDefinition]) -> Vec<ToolDefinition> {
+        let mut out = tools.to_vec();
+        if out.is_empty() || out.iter().any(|t| t.name == "recall") {
+            return out;
+        }
+        out.push(ToolDefinition {
+            name: "recall".into(),
+            description: "Return the full text of an earlier tool result that was shown \
+                shortened or hidden. Use the id from its [id · …] line. Long results come in \
+                pieces: pass offset to continue."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "chunk_id": {
+                        "type": "string",
+                        "description": "The id shown in the result's [id · …] line"
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Byte offset to continue from (default 0)"
+                    }
+                },
+                "required": ["chunk_id"]
+            }),
+        });
+        out
+    }
+
     fn is_builtin_tool(&self, name: &str) -> bool {
         let name = Self::normalize_tool_name(name);
         matches!(
             name,
-            "think"
+            "recall"
+                | "think"
                 | "plan"
                 | "create_artifact"
                 | "switch_model"
@@ -8233,6 +8303,143 @@ mod tests {
         let out = truncate_tool_result_if_needed(&messages, &big);
         assert!(out.len() < big.len());
         assert!(out.contains("[Content truncated:"));
+    }
+
+    fn calls(n: usize, name: &str) -> Vec<ToolCall> {
+        (0..n)
+            .map(|i| ToolCall {
+                id: format!("t{i}"),
+                call_id: None,
+                name: name.into(),
+                arguments: serde_json::json!({ "thought": "x" }),
+                signature: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn with_visibility_off_nothing_changes() {
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(LlmResponse {
+            text: "".into(),
+            tool_calls: calls(1, "think"),
+            reasoning: None,
+        });
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        agent.run(&session_log_input("go")).unwrap();
+        assert!(agent.host.rendered.borrow().is_empty());
+        let req = agent.host.captured_requests.borrow()[0].clone();
+        assert!(!req.tools.iter().any(|t| t.name == "recall"));
+    }
+
+    #[test]
+    fn with_visibility_on_the_rendered_text_reaches_the_model() {
+        let mock = MockHostFunctions::new();
+        mock.visibility.set(true);
+        *mock.render_with.borrow_mut() = Some("[c · think · hidden] — recall(\"c\")".into());
+        mock.add_llm_response(LlmResponse {
+            text: "".into(),
+            tool_calls: calls(1, "think"),
+            reasoning: None,
+        });
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        agent.run(&session_log_input("go")).unwrap();
+        assert_eq!(agent.host.rendered.borrow().len(), 1);
+        let req = agent.host.captured_requests.borrow()[1].clone();
+        assert!(req.tools.iter().any(|t| t.name == "recall"));
+        let tool_msg = req
+            .messages
+            .iter()
+            .find(|m| matches!(m.role, MessageRole::Tool))
+            .unwrap();
+        assert!(tool_msg.content.contains("hidden"), "{}", tool_msg.content);
+    }
+
+    #[test]
+    fn recall_goes_to_the_host_and_is_never_rendered() {
+        let mock = MockHostFunctions::new();
+        mock.visibility.set(true);
+        mock.add_llm_response(LlmResponse {
+            text: "".into(),
+            tool_calls: vec![a_tool_call(
+                "recall",
+                serde_json::json!({"chunk_id": "c9", "offset": 10}),
+            )],
+            reasoning: None,
+        });
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        agent.run(&session_log_input("go")).unwrap();
+        assert_eq!(*agent.host.recalls.borrow(), vec![("c9".to_string(), 10)]);
+        assert!(agent.host.rendered.borrow().is_empty());
+        let req = agent.host.captured_requests.borrow()[1].clone();
+        let tool_msg = req
+            .messages
+            .iter()
+            .find(|m| matches!(m.role, MessageRole::Tool))
+            .unwrap();
+        assert!(
+            tool_msg.content.contains("FULL TEXT"),
+            "{}",
+            tool_msg.content
+        );
+    }
+
+    #[test]
+    fn a_local_provider_never_uses_visibility() {
+        let mock = MockHostFunctions::new();
+        mock.visibility.set(true);
+        *mock.render_with.borrow_mut() = Some("RENDERED".into());
+        mock.add_llm_response(LlmResponse {
+            text: "".into(),
+            tool_calls: calls(1, "think"),
+            reasoning: None,
+        });
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        let mut input = session_log_input("go");
+        input.local = Some(LocalModeInput {
+            n_ctx: 32768,
+            loaded_tools: vec![],
+            user_doc: None,
+        });
+        agent.run(&input).unwrap();
+        assert!(agent.host.rendered.borrow().is_empty());
+        for req in agent.host.captured_requests.borrow().iter() {
+            assert!(!req.tools.iter().any(|t| t.name == "recall"));
+        }
+    }
+
+    #[test]
+    fn aged_results_are_not_shrunk_while_visibility_is_on() {
+        // 18 results of 13 KB in one step: with aged-shrink, the 6 oldest
+        // (78 KB, over the 64 KB watermark) would be cut to 4 KB before the
+        // next call. With visibility on they must reach it whole.
+        let big = "z".repeat(13_000);
+        let mock = MockHostFunctions::new();
+        mock.visibility.set(true);
+        *mock.render_with.borrow_mut() = Some(big.clone());
+        mock.add_llm_response(LlmResponse {
+            text: "".into(),
+            tool_calls: calls(18, "think"),
+            reasoning: None,
+        });
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        agent.run(&session_log_input("go")).unwrap();
+        let req = agent.host.captured_requests.borrow()[1].clone();
+        let first = req
+            .messages
+            .iter()
+            .find(|m| matches!(m.role, MessageRole::Tool))
+            .unwrap();
+        assert_eq!(
+            first.content.len(),
+            big.len(),
+            "the oldest result was shrunk"
+        );
     }
 
     fn a_tool_call(name: &str, args: serde_json::Value) -> ToolCall {
