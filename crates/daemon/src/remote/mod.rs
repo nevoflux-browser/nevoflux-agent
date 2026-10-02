@@ -20,6 +20,8 @@ pub mod history;
 pub mod identity;
 pub mod inject;
 pub mod local_media;
+pub mod mcp_server;
+pub mod mcp_tools;
 pub mod media_frame;
 pub mod pairing;
 pub mod portal_gateway;
