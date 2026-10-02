@@ -302,6 +302,42 @@ G2) while the sites are on loopback; that needs a decision (a public host for
 the eval sites, or an eval-only exception to the loopback rule).
 
 
+## Jev P2-3a (per-step signals, recall stubs, corrections), 2026-10-02
+
+Agent `feat/jev-p2-3a`:
+- with visibility on, aged results become `recall` stubs instead of staying
+  whole;
+- every tool step asks Jev request ① (remaining steps → H = P25, drift,
+  irrelevant bulk, needs action) without waiting;
+- the loop appends one correction note when code signals (failed repeats,
+  error streaks, bad arguments) or fresh Jev signals (> 0.8) say the turn is
+  going in circles.
+
+**Real-model measurement deferred** (the user, 2026-10-02): Kimi's weekly
+quota ran out after one Jev-on trial, and that trial ran an older release
+binary (the measurement script did not stop when its rebuild failed), so it
+showed no Jev activity.
+
+**End to end with a fake model** (`fake_anthropic.py`: navigate, read, two
+identical `think` calls, answer), `jev-flights-cheapest` on `localtest.me`:
+
+```bash
+python -m eval.harness.fake_anthropic 58740 &
+NEVOFLUX_API_KEY_TYPESAFE=… python -m eval.harness.run --tasks eval/harness/tasks/jev   --only jev-flights-cheapest --k 1 --set llm.provider=anthropic   --set llm.anthropic.base_url=http://127.0.0.1:58740 --set jev.enabled=true   --site-host localtest.me --out eval/results/jev-e2e-real
+```
+
+Against the real TypeSafe endpoint (public synthetic page only):
+- 4 `jev/signals` with H = 6, 4, 4, 4, drift 0.13–0.21 and irrelevant bulk
+  0.41–0.59;
+- latency 804 ms (first, cold) and then 303–338 ms;
+- one `context/correction` (`repeat_call`, for the identical `think` pair);
+- the turn's `jev` usage bucket: 4 418 input / 284 output tokens over 4 calls.
+
+The fake model needs no quota, so it is the way to check Jev wiring after a
+change; it says nothing about quality (G2).
+
+## Known gaps
+
 - Agent-loop tasks have no deadline on the daemon side: `wall_clock_secs`
   bounds only the script backend, and `DELETE /tasks/:id` only marks the task
   cancelled in the queue while the agent keeps running. The harness's poll
