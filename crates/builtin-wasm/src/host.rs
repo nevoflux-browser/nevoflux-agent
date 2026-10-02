@@ -75,6 +75,8 @@ pub struct RebuildRequest<'a> {
     pub reason: &'a str,
     /// Messages after the system prompt that are earlier turns.
     pub history_len: usize,
+    /// This turn's messages so far: a rebuild writes them to the cache again.
+    pub current: &'a [Message],
 }
 
 /// What the host made of a tool result: the text the model sees and, when
@@ -1280,6 +1282,8 @@ pub struct MockHostFunctions {
     pub read_text: std::cell::RefCell<Option<String>>,
     /// Reasons `rebuild_history` was asked with.
     pub rebuild_asked: std::cell::RefCell<Vec<String>>,
+    /// The current-turn length each rebuild request carried.
+    pub rebuild_current: std::cell::RefCell<Vec<usize>>,
 }
 
 #[cfg(test)]
@@ -1326,6 +1330,7 @@ impl MockHostFunctions {
             rebuild_with: std::cell::RefCell::new(None),
             read_text: std::cell::RefCell::new(None),
             rebuild_asked: std::cell::RefCell::new(vec![]),
+            rebuild_current: std::cell::RefCell::new(vec![]),
         }
     }
 
@@ -1462,6 +1467,7 @@ impl HostFunctions for MockHostFunctions {
 
     fn rebuild_history(&self, req: &RebuildRequest<'_>) -> Option<Vec<Message>> {
         self.rebuild_asked.borrow_mut().push(req.reason.to_string());
+        self.rebuild_current.borrow_mut().push(req.current.len());
         self.rebuild_with.borrow().clone()
     }
 

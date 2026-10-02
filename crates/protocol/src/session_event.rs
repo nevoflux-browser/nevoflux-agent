@@ -295,6 +295,10 @@ pub enum SessionEventPayload {
         /// so the rendition can be rebuilt from the stored text.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         kept: Vec<[u64; 2]>,
+        /// URLs of the pages the chunk may come from (empty: no page), so a
+        /// re-grade can re-check them against the current sensitive list.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pages: Vec<String>,
     },
     /// Jev's per-step signals (request ①, spec §5.4), logged when they land.
     #[serde(rename = "jev/signals")]
@@ -449,10 +453,12 @@ mod tests {
             elapsed_ms: 400,
             call_id: Some("toolu_1".into()),
             kept: vec![[25, 50]],
+            pages: vec!["https://example.com/a".into()],
         };
         let v = serde_json::to_value(&p).unwrap();
         assert_eq!(v["call_id"], "toolu_1");
         assert_eq!(v["kept"][0][1], 50);
+        assert_eq!(v["pages"][0], "https://example.com/a");
         let back: SessionEventPayload = serde_json::from_value(v).unwrap();
         assert_eq!(back, p);
     }
@@ -462,7 +468,9 @@ mod tests {
         let v = serde_json::json!({"type": "jev/visibility", "id": "c1", "tool": "read", "bytes": 9000,
             "level": "short", "graded_by": "jev", "kept_lines": 0, "elapsed_ms": 1});
         let p: SessionEventPayload = serde_json::from_value(v).unwrap();
-        assert!(matches!(p, SessionEventPayload::JevVisibility { call_id: None, ref kept, .. } if kept.is_empty()));
+        assert!(
+            matches!(p, SessionEventPayload::JevVisibility { call_id: None, ref kept, .. } if kept.is_empty())
+        );
     }
 
     #[test]
@@ -510,6 +518,7 @@ mod tests {
             elapsed_ms: 412,
             call_id: None,
             kept: vec![],
+            pages: vec![],
         };
         let v = serde_json::to_value(&p).unwrap();
         assert_eq!(v["type"], "jev/visibility");

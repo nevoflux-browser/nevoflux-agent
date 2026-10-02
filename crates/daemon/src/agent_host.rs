@@ -2300,12 +2300,9 @@ impl HostFunctions for DaemonHostFunctions {
                 .list(&session)
                 .ok()?;
         // Earlier turns only: this turn's messages stay as the loop has them.
-        if let Some(i) = events.iter().rposition(|e| {
-            matches!(
-                e.payload,
-                nevoflux_protocol::session_event::SessionEventPayload::TurnStart { .. }
-            )
-        }) {
+        // A subagent logs its own turn inside this one; that is not where
+        // this turn starts.
+        if let Some(i) = crate::jev::history::current_turn_start(&events) {
             events.truncate(i);
         }
         let h = self
@@ -2313,6 +2310,24 @@ impl HostFunctions for DaemonHostFunctions {
             .lock()
             .ok()
             .and_then(|g| g.as_ref().and_then(|s| s.h));
+        // The same user words and attributions as the turn-start history.
+        let max = cfg.daemon.context.max_history_messages as usize;
+        let mut rows = nevoflux_storage::repositories::MessageRepository::new(&services.database)
+            .list_recent(&session, max as u32 + 1)
+            .unwrap_or_default();
+        rows.pop(); // this turn's own request
+        let registry = services.role_registry();
+        let display_name = |slug: &str| -> String {
+            registry
+                .and_then(|r| r.get(slug).ok())
+                .map(|def| def.name)
+                .unwrap_or_else(|| slug.to_string())
+        };
+        let table = crate::jev::rebuild::table_turns(
+            &rows,
+            self.active_soul.as_deref().map(|s| s.slug.as_str()),
+            &display_name,
+        );
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
@@ -2324,16 +2339,14 @@ impl HostFunctions for DaemonHostFunctions {
             query: req.query,
             writer: self.event_writer().map(Arc::new),
             stats: self.turn_stats.clone(),
-            opts: crate::jev::history::HistoryOpts {
-                max_messages: cfg.daemon.context.max_history_messages as usize,
-                max_bytes: 32_000,
-            },
+            opts: crate::jev::rebuild::history_opts(cfg, max, table),
             now_ms,
         };
         let h = crate::jev::economics::remaining_requests(h);
+        let current = crate::jev::rebuild::tokens(req.current);
         let runtime = self.runtime.clone();
         tokio::task::block_in_place(|| {
-            runtime.block_on(crate::jev::rebuild::polluted_rebuild(&env, h))
+            runtime.block_on(crate::jev::rebuild::polluted_rebuild(&env, h, current))
         })
     }
 

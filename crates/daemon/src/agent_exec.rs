@@ -268,6 +268,7 @@ pub async fn run_agent_once(
         && crate::jev::rebuild::rebuild_point_on(&agent_config)
     {
         let max = agent_config.daemon.context.max_history_messages as usize;
+        let table = crate::jev::rebuild::table_from_text(&text_history);
         crate::jev::rebuild::prefer_log(
             crate::jev::rebuild::history_from_log(
                 &agent_config,
@@ -275,6 +276,7 @@ pub async fn run_agent_once(
                 &req.session_id,
                 &req.user_message,
                 max,
+                table,
             )
             .await,
             text_history,

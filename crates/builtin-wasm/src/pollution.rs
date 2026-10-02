@@ -42,6 +42,39 @@ pub const CONTENT_SHARE: f64 = 0.3;
 
 /// Whether each action's result was superseded by a later one for the same
 /// tool and target.
+/// Arguments that pick a part of a target: reading another part of it is
+/// paging, not a re-read.
+const RANGE_ARGS: &[&str] = &[
+    "end",
+    "end_line",
+    "limit",
+    "line",
+    "lines",
+    "offset",
+    "page",
+    "range",
+    "start",
+    "start_line",
+];
+
+/// What an action read or wrote, with the part of it, for telling a re-read
+/// from a new read.
+pub fn action_target(args: &serde_json::Value) -> Option<String> {
+    let base = ["url", "file_path", "path"]
+        .iter()
+        .find_map(|k| args[*k].as_str())?;
+    let range: Vec<String> = RANGE_ARGS
+        .iter()
+        .filter(|k| !args[**k].is_null())
+        .map(|k| format!("{k}={}", args[*k]))
+        .collect();
+    Some(if range.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}#{}", range.join("&"))
+    })
+}
+
 fn superseded(log: &[ActionRecord]) -> Vec<bool> {
     log.iter()
         .enumerate()
@@ -535,5 +568,19 @@ mod tests {
         let p = detect(&log, None, 0.8, 2, 0).unwrap();
         let text = correction_text(&"q".repeat(5_000), &p);
         assert!(text.len() < 1_500, "{}", text.len());
+    }
+
+    #[test]
+    fn a_target_names_the_range_read() {
+        let whole = action_target(&serde_json::json!({"file_path": "a.txt"}));
+        let page =
+            action_target(&serde_json::json!({"file_path": "a.txt", "offset": 400, "limit": 200}));
+        assert_eq!(whole.as_deref(), Some("a.txt"));
+        assert_ne!(whole, page);
+        assert_eq!(
+            page,
+            action_target(&serde_json::json!({"limit": 200, "offset": 400, "file_path": "a.txt"}))
+        );
+        assert_eq!(action_target(&serde_json::json!({"query": "x"})), None);
     }
 }

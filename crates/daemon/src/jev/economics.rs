@@ -82,6 +82,15 @@ pub fn keep_cost(p: f64, h: u32, rate: CacheRate, warm: bool) -> f64 {
     }
 }
 
+/// Keeping a prefix of `p` tokens of which `cached` are still in the
+/// provider's cache: those are read, the rest written once, then all read.
+pub fn keep_cost_cached(p: f64, cached: f64, h: u32, rate: CacheRate) -> f64 {
+    let cached = cached.clamp(0.0, p);
+    let fresh = p - cached;
+    let h = h as f64;
+    h * cached * rate.read + fresh * rate.write + (h - 1.0).max(0.0) * fresh * rate.read
+}
+
 /// Rebuilding into a prefix of `a` tokens, plus the Jev tokens it took.
 pub fn rebuild_cost(a: f64, h: u32, rate: CacheRate, jev_tokens: f64) -> f64 {
     a * rate.write + (h as f64 - 1.0).max(0.0) * a * rate.read + jev_tokens
@@ -231,5 +240,23 @@ mod tests {
             toml::from_str("[jev.cache.anthropic]\nread = 0.05\nwrite = 1.25\nttl_secs = 3600\n")
                 .unwrap();
         assert_eq!(cfg.jev.cache["anthropic"].ttl_secs, 3600);
+    }
+
+    #[test]
+    fn keeping_reads_only_what_is_still_cached() {
+        let r = cache_rate(ProviderType::Anthropic, &BTreeMap::new());
+        assert!(near(
+            keep_cost_cached(1000.0, 1000.0, 3, r),
+            keep_cost(1000.0, 3, r, true)
+        ));
+        assert!(near(
+            keep_cost_cached(1000.0, 0.0, 3, r),
+            keep_cost(1000.0, 3, r, false)
+        ));
+        // half cached: 3·500·0.1 + 500·1.25 + 2·500·0.1
+        assert!(near(
+            keep_cost_cached(1000.0, 500.0, 3, r),
+            150.0 + 625.0 + 100.0
+        ));
     }
 }

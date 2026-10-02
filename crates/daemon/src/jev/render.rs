@@ -189,6 +189,12 @@ fn log(
     started: Instant,
 ) {
     if let Some(w) = &env.events {
+        // Where the text may come from, so a later re-grade can re-check it.
+        let pages = match page_kind(&req.call.name, &req.call.arguments) {
+            PageKind::Browser => env.page_urls.clone().unwrap_or_default(),
+            PageKind::Url(u) => vec![u],
+            PageKind::Unknown | PageKind::None => Vec::new(),
+        };
         w.append(SessionEventPayload::JevVisibility {
             id: chunk.to_string(),
             tool: req.call.name.clone(),
@@ -202,6 +208,7 @@ fn log(
                 .iter()
                 .map(|r| [r.start as u64, r.end as u64])
                 .collect(),
+            pages,
         });
     }
 }
@@ -411,6 +418,34 @@ mod tests {
                 &e.payload,
                 SessionEventPayload::JevVisibility { call_id: Some(c), kept, .. }
                     if c == "call_1" && kept == &vec![[25u64, 50u64]]
+            )),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_grade_logs_the_pages_its_text_may_come_from() {
+        let (url, _) = answering(answer("long", &["b001"]), Duration::ZERO).await;
+        let db = Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        let w = Arc::new(SessionEventWriter::new(db.clone(), "s1".into()));
+        run(
+            &jev(&url, 2000),
+            "browser_get_markdown",
+            serde_json::json!({}),
+            Some("https://shop.example/cart"),
+            &hundred_lines(),
+            true,
+            Some(w),
+        )
+        .await;
+        let events = nevoflux_storage::repositories::SessionEventRepository::new(&db)
+            .list("s1")
+            .unwrap();
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.payload,
+                SessionEventPayload::JevVisibility { pages, .. }
+                    if pages == &vec!["https://shop.example/cart".to_string()]
             )),
             "{events:?}"
         );

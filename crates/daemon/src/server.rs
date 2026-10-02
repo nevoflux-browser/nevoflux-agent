@@ -6011,18 +6011,6 @@ async fn load_session_history(
         Ok(mut messages) => {
             // Remove the last message (the current user message we just saved)
             let current = messages.pop();
-            // Jev on: earlier turns come from the session log with their tool
-            // results, graded (spec §5.2); the messages table stays the source
-            // otherwise.
-            if let (Some(cfg), Some(query)) = (services.agent_config.as_ref(), current.as_ref()) {
-                if crate::jev::rebuild::rebuild_point_on(cfg) {
-                    if let Some(history) =
-                        jev_history(cfg, session_id, &query.content, max_messages, services).await
-                    {
-                        return history;
-                    }
-                }
-            }
             let registry = services.role_registry();
             let display_name = |slug: &str| -> String {
                 registry
@@ -6031,11 +6019,27 @@ async fn load_session_history(
                     .map(|def| def.name)
                     .unwrap_or_else(|| slug.to_string())
             };
-            convert_history_messages(
-                messages,
-                active_soul.map(|s| s.slug.as_str()),
-                &display_name,
-            )
+            let active = active_soul.map(|s| s.slug.as_str());
+            // Jev on: earlier turns come from the session log with their tool
+            // results, graded (spec §5.2); the messages table stays the source
+            // otherwise, and whenever the log has no earlier turns.
+            let log = match (services.agent_config.as_ref(), current.as_ref()) {
+                (Some(cfg), Some(query)) if crate::jev::rebuild::rebuild_point_on(cfg) => {
+                    let table = crate::jev::rebuild::table_turns(&messages, active, &display_name);
+                    jev_history(
+                        cfg,
+                        session_id,
+                        &query.content,
+                        max_messages,
+                        services,
+                        table,
+                    )
+                    .await
+                }
+                _ => None,
+            };
+            let text = convert_history_messages(messages, active, &display_name);
+            crate::jev::rebuild::prefer_log(log, text)
         }
         Err(e) => {
             warn!("Failed to load session history for {}: {}", session_id, e);
@@ -6053,6 +6057,7 @@ async fn jev_history(
     query: &str,
     max_messages: u32,
     services: &HostServices,
+    table: Vec<crate::jev::history::TableTurn>,
 ) -> Option<Vec<WasmMessage>> {
     crate::jev::rebuild::history_from_log(
         cfg,
@@ -6060,6 +6065,7 @@ async fn jev_history(
         session_id,
         query,
         max_messages as usize,
+        table,
     )
     .await
 }
