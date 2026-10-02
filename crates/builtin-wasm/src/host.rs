@@ -2227,6 +2227,7 @@ mod tests {
             messages: vec![Message::user("Hello")],
             tools: vec![],
             stream: false,
+            history_len: None,
         };
         let response = mock.llm_chat(&request).unwrap();
         assert_eq!(response.text, "Mock response");
@@ -2245,6 +2246,7 @@ mod tests {
             messages: vec![Message::user("Hello")],
             tools: vec![],
             stream: false,
+            history_len: None,
         };
         let response = mock.llm_chat(&request).unwrap();
         assert_eq!(response.text, "Custom response");
@@ -2257,6 +2259,7 @@ mod tests {
             messages: vec![Message::user("Hello")],
             tools: vec![],
             stream: true,
+            history_len: None,
         };
 
         let stream_id = mock.llm_stream_start(&request).unwrap();

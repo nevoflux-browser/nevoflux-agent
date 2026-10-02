@@ -200,6 +200,7 @@ mod tests {
         // `LlmMessage` does not derive `Default`, so every field is filled
         // explicitly with the real struct's required fields.
         LlmMessage {
+            cache_anchor: false,
             role: role.to_string(),
             content: content.to_string(),
             tool_calls: None,

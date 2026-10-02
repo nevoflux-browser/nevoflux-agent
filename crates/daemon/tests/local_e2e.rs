@@ -142,6 +142,7 @@ async fn wait_for_ready() -> LocalState {
 fn user(text: &str) -> LlmChatRequest {
     LlmChatRequest {
         messages: vec![LlmMessage {
+            cache_anchor: false,
             role: "user".into(),
             content: text.into(),
             tool_calls: None,

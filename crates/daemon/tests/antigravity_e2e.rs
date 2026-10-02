@@ -165,6 +165,7 @@ async fn antigravity_daemon_chain_end_to_end() {
 async fn antigravity_incremental_fastpath_hits_after_appended_message() {
     fn msg(role: &str, content: &str) -> LlmMessage {
         LlmMessage {
+            cache_anchor: false,
             role: role.to_string(),
             content: content.to_string(),
             tool_calls: None,

@@ -809,6 +809,7 @@ pub async fn handle_soul_generate(
     // No tools: this is a single call that returns text, not an agent run.
     let request = crate::wasm::llm::LlmChatRequest {
         messages: vec![crate::wasm::llm::LlmMessage {
+            cache_anchor: false,
             role: "user".to_string(),
             content: prompt,
             tool_calls: None,

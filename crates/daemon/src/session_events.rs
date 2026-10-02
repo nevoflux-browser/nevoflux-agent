@@ -268,6 +268,7 @@ mod tests {
 
     fn msg(role: &str, content: &str) -> LlmMessage {
         LlmMessage {
+            cache_anchor: false,
             role: role.into(),
             content: content.into(),
             tool_calls: None,

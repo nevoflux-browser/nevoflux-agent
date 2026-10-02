@@ -201,12 +201,17 @@ pub struct LlmMessage {
     /// mode when the turn includes tool calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    /// The last message of the earlier turns: the Anthropic body puts a cache
+    /// breakpoint here (Jev P2-3b, the 4th of at most 4).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cache_anchor: bool,
 }
 
 impl LlmMessage {
     /// Create a new user message.
     pub fn user(content: impl Into<String>) -> Self {
         Self {
+            cache_anchor: false,
             role: "user".into(),
             content: content.into(),
             tool_calls: None,
@@ -222,6 +227,7 @@ impl LlmMessage {
         attachments: Vec<LlmAttachment>,
     ) -> Self {
         Self {
+            cache_anchor: false,
             role: "user".into(),
             content: content.into(),
             tool_calls: None,
@@ -234,6 +240,7 @@ impl LlmMessage {
     /// Create a new assistant message.
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
+            cache_anchor: false,
             role: "assistant".into(),
             content: content.into(),
             tool_calls: None,
@@ -246,6 +253,7 @@ impl LlmMessage {
     /// Create an assistant message with tool calls.
     pub fn assistant_with_tool_calls(tool_calls: Vec<LlmToolCall>) -> Self {
         Self {
+            cache_anchor: false,
             role: "assistant".into(),
             content: String::new(),
             tool_calls: Some(tool_calls),
@@ -258,6 +266,7 @@ impl LlmMessage {
     /// Create a tool result message.
     pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
+            cache_anchor: false,
             role: "tool".into(),
             content: content.into(),
             tool_calls: None,
@@ -1229,9 +1238,14 @@ fn build_anthropic_messages_request_body(
     let mut messages: Vec<serde_json::Value> = Vec::new();
     let mut pending_images: Vec<serde_json::Value> = Vec::new();
 
+    let mut anchor: Option<usize> = None;
     for msg in &request.messages {
         if msg.role != "tool" {
             flush_tool_images(&mut messages, &mut pending_images);
+        }
+        if msg.cache_anchor {
+            // The message about to be pushed for it.
+            anchor = Some(messages.len());
         }
         match msg.role.as_str() {
             "system" => {
@@ -1328,6 +1342,10 @@ fn build_anthropic_messages_request_body(
 
     flush_tool_images(&mut messages, &mut pending_images);
     if opts.cache {
+        // The end of the earlier turns, unless it is the tail anyway.
+        if let Some(i) = anchor.filter(|i| i + 1 < messages.len()) {
+            mark_cache_breakpoint(&mut messages[i]["content"]);
+        }
         if let Some(last) = messages.last_mut() {
             mark_cache_breakpoint(&mut last["content"]);
         }
@@ -6839,6 +6857,55 @@ mod tests {
     }
 
     #[test]
+    fn raw_body_marks_the_end_of_the_history_when_told() {
+        let anchor = super::LlmMessage {
+            role: "assistant".into(),
+            content: "earlier answer".into(),
+            cache_anchor: true,
+            ..Default::default()
+        };
+        let mut req = anth_req(vec![user_msg("earlier"), anchor, user_msg("now")]);
+        req.system = Some("SYS".into());
+        let body = super::build_anthropic_messages_request_body(
+            "m",
+            &req,
+            true,
+            super::AnthropicBodyOpts {
+                include_reasoning: false,
+                cache: true,
+            },
+        );
+        assert_eq!(
+            body["messages"][1]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        let n = body.to_string().matches("\"cache_control\"").count();
+        assert_eq!(n, 4, "system, tools, history end, tail");
+    }
+
+    #[test]
+    fn an_anchor_on_the_tail_is_not_a_second_breakpoint() {
+        let anchor = super::LlmMessage {
+            role: "user".into(),
+            content: "now".into(),
+            cache_anchor: true,
+            ..Default::default()
+        };
+        let mut req = anth_req(vec![anchor]);
+        req.system = Some("SYS".into());
+        let body = super::build_anthropic_messages_request_body(
+            "m",
+            &req,
+            true,
+            super::AnthropicBodyOpts {
+                include_reasoning: false,
+                cache: true,
+            },
+        );
+        assert_eq!(body.to_string().matches("\"cache_control\"").count(), 3);
+    }
+
+    #[test]
     fn raw_body_without_cache_is_unchanged_shape() {
         let mut req = anth_req(vec![user_msg("q")]);
         req.system = Some("SYS".into());
@@ -8048,6 +8115,7 @@ mod tests {
     fn test_tool_message_with_image_attachment_serialization() {
         // Verify that LlmMessage with tool role and attachments serializes correctly
         let msg = LlmMessage {
+            cache_anchor: false,
             role: "tool".into(),
             content: r#"{"success":true,"screenshot_available":true}"#.into(),
             tool_calls: None,
@@ -8075,6 +8143,7 @@ mod tests {
     fn test_tool_message_without_attachment_no_attachment_field() {
         // When no attachments, the field should be omitted in serialization
         let msg = LlmMessage {
+            cache_anchor: false,
             role: "tool".into(),
             content: r#"{"success":true}"#.into(),
             tool_calls: None,
@@ -8149,6 +8218,7 @@ mod tests {
             ProviderType::Anthropic,
         ] {
             let msg = LlmMessage {
+                cache_anchor: false,
                 role: "assistant".into(),
                 content: "hi".into(),
                 tool_calls: None,
@@ -8177,6 +8247,7 @@ mod tests {
             messages: vec![
                 LlmMessage::user("hi"),
                 LlmMessage {
+                    cache_anchor: false,
                     role: "assistant".into(),
                     content: String::new(),
                     tool_calls: Some(vec![LlmToolCall {
@@ -8191,6 +8262,7 @@ mod tests {
                     reasoning: Some("step 1: get the page".into()),
                 },
                 LlmMessage {
+                    cache_anchor: false,
                     role: "tool".into(),
                     content: "<page contents>".into(),
                     tool_calls: None,

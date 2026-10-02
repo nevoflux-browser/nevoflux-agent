@@ -484,6 +484,9 @@ pub struct Agent<H: HostFunctions> {
     selector_tools_loaded: Cell<bool>,
     /// Jev visibility is on for the current run (`recall` is a builtin only then).
     visibility_on: Cell<bool>,
+    /// `[0, n)` of this run's messages are the system prompt and the earlier
+    /// turns (Jev path only), for the host's history cache breakpoint.
+    history_anchor: Cell<Option<usize>>,
     /// Current keywords extracted from user message and LLM context, used for auto-snapshots.
     current_keywords: RefCell<Vec<String>>,
     /// Skills that have been loaded in this session (prevent redundant re-loading).
@@ -663,6 +666,7 @@ impl<H: HostFunctions> Agent<H> {
             computer_use_triggered: Cell::new(false),
             selector_tools_loaded: Cell::new(false),
             visibility_on: Cell::new(false),
+            history_anchor: Cell::new(None),
             current_keywords: RefCell::new(Vec::new()),
             loaded_skills: RefCell::new(std::collections::HashSet::new()),
             local_index: RefCell::new(None),
@@ -685,6 +689,7 @@ impl<H: HostFunctions> Agent<H> {
             computer_use_triggered: Cell::new(false),
             selector_tools_loaded: Cell::new(false),
             visibility_on: Cell::new(false),
+            history_anchor: Cell::new(None),
             current_keywords: RefCell::new(Vec::new()),
             loaded_skills: RefCell::new(std::collections::HashSet::new()),
             local_index: RefCell::new(None),
@@ -1874,6 +1879,9 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
             std::collections::HashMap::new();
         // Jev per-step signals (request ①) and the in-turn correction (§5.7).
         let signals = input.local.is_none() && self.host.signals_active();
+        // The Jev path takes earlier turns from the log (P2-3b): anchor their end.
+        self.history_anchor
+            .set((signals && !input.history.is_empty()).then(|| 1 + input.history.len()));
         let _settle = SettleSignals {
             host: &self.host,
             active: signals,
@@ -1994,6 +2002,7 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                     messages: messages.clone(),
                     tools: offered.clone(),
                     stream: false,
+                    history_len: self.history_anchor.get(),
                 };
                 self.host.llm_chat(&request)?
             };
@@ -2441,6 +2450,7 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
             messages: messages.to_vec(),
             tools: tools.to_vec(),
             stream: true,
+            history_len: self.history_anchor.get(),
         };
 
         // Start the stream
@@ -8928,6 +8938,30 @@ mod tests {
         for (i, t) in texts.iter().enumerate().take(6) {
             assert!(t.contains(&format!("recall(\"c{i}\")")), "{i}: {t}");
         }
+    }
+
+    #[test]
+    fn history_len_is_set_only_on_the_jev_path() {
+        let input = || {
+            let mut i = session_log_input("go");
+            i.history = vec![Message::user("earlier"), Message::assistant("answer")];
+            i
+        };
+        let mock = MockHostFunctions::new();
+        mock.signals.set(true);
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        agent.run(&input()).unwrap();
+        assert_eq!(
+            agent.host.captured_requests.borrow()[0].history_len,
+            Some(3)
+        );
+
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        agent.run(&input()).unwrap();
+        assert_eq!(agent.host.captured_requests.borrow()[0].history_len, None);
     }
 
     fn a_tool_call(name: &str, args: serde_json::Value) -> ToolCall {

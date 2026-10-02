@@ -136,6 +136,7 @@ mod tests {
 
     fn msg(role: &str, content: &str) -> crate::wasm::llm::LlmMessage {
         crate::wasm::llm::LlmMessage {
+            cache_anchor: false,
             role: role.into(),
             content: content.into(),
             tool_calls: None,

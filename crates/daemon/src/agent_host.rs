@@ -1173,6 +1173,7 @@ impl DaemonHostFunctions {
                 };
                 // Strip tool_calls from assistant messages (they're orphaned after compression)
                 DaemonLlmMessage {
+                    cache_anchor: false,
                     role,
                     content: m.content.clone(),
                     tool_calls: None,
@@ -1221,7 +1222,8 @@ impl DaemonHostFunctions {
         let messages: Vec<DaemonLlmMessage> = request
             .messages
             .iter()
-            .map(|m| {
+            .enumerate()
+            .map(|(i, m)| {
                 let role = match m.role {
                     nevoflux_builtin_wasm::MessageRole::System => "system",
                     nevoflux_builtin_wasm::MessageRole::User => "user",
@@ -1257,6 +1259,8 @@ impl DaemonHostFunctions {
                     .collect();
 
                 DaemonLlmMessage {
+                    // The last message of the earlier turns (Jev P2-3b).
+                    cache_anchor: request.history_len.is_some_and(|n| n >= 2 && i + 1 == n),
                     role: role.to_string(),
                     content: m.content.clone(),
                     tool_calls,
@@ -8210,6 +8214,7 @@ impl DaemonHostFunctions {
             ],
             tools: vec![],
             stream: false,
+            history_len: None,
         };
 
         // Call LLM (non-streaming)
@@ -9617,6 +9622,40 @@ mod tests {
         assert!(!host.signals_active());
     }
 
+    #[test]
+    fn the_history_end_becomes_a_cache_anchor() {
+        use nevoflux_builtin_wasm::{LlmRequest, Message};
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let host = super::DaemonHostFunctions::new(
+            std::sync::Arc::new(crate::config::AgentConfig::default()),
+            rt.handle().clone(),
+        );
+        let mut req = LlmRequest {
+            messages: vec![
+                Message::system("sys"),
+                Message::user("earlier"),
+                Message::assistant("answer"),
+                Message::user("now"),
+            ],
+            tools: vec![],
+            stream: false,
+            history_len: Some(3),
+        };
+        let out = host.convert_request_to_daemon(&req);
+        let anchors: Vec<bool> = out.messages.iter().map(|m| m.cache_anchor).collect();
+        assert_eq!(anchors.iter().filter(|a| **a).count(), 1);
+        assert!(out
+            .messages
+            .iter()
+            .any(|m| m.cache_anchor && m.content == "answer"));
+        req.history_len = None;
+        let out = host.convert_request_to_daemon(&req);
+        assert!(out.messages.iter().all(|m| !m.cache_anchor));
+    }
+
     fn host_with_prompt_held_by(pack: &str) -> super::DaemonHostFunctions {
         let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
         let services = crate::wasm::services::HostServices::new(db).with_own_session_state();
@@ -10023,6 +10062,7 @@ message = "not here"
             messages: vec![Message::user("hi")],
             tools: vec![],
             stream: false,
+            history_len: None,
         }
     }
 
