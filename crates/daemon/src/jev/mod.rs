@@ -1,6 +1,7 @@
 //! Jev decision oracle (design v1.6 §5).
 
 pub mod client;
+pub mod economics;
 pub mod export;
 pub mod history;
 pub mod oracle;

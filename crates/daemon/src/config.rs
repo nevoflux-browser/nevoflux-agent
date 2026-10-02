@@ -1736,6 +1736,9 @@ pub struct JevConfig {
     pub points: JevPoints,
     /// Domains the user adds to the built-in sensitive-site list (§5.8).
     pub sensitive_domains: Vec<String>,
+    /// Prompt-cache rates by wire (`anthropic`, `deepseek`, `openai`),
+    /// overriding the built-in ones (spec §9 M6).
+    pub cache: std::collections::BTreeMap<String, crate::jev::economics::CacheRate>,
 }
 
 impl Default for JevConfig {
@@ -1748,6 +1751,7 @@ impl Default for JevConfig {
             model: "jev-latest".into(),
             points: JevPoints::default(),
             sensitive_domains: Vec::new(),
+            cache: std::collections::BTreeMap::new(),
         }
     }
 }
