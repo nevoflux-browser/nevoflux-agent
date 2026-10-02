@@ -15,12 +15,71 @@ use super::wire::{JevResponse, Question};
 use crate::session_events::SessionEventWriter;
 use crate::turn_stats::TurnStats;
 
+/// What the state describes, so the oracle can apply §5.8. There is no
+/// public field to forget: every call site has to pick one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PageScope {
+    /// Content of the page at this URL.
+    Page(String),
+    /// Page content whose URL is not known (MCP tools, a lost tab): metadata only.
+    UnknownPage,
+    /// No page content at all (local files, shell output, the user's own text).
+    NoPage,
+}
+
 pub struct OracleContext {
     /// The decision point asking (`tools`, `visibility`, …), for the log.
-    pub point: &'static str,
-    /// The active tab, when the state describes a page (privacy scope).
-    pub tab_url: Option<String>,
-    pub timeout: Duration,
+    point: &'static str,
+    page: PageScope,
+    timeout: Duration,
+}
+
+impl OracleContext {
+    /// The state carries content of the page at `url`.
+    pub fn page(point: &'static str, url: impl Into<String>, timeout: Duration) -> Self {
+        Self {
+            point,
+            page: PageScope::Page(url.into()),
+            timeout,
+        }
+    }
+
+    /// The state carries page content from an unknown URL: metadata only.
+    pub fn unknown_page(point: &'static str, timeout: Duration) -> Self {
+        Self {
+            point,
+            page: PageScope::UnknownPage,
+            timeout,
+        }
+    }
+
+    /// The state carries no page content.
+    pub fn no_page(point: &'static str, timeout: Duration) -> Self {
+        Self {
+            point,
+            page: PageScope::NoPage,
+            timeout,
+        }
+    }
+
+    pub fn point(&self) -> &'static str {
+        self.point
+    }
+
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// Full only for no page or a known, non-sensitive page; an empty URL
+    /// counts as unknown.
+    pub fn scope(&self, sensitive_domains: &[String]) -> Scope {
+        match &self.page {
+            PageScope::NoPage => Scope::Full,
+            PageScope::UnknownPage => Scope::MetadataOnly,
+            PageScope::Page(u) if u.trim().is_empty() => Scope::MetadataOnly,
+            PageScope::Page(u) => scope_for(u, sensitive_domains),
+        }
+    }
 }
 
 pub enum Verdict {
@@ -99,15 +158,11 @@ impl DecisionOracle for JevOracle {
         questions: BTreeMap<String, Question>,
     ) -> Verdict {
         let started = Instant::now();
-        let scoped = match ctx
-            .tab_url
-            .as_deref()
-            .map(|u| scope_for(u, &self.sensitive_domains))
-        {
-            Some(Scope::MetadataOnly) => metadata_only(&state),
-            _ => state,
+        let scoped = match ctx.scope(&self.sensitive_domains) {
+            Scope::MetadataOnly => metadata_only(&state),
+            Scope::Full => state,
         };
-        match self.client.ask(scoped, questions, ctx.timeout).await {
+        match self.client.ask(scoped, questions, ctx.timeout()).await {
             Ok(r) => {
                 if let Some(s) = &self.stats {
                     s.record_jev(r.usage.input_tokens, r.usage.output_tokens);
@@ -123,7 +178,7 @@ impl DecisionOracle for JevOracle {
                     JevError::Transport(_) => "transport".to_string(),
                     JevError::Decode(_) => "decode".to_string(),
                 };
-                self.fall_back(ctx.point, reason, started)
+                self.fall_back(ctx.point(), reason, started)
             }
         }
     }
@@ -135,11 +190,56 @@ mod tests {
     use crate::jev::test_support::{answering, one_noul};
 
     fn ctx(point: &'static str, tab: Option<&str>, ms: u64) -> OracleContext {
-        OracleContext {
-            point,
-            tab_url: tab.map(str::to_string),
-            timeout: Duration::from_millis(ms),
+        let t = Duration::from_millis(ms);
+        match tab {
+            Some(u) => OracleContext::page(point, u, t),
+            None => OracleContext::no_page(point, t),
         }
+    }
+
+    #[test]
+    fn scope_is_metadata_only_unless_the_page_is_known_and_ordinary() {
+        let t = Duration::from_millis(800);
+        assert_eq!(OracleContext::no_page("x", t).scope(&[]), Scope::Full);
+        assert_eq!(
+            OracleContext::page("x", "https://en.wikipedia.org/", t).scope(&[]),
+            Scope::Full
+        );
+        assert_eq!(
+            OracleContext::page("x", "https://www.paypal.com/", t).scope(&[]),
+            Scope::MetadataOnly
+        );
+        assert_eq!(
+            OracleContext::page("x", "", t).scope(&[]),
+            Scope::MetadataOnly
+        );
+        assert_eq!(
+            OracleContext::unknown_page("x", t).scope(&[]),
+            Scope::MetadataOnly
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_page_sends_metadata_only() {
+        let (url, bodies) = answering(
+            serde_json::json!({"answers": {}, "usage": {}}),
+            Duration::ZERO,
+        )
+        .await;
+        let oracle = JevOracle::new(JevClient::new(&url, "k", "jev-latest"), vec![], None, None);
+        let state = serde_json::json!({"domain": "d", "page_text": "SECRET"});
+        oracle
+            .ask(
+                &OracleContext::unknown_page("visibility", Duration::from_secs(2)),
+                state,
+                one_noul(),
+            )
+            .await;
+        let sent = bodies.lock().unwrap().join(
+            "
+",
+        );
+        assert!(!sent.contains("SECRET"), "{sent}");
     }
 
     fn writer() -> (Arc<SessionEventWriter>, Arc<nevoflux_storage::Database>) {
