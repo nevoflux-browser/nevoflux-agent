@@ -37,7 +37,8 @@ or the relay answers 403. Always dial out; the head never connects to you.
 
 The relay sends plaintext text messages `{"k":"peers","n":N}`, where N counts
 the *other* sockets on the channel, never the recipient itself. Everything
-else is binary and sealed.
+else is binary and sealed. The head never reads any other text message: an
+envelope sent as text is dropped unanswered.
 
 ## 3. Sealing
 
@@ -73,10 +74,20 @@ both counters restart. The head decides a connection has arrived when the
 relay's `peers` count rises, so a second socket from you on the same channel
 also starts a new session and ends the first.
 
-The head drops frames that fail these checks without answering, and after 8
-refusals drops the MCP session (`fixtures/muse/envelope.json` lists the cases
-and the order they are checked in: shape, direction, challenge, counter).
-A frame whose `m` is missing, `null` or not an object is a shape failure.
+A challenge frame (`d=h2c`, `n=0`, `m=null`) may arrive at any time, not only
+right after you connect: when the head itself reconnects or restarts, your
+socket stays up but the head greets you again. On receiving one: drop the
+current MCP session, reset both counters, and run `initialize` again. Ignore
+any `h2c` frame whose `ch` is not the most recent challenge.
+
+The head drops frames that fail these checks without answering. It checks, in
+order: shape (an object with `d`, `n` as a non-negative integer, `ch` and `m`
+all present), direction, challenge, counter, and finally that `m` is a JSON
+object — so a frame whose `m` is `null` or not an object is a shape failure
+reported only after its counter has been checked
+(`fixtures/muse/envelope.json` lists the cases). After 8 refused frames the
+head drops the MCP session and stops answering on that connection until you
+redial.
 
 ## 5. MCP
 
