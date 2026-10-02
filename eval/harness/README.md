@@ -269,6 +269,15 @@ cache hit 98.0%, `browser_eval_js` 26 (same count method as above).
 Rule: if a rerun regresses with no code cause, compare the snapshot's
 `viewport:` line and `stats.occluded` against the passing run first.
 
+## Jev runs: `--site-host localtest.me`
+
+The daemon treats 127.0.0.1 as intranet (§5.8), so pages from the eval sites
+are never sent to Jev and every grade falls back to the local rule. Jev runs
+therefore serve the sites under `localtest.me`, a public DNS name that
+resolves to 127.0.0.1: `--site-host localtest.me`. The harness checks before
+any trial that the name resolves to loopback only, and stops otherwise. The
+default stays 127.0.0.1, which needs no DNS.
+
 ## Jev P2-2 (visibility), 2026-10-02
 
 Agent `feat/jev-p2-2`: tool results over 4 KB in the native loop are graded

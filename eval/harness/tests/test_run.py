@@ -38,3 +38,18 @@ class StopTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SiteHostTest(unittest.TestCase):
+    def test_site_host_must_resolve_to_loopback(self):
+        from eval.harness.run import check_site_host
+        check_site_host("127.0.0.1")
+        check_site_host("localtest.me")  # public DNS → 127.0.0.1 (needs DNS)
+        with self.assertRaises(SystemExit):
+            check_site_host("example.com")
+        with self.assertRaises(SystemExit):
+            check_site_host("no-such-host.invalid")
+
+    def test_trial_base_uses_the_site_host(self):
+        from eval.harness.trial import site_base
+        self.assertEqual(site_base("localtest.me", 5123, "shop"), "http://localtest.me:5123/shop")
