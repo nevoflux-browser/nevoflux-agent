@@ -6,6 +6,7 @@ pub mod oracle;
 pub mod privacy;
 pub mod render;
 pub mod rpc;
+pub mod signals;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod visibility;
