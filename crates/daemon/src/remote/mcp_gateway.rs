@@ -90,8 +90,17 @@ impl McpGateway {
         match session.verifier.accept(&frame) {
             Ok(message) => match serde_json::from_value::<RxJsonRpcMessage<RoleServer>>(message) {
                 Ok(msg) => {
-                    if session.inbound.send(msg).await.is_err() {
-                        tracing::debug!(target: "remote", channel = %self.id, "MCP session already gone");
+                    // Never wait here: `live` is held, and a stalled rmcp
+                    // must not keep end_session from tearing the session
+                    // down. A full buffer means the agent is flooding or
+                    // rmcp is stuck; the frame is dropped (its counter is
+                    // already spent, so a resend is refused as a replay).
+                    if let Err(e) = session.inbound.try_send(msg) {
+                        if e.is_full() {
+                            tracing::warn!(target: "remote", channel = %self.id, "MCP session overloaded; frame dropped");
+                        } else {
+                            tracing::debug!(target: "remote", channel = %self.id, "MCP session already gone");
+                        }
                     }
                 }
                 Err(e) => {
@@ -427,12 +436,49 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_reflected_frame_is_ignored() {
         let (gw, sink) = build();
-        let (_ch, _n) = handshake(&gw, &sink, 1).await;
-        let count = sink.frames().len();
-        let own = sink.frames().last().cloned().unwrap();
-        gw.on_wire_in(&sealed(&KEY, own)).await;
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(sink.frames().len(), count, "nothing answers a reflection");
+        let (ch, n) = handshake(&gw, &sink, 1).await;
+        // A head-to-controller envelope reflected back, carrying a real request.
+        let reflected = sealed(
+            &KEY,
+            json!({"d": "h2c", "n": n, "ch": ch, "m": request(20, "tools/list", json!({}))}),
+        );
+        gw.on_wire_in(&reflected).await;
+        // Positive control: the session is alive, and anything queued earlier
+        // on the same ordered path would have been answered before this.
+        gw.on_wire_in(&c2h(n, &ch, request(21, "tools/list", json!({}))))
+            .await;
+        wait_for(&sink, |f| f["m"]["id"] == json!(21))
+            .await
+            .expect("session still alive");
+        assert_eq!(answers(&sink, 20), 0, "nothing answers a reflection");
+    }
+
+    /// rmcp never reads (its end of the buffer is kept but idle), as when it is
+    /// wedged on a stalled socket. Frames beyond the buffer must neither block
+    /// the reader nor keep the session from being torn down.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stalled_session_can_still_be_torn_down() {
+        let (gw, _sink) = build();
+        let challenge = new_challenge();
+        let (tx, _idle_rx) = mpsc::channel::<RxJsonRpcMessage<RoleServer>>(BUFFER);
+        *gw.live.lock().await = Some(Live {
+            verifier: InboundVerifier::new(challenge.clone()),
+            inbound: tx,
+            cancel: CancellationToken::new(),
+        });
+        for i in 0..(BUFFER as u64 * 3) {
+            let wire = c2h(i, &challenge, request(100 + i, "ping", json!({})));
+            tokio::time::timeout(Duration::from_secs(2), gw.on_wire_in(&wire))
+                .await
+                .expect("a flood never blocks the reader");
+        }
+        tokio::time::timeout(Duration::from_secs(2), gw.on_wire_in(&presence(0)))
+            .await
+            .expect("teardown is not stuck behind a stalled session");
+        assert!(gw.live.lock().await.is_none());
+        tokio::time::timeout(Duration::from_secs(2), gw.on_disconnected())
+            .await
+            .expect("disconnect completes");
     }
 
     #[tokio::test(flavor = "multi_thread")]
