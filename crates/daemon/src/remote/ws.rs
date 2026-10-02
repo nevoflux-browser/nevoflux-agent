@@ -534,6 +534,107 @@ async fn serve_control(
     }
 }
 
+/// Keep an agent pairing's MCP channel dialled (design §3).
+///
+/// Shaped like [`run_control_socket`]: same reconnect policy, same keepalive.
+/// The one addition is telling the gateway when the socket drops, because an
+/// MCP session must not outlive the connection that carried its challenge.
+pub async fn run_mcp_socket(
+    relay_base: &str,
+    channel_id: &str,
+    account_base: String,
+    account_token: String,
+    sink: Arc<WsSink>,
+    gateway: Arc<super::mcp_gateway::McpGateway>,
+    cancel: CancellationToken,
+) {
+    let dial = async {
+        let mut policy = ReconnectPolicy::new();
+        loop {
+            let token = match super::account::mint_do_jwt(&account_base, &account_token).await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(target: "remote", "mint agent relay JWT failed: {e}");
+                    tokio::time::sleep(policy.on_failure().wait).await;
+                    continue;
+                }
+            };
+            let url = format!("{relay_base}/?c={channel_id}&t={token}");
+
+            match connect_async(url.as_str()).await {
+                Ok((ws, _resp)) => {
+                    tracing::info!(target: "remote", "agent relay connected (channel {channel_id})");
+                    policy.on_connected();
+                    let (write, read) = ws.split();
+                    sink.set(write).await;
+                    let up = Instant::now();
+                    serve_mcp(read, &sink, &gateway).await;
+                    sink.clear().await;
+                    gateway.on_disconnected().await;
+                    if up.elapsed() >= STABLE_CONNECTION {
+                        policy.on_stable();
+                        tokio::time::sleep(BASE_BACKOFF).await;
+                    } else {
+                        tokio::time::sleep(policy.on_failure().wait).await;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(target: "remote", "agent relay connect failed: {e}");
+                    tokio::time::sleep(policy.on_failure().wait).await;
+                }
+            }
+        }
+    };
+
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            tracing::info!(target: "remote", "agent channel {channel_id} closed");
+        }
+        _ = dial => {}
+    }
+    sink.clear().await;
+    gateway.on_disconnected().await;
+}
+
+/// Pump one connected agent socket until it stops leading anywhere.
+async fn serve_mcp(mut read: WsRead, sink: &WsSink, gateway: &Arc<super::mcp_gateway::McpGateway>) {
+    let mut last_inbound = Instant::now();
+    let mut ticker = tokio::time::interval(PING_INTERVAL);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    ticker.tick().await;
+
+    loop {
+        tokio::select! {
+            item = read.next() => match item {
+                Some(Ok(msg)) => {
+                    last_inbound = Instant::now();
+                    if let Some(wire) = message_to_wire(msg) {
+                        // Awaited in place: frames of one channel are handled
+                        // strictly one at a time.
+                        gateway.on_wire_in(&wire).await;
+                    }
+                }
+                Some(Err(e)) => {
+                    tracing::warn!(target: "remote", "agent socket error: {e} - reconnecting");
+                    return;
+                }
+                None => {
+                    tracing::warn!(target: "remote", "agent relay disconnected - reconnecting");
+                    return;
+                }
+            },
+            _ = ticker.tick() => match assess(last_inbound.elapsed()) {
+                Liveness::Dead => {
+                    tracing::warn!(target: "remote", "agent relay silent for {SILENT_DEADLINE:?} - reconnecting");
+                    return;
+                }
+                Liveness::Ping => sink.ping().await,
+            },
+        }
+    }
+}
+
 /// The relay channel that carries this session's media.
 ///
 /// A sibling of the chat channel rather than the same one. The relay routes by
@@ -915,7 +1016,7 @@ mod tests {
         let cancel = CancellationToken::new();
 
         let task = tokio::spawn(run_gateway(
-            "ws://127.0.0.1:1",          // nothing listens
+            "ws://127.0.0.1:1", // nothing listens
             "chan-cancel-loop",
             "http://127.0.0.1:1".into(), // and the mint refuses at once
             "token".into(),
@@ -994,10 +1095,7 @@ mod tests {
             async fn page(&self, _: u32) -> Vec<super::super::session_list::StoredSession> {
                 Vec::new()
             }
-            async fn by_ids(
-                &self,
-                _: &[String],
-            ) -> Vec<super::super::session_list::StoredSession> {
+            async fn by_ids(&self, _: &[String]) -> Vec<super::super::session_list::StoredSession> {
                 Vec::new()
             }
         }
@@ -1048,5 +1146,41 @@ mod tests {
             .await
             .expect("cancelling must end the media loop")
             .expect("the task must finish without panicking");
+    }
+
+    #[tokio::test]
+    async fn cancelling_ends_the_mcp_loop() {
+        use crate::remote::mcp_gateway::McpGateway;
+        use crate::remote::mcp_tools::UnavailableBackend;
+
+        let sink = Arc::new(WsSink::new());
+        let gw = Arc::new(McpGateway::new(
+            None,
+            sink.clone(),
+            Arc::new(UnavailableBackend),
+            "c-1",
+        ));
+        let cancel = CancellationToken::new();
+        let task = {
+            let (s, g, c) = (sink.clone(), gw.clone(), cancel.clone());
+            tokio::spawn(async move {
+                run_mcp_socket(
+                    "ws://127.0.0.1:1",
+                    "c-1",
+                    "http://127.0.0.1:1".into(),
+                    "tok".into(),
+                    s,
+                    g,
+                    c,
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the loop ends when cancelled")
+            .unwrap();
     }
 }

@@ -362,8 +362,7 @@ pub async fn open_control_channel_with_token(
     // channel, so nothing else would ever stop this task.
     gateway.spawn_projector(cancel.clone());
 
-    let relay = std::env::var("NEVOFLUX_RELAY_URL")
-        .unwrap_or_else(|_| "wss://relay.nevoflux.app".to_string());
+    let relay = relay_base();
     let handle = ChannelHandle {
         gateway_id: super::gateway::RemoteGateway::id(gateway.as_ref()).to_string(),
         portal: None,
@@ -380,7 +379,14 @@ pub async fn open_control_channel_with_token(
         );
         tokio::spawn(async move {
             super::ws::run_control_socket(
-                &relay, &ch, base, account_token, sink, gw, commands, cancel,
+                &relay,
+                &ch,
+                base,
+                account_token,
+                sink,
+                gw,
+                commands,
+                cancel,
             )
             .await;
         });
@@ -437,11 +443,104 @@ pub fn control_deps() -> Option<&'static ControlDeps> {
     CONTROL_DEPS.get()
 }
 
+/// Where relays are dialled. One place, so a pairing block and the socket
+/// that serves it can never disagree.
+pub fn relay_base() -> String {
+    std::env::var("NEVOFLUX_RELAY_URL").unwrap_or_else(|_| "wss://relay.nevoflux.app".to_string())
+}
+
+/// Bring up an agent pairing's MCP channel (design §3).
+pub async fn open_mcp_channel(
+    pairing: &super::pairing::Pairing,
+    backend: Arc<dyn super::mcp_tools::AgentToolBackend>,
+    registry: &Arc<Mutex<GatewayRegistry>>,
+) -> Result<ChannelHandle, OpenError> {
+    open_mcp_channel_with_token(pairing, backend, stored_account_token(), registry).await
+}
+
+/// The sequence itself, with the account token passed in so it is testable.
+pub async fn open_mcp_channel_with_token(
+    pairing: &super::pairing::Pairing,
+    backend: Arc<dyn super::mcp_tools::AgentToolBackend>,
+    account_token: Option<String>,
+    registry: &Arc<Mutex<GatewayRegistry>>,
+) -> Result<ChannelHandle, OpenError> {
+    let account_token = account_token.ok_or(OpenError::NotLoggedIn)?;
+    let base = std::env::var("NEVOFLUX_ACCOUNT_URL")
+        .unwrap_or_else(|_| "https://nevoflux.app".to_string());
+    super::account::mint_do_jwt(&base, &account_token)
+        .await
+        .map_err(|e| OpenError::JwtMint(e.to_string()))?;
+
+    let channel_id = pairing.control_channel_id.clone();
+    let sink = Arc::new(super::ws::WsSink::new());
+    let gateway = Arc::new(super::mcp_gateway::McpGateway::new(
+        pairing.control_key(),
+        sink.clone(),
+        backend,
+        &channel_id,
+    ));
+    registry.lock().await.register(gateway.clone());
+    let cancel = CancellationToken::new();
+    let handle = ChannelHandle {
+        gateway_id: super::gateway::RemoteGateway::id(gateway.as_ref()).to_string(),
+        portal: None,
+        cancel: cancel.clone(),
+        registry: registry.clone(),
+    };
+    {
+        let (relay, ch, sink, gw, cancel) = (
+            relay_base(),
+            channel_id.clone(),
+            sink.clone(),
+            gateway.clone(),
+            cancel.clone(),
+        );
+        tokio::spawn(async move {
+            super::ws::run_mcp_socket(&relay, &ch, base, account_token, sink, gw, cancel).await;
+        });
+    }
+    if let Some(previous) = channels().lock().await.insert(channel_id, handle.clone()) {
+        previous.close().await;
+    }
+    Ok(handle)
+}
+
+/// Pair an AI agent: mint one channel, bring it up, persist it.
+///
+/// Returns the pairing and the code. Like [`pair_device`], the code is shown
+/// once and never stored.
+pub async fn pair_agent(
+    deps: &ControlDeps,
+) -> Result<(super::pairing::Pairing, String), OpenError> {
+    let code = crate::share::password::generate_password();
+    let pairing = super::pairing::mint_agent_blocking(code.clone())
+        .await
+        .ok_or_else(|| OpenError::JwtMint("could not derive the channel key".into()))?;
+    let handle = open_for_pairing(deps, &pairing).await?;
+    if let Err(e) = deps.pairings.add(pairing.clone()) {
+        handle.close().await;
+        return Err(OpenError::JwtMint(format!(
+            "could not store the pairing: {e}"
+        )));
+    }
+    Ok((pairing, code))
+}
+
 /// Bring up one pairing's control channel.
 pub async fn open_for_pairing(
     deps: &ControlDeps,
     pairing: &super::pairing::Pairing,
 ) -> Result<ChannelHandle, OpenError> {
+    if pairing.is_agent() {
+        // M1: the channel and handshake are real; tools arrive in M2.
+        return open_mcp_channel(
+            pairing,
+            Arc::new(super::mcp_tools::UnavailableBackend),
+            &deps.registry,
+        )
+        .await;
+    }
     let injector: Arc<dyn super::inject::Injector> = Arc::new(super::inject::ChannelInjector::new(
         deps.msg_tx.clone(),
         deps.injector_proxy_id.clone(),
@@ -592,7 +691,9 @@ pub async fn pair_device(
     if let Err(e) = deps.pairings.add(pairing.clone()) {
         // Nothing was saved, so nothing may be left dialling either.
         handle.close().await;
-        return Err(OpenError::JwtMint(format!("could not store the pairing: {e}")));
+        return Err(OpenError::JwtMint(format!(
+            "could not store the pairing: {e}"
+        )));
     }
     Ok((pairing, code))
 }
@@ -747,5 +848,31 @@ mod tests {
         std::env::remove_var("NEVOFLUX_ACCOUNT_URL");
         assert!(matches!(err, OpenError::JwtMint(_)));
         assert!(registry.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_agent_channel_refuses_when_not_logged_in() {
+        let registry = Arc::new(Mutex::new(crate::remote::gateway::GatewayRegistry::new()));
+        let pairing = crate::remote::pairing::mint_agent("A-BCDE-FGHJ-KMNP").unwrap();
+        let outcome = open_mcp_channel_with_token(
+            &pairing,
+            Arc::new(crate::remote::mcp_tools::UnavailableBackend),
+            None,
+            &registry,
+        )
+        .await;
+        assert!(matches!(outcome, Err(OpenError::NotLoggedIn)));
+        assert!(
+            registry.lock().await.is_empty(),
+            "nothing registered on refusal"
+        );
+    }
+
+    #[test]
+    fn the_relay_defaults_to_production() {
+        // Only meaningful when the override is absent, which is the CI default.
+        if std::env::var("NEVOFLUX_RELAY_URL").is_err() {
+            assert_eq!(relay_base(), "wss://relay.nevoflux.app");
+        }
     }
 }

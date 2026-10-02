@@ -9343,6 +9343,50 @@ async fn handle_chat_message(
                     }
                 }
 
+                // --- Pair an AI agent (design §4.1): one MCP channel, and a
+                //     four-line block the person pastes into the agent.
+                "remote.pair_agent" => {
+                    let fail = |code: &str, message: String| {
+                        serde_json::json!({
+                            "type": "system_response",
+                            "payload": {
+                                "request_id": request_id,
+                                "command": "remote.pair_agent",
+                                "success": false,
+                                "error": { "code": code, "message": message }
+                            }
+                        })
+                    };
+                    match crate::remote::start::control_deps() {
+                        None => fail("NOT_READY", "the daemon is still starting".into()),
+                        Some(deps) => match crate::remote::start::pair_agent(deps).await {
+                            Err(e) => fail("PAIR_FAILED", e.to_string()),
+                            Ok((pairing, code)) => {
+                                let relay = crate::remote::start::relay_base();
+                                let block = crate::remote::connect_block::render_agent_block(
+                                    &relay,
+                                    &pairing.control_channel_id,
+                                    &code,
+                                );
+                                serde_json::json!({
+                                    "type": "system_response",
+                                    "payload": {
+                                        "request_id": request_id,
+                                        "command": "remote.pair_agent",
+                                        "success": true,
+                                        "data": {
+                                            "channel_id": pairing.control_channel_id,
+                                            "pairing_code": code,
+                                            "relay": relay,
+                                            "block": block,
+                                        }
+                                    }
+                                })
+                            }
+                        },
+                    }
+                }
+
                 // --- The paired devices, for the sidebar to list and revoke.
                 //     Codes and keys are deliberately absent: this answers "what
                 //     can reach this machine", which needs no secret.
@@ -9354,6 +9398,7 @@ async fn handle_chat_message(
                         .map(|p| {
                             serde_json::json!({
                                 "control_channel_id": p.control_channel_id,
+                                "kind": if p.is_agent() { "agent" } else { "device" },
                                 "label": p.label,
                                 "created_at": p.created_at,
                                 "can_be_woken": p.push.is_some(),
