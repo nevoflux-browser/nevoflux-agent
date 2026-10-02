@@ -10,6 +10,53 @@ import sys
 MISSING = {"harness_error", "timeout", "provider_error"}
 
 
+def jev_summary(rows) -> dict:
+    """Jev numbers from the session logs (spec §8.3): grades, fallbacks,
+    per-step signals and the error of H, corrections, recalls.
+
+    H is "tool-using steps still needed" asked at step s; the actual value is
+    last step of the turn - s - 1 (the last step is the answer).
+    """
+    vis, corrections = {}, {}
+    fallbacks = signals = recalls = 0
+    errors = []
+    for r in rows:
+        events = [json.loads(l) for l in (r.get("session_jsonl") or "").splitlines() if l.strip()]
+        turn, last_step, asked = None, {}, []
+        for e in events:
+            t = e.get("type")
+            if t == "turn/start":
+                turn = e.get("turn")
+            elif t == "step/start":
+                last_step[turn] = max(last_step.get(turn, 0), e.get("step", 0))
+            elif t == "jev/visibility":
+                k = f"{e.get('level')}/{e.get('graded_by')}"
+                vis[k] = vis.get(k, 0) + 1
+            elif t == "jev/fallback":
+                fallbacks += 1
+            elif t == "jev/signals":
+                signals += 1
+                if e.get("h") is not None:
+                    asked.append((turn, e["step"], e["h"]))
+            elif t == "context/correction":
+                for trig in e.get("triggers") or []:
+                    corrections[trig] = corrections.get(trig, 0) + 1
+            elif t == "tool/call" and e.get("name") == "recall":
+                recalls += 1
+        for turn_, step, h in asked:
+            if turn_ in last_step:
+                errors.append(h - max(0, last_step[turn_] - step - 1))
+    return {
+        "visibility": vis,
+        "fallbacks": fallbacks,
+        "signals": signals,
+        "h_mae": statistics.mean(abs(x) for x in errors) if errors else None,
+        "h_bias": statistics.mean(errors) if errors else None,
+        "corrections": corrections,
+        "recalls": recalls,
+    }
+
+
 def summarize(rows) -> dict:
     # A resumed run re-runs missing trials; only the latest row per trial counts.
     latest = {}
@@ -27,6 +74,7 @@ def summarize(rows) -> dict:
     total_input = sum(b.get("input", 0) for b in buckets)
     cache_read = sum(b.get("cache_read") or 0 for b in buckets)
     return {
+        "jev": jev_summary(rows),
         "per_rep_score": per_rep,
         "mean": statistics.mean(per_rep) if per_rep else 0.0,
         "sd": sd,

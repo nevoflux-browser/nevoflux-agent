@@ -63,3 +63,43 @@ class CalibrateTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def ev(**kw):
+    import json
+    return json.dumps(kw)
+
+
+class JevSummaryTest(unittest.TestCase):
+    def test_jev_summary_reads_the_session_log(self):
+        log = "\n".join([
+            ev(type="turn/start", turn=1),
+            ev(type="step/start", step=0, turn=1),
+            ev(type="tool/call", id="a", name="read", args={}),
+            ev(type="jev/signals", step=0, h=5, drift=0.1, irrelevant_bulk=None, needs_action=0.9, elapsed_ms=300),
+            ev(type="step/start", step=1, turn=1),
+            ev(type="jev/visibility", id="c1", tool="read", bytes=9000, level="short", graded_by="jev", kept_lines=0, elapsed_ms=400),
+            ev(type="jev/fallback", point="visibility", reason="timeout", elapsed_ms=801),
+            ev(type="step/start", step=2, turn=1),
+            ev(type="jev/signals", step=2, h=1, drift=0.9, irrelevant_bulk=None, needs_action=0.2, elapsed_ms=280),
+            ev(type="context/correction", step=3, triggers=["drift"], entries=1),
+            ev(type="step/start", step=3, turn=1),
+            ev(type="tool/call", id="b", name="recall", args={"chunk_id": "c1"}),
+            ev(type="step/start", step=4, turn=1),
+            ev(type="turn/end", turn=1),
+        ])
+        r = row(0, "a", True)
+        r["session_jsonl"] = log
+        j = summarize([r])["jev"]
+        self.assertEqual(j["visibility"], {"short/jev": 1})
+        self.assertEqual(j["fallbacks"], 1)
+        self.assertEqual(j["signals"], 2)
+        # last step 4 is the answer: tool steps left after 0 = 3, after 2 = 1
+        self.assertAlmostEqual(j["h_mae"], 1.0)   # (|5-3| + |1-1|) / 2
+        self.assertAlmostEqual(j["h_bias"], 1.0)  # (2 + 0) / 2
+        self.assertEqual(j["corrections"], {"drift": 1})
+        self.assertEqual(j["recalls"], 1)
+
+    def test_no_jev_events_gives_empty_numbers(self):
+        j = summarize([row(0, "a", True)])["jev"]
+        self.assertEqual((j["signals"], j["h_mae"], j["h_bias"]), (0, None, None))
