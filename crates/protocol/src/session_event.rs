@@ -319,6 +319,26 @@ pub enum SessionEventPayload {
         /// Failed attempts listed in the note.
         entries: u32,
     },
+    /// Earlier turns were kept or rebuilt (spec §5.7 rebuild economics).
+    #[serde(rename = "context/rebuild")]
+    ContextRebuild {
+        /// `ttl_expired`, `cost_formula` or `polluted`.
+        reason: String,
+        /// `rebuild`, `keep` or `keep_fallback` (Jev failed: kept, §5.8).
+        decision: String,
+        /// Cost of keeping, in uncached-input-token units.
+        keep_cost: f64,
+        /// Cost of rebuilding, same units, Jev tokens included.
+        rebuild_cost: f64,
+        /// Remaining requests that read the prefix (Jev's steps + 1).
+        h: u32,
+        /// Estimated tokens of the history kept.
+        before_tokens: u64,
+        /// Estimated tokens of the history rebuilt (= before when kept).
+        after_tokens: u64,
+        /// Chunks re-graded by Jev.
+        regraded: u32,
+    },
 }
 
 impl SessionEventPayload {
@@ -348,6 +368,7 @@ impl SessionEventPayload {
             Self::JevVisibility { .. } => "jev/visibility",
             Self::JevSignals { .. } => "jev/signals",
             Self::ContextCorrection { .. } => "context/correction",
+            Self::ContextRebuild { .. } => "context/rebuild",
         }
     }
 }
@@ -395,6 +416,26 @@ pub fn tools_hash(names: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_rebuild_event_wire_shape() {
+        let p = SessionEventPayload::ContextRebuild {
+            reason: "ttl_expired".into(),
+            decision: "rebuild".into(),
+            keep_cost: 153_000.0,
+            rebuild_cost: 59_500.0,
+            h: 10,
+            before_tokens: 90_000,
+            after_tokens: 35_000,
+            regraded: 12,
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["type"], "context/rebuild");
+        assert_eq!(v["decision"], "rebuild");
+        assert_eq!(p.type_str(), "context/rebuild");
+        let back: SessionEventPayload = serde_json::from_value(v).unwrap();
+        assert_eq!(back, p);
+    }
 
     #[test]
     fn jev_visibility_carries_its_call_and_kept_ranges() {
