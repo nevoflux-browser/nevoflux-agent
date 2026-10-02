@@ -133,7 +133,7 @@ pub async fn render(env: &RenderEnv<'_>, req: &RenderRequest<'_>) -> Option<Rend
     }
     let grade = combine(&ps, &answers);
     if grade.level == Level::Full && content.len() <= req.max_bytes {
-        log(env, req, &chunk, Level::Full, 0, "jev", started);
+        log(env, req, &chunk, Level::Full, &[], "jev", started);
         return Some(named(&chunk, req.content.to_string()));
     }
     Some(named(
@@ -174,20 +174,8 @@ fn finish(
         bytes: req.content.len(),
         graded_by,
     };
-    let kept_lines = if level == Level::Long {
-        kept.iter().map(|r| r.len()).sum()
-    } else {
-        0
-    };
-    log(
-        env,
-        req,
-        chunk,
-        level,
-        kept_lines as u64,
-        graded_by,
-        started,
-    );
+    let kept: &[std::ops::Range<usize>] = if level == Level::Long { kept } else { &[] };
+    log(env, req, chunk, level, kept, graded_by, started);
     render_level(level, req.content, lines, kept, &meta, req.max_bytes)
 }
 
@@ -196,7 +184,7 @@ fn log(
     req: &RenderRequest<'_>,
     chunk: &str,
     level: Level,
-    kept_lines: u64,
+    kept: &[std::ops::Range<usize>],
     graded_by: &str,
     started: Instant,
 ) {
@@ -207,8 +195,13 @@ fn log(
             bytes: req.content.len() as u64,
             level: level.as_str().to_string(),
             graded_by: graded_by.to_string(),
-            kept_lines,
+            kept_lines: kept.iter().map(|r| r.len() as u64).sum(),
             elapsed_ms: started.elapsed().as_millis() as u64,
+            call_id: Some(req.tool_call_id.to_string()),
+            kept: kept
+                .iter()
+                .map(|r| [r.start as u64, r.end as u64])
+                .collect(),
         });
     }
 }
@@ -393,6 +386,34 @@ mod tests {
         let (chunk, stored) = r.stored.iter().next().expect("stored");
         assert!(out.contains(&format!("recall(\"{chunk}\")")), "{out}");
         assert_eq!(stored, &content);
+    }
+
+    #[tokio::test]
+    async fn a_long_grade_logs_its_call_and_kept_lines() {
+        let (url, _) = answering(answer("long", &["b001"]), Duration::ZERO).await;
+        let db = Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        let w = Arc::new(SessionEventWriter::new(db.clone(), "s1".into()));
+        run(
+            &jev(&url, 2000),
+            "read",
+            serde_json::json!({}),
+            None,
+            &hundred_lines(),
+            true,
+            Some(w),
+        )
+        .await;
+        let events = nevoflux_storage::repositories::SessionEventRepository::new(&db)
+            .list("s1")
+            .unwrap();
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.payload,
+                SessionEventPayload::JevVisibility { call_id: Some(c), kept, .. }
+                    if c == "call_1" && kept == &vec![[25u64, 50u64]]
+            )),
+            "{events:?}"
+        );
     }
 
     #[tokio::test]

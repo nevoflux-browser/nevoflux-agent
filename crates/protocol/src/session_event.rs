@@ -281,12 +281,20 @@ pub enum SessionEventPayload {
         bytes: u64,
         /// `hide`, `short`, `long` or `full`.
         level: String,
-        /// `jev`, `fallback` (Jev failed) or `sensitive` (never sent, §5.8).
+        /// `jev`, `fallback` (Jev failed), `sensitive` (never sent, §5.8) or
+        /// `rebuild` (re-graded against a later query).
         graded_by: String,
         /// Lines kept by a long grade, 0 otherwise.
         kept_lines: u64,
         /// Time spent grading.
         elapsed_ms: u64,
+        /// The tool call the chunk belongs to (absent in logs before P2-3b).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
+        /// Kept line ranges `[start, end)` of a long grade, in pseudo-lines,
+        /// so the rendition can be rebuilt from the stored text.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        kept: Vec<[u64; 2]>,
     },
     /// Jev's per-step signals (request ①, spec §5.4), logged when they land.
     #[serde(rename = "jev/signals")]
@@ -389,6 +397,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn jev_visibility_carries_its_call_and_kept_ranges() {
+        let p = SessionEventPayload::JevVisibility {
+            id: "c1".into(),
+            tool: "read".into(),
+            bytes: 9000,
+            level: "long".into(),
+            graded_by: "jev".into(),
+            kept_lines: 25,
+            elapsed_ms: 400,
+            call_id: Some("toolu_1".into()),
+            kept: vec![[25, 50]],
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["call_id"], "toolu_1");
+        assert_eq!(v["kept"][0][1], 50);
+        let back: SessionEventPayload = serde_json::from_value(v).unwrap();
+        assert_eq!(back, p);
+    }
+
+    #[test]
+    fn an_old_jev_visibility_event_still_parses() {
+        let v = serde_json::json!({"type": "jev/visibility", "id": "c1", "tool": "read", "bytes": 9000,
+            "level": "short", "graded_by": "jev", "kept_lines": 0, "elapsed_ms": 1});
+        let p: SessionEventPayload = serde_json::from_value(v).unwrap();
+        assert!(matches!(p, SessionEventPayload::JevVisibility { call_id: None, ref kept, .. } if kept.is_empty()));
+    }
+
+    #[test]
     fn jev_signals_event_wire_shape() {
         let p = SessionEventPayload::JevSignals {
             step: 3,
@@ -431,6 +467,8 @@ mod tests {
             graded_by: "jev".into(),
             kept_lines: 25,
             elapsed_ms: 412,
+            call_id: None,
+            kept: vec![],
         };
         let v = serde_json::to_value(&p).unwrap();
         assert_eq!(v["type"], "jev/visibility");
