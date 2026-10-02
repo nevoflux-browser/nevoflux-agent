@@ -269,7 +269,29 @@ cache hit 98.0%, `browser_eval_js` 26 (same count method as above).
 Rule: if a rerun regresses with no code cause, compare the snapshot's
 `viewport:` line and `stats.occluded` against the passing run first.
 
-## Known gaps
+## Jev P2-2 (visibility), 2026-10-02
+
+Agent `feat/jev-p2-2`: tool results over 4 KB in the native loop are graded
+by Jev (hide/short/long/full, block Nouls at 0.3) and rendered before they
+enter the context; the full text is spilled and `recall(chunk_id)` brings it
+back; aged-shrink is off while visibility is on. Sensitive or unknown pages
+are never sent (local rule, `graded_by: sensitive`); Jev failures fall back to
+short + recall (`graded_by: fallback`).
+
+**J20, k=1, Jev off** (`eval/results/p2-2-off`): **21/21**, 51 s per trial,
+cache hit 97.3%, main input 3.00M, `browser_eval_js` 36 — unchanged.
+
+**J20, k=1, Jev on** (`eval/results/p2-2-on`): **21/21**, 53 s per trial,
+cache hit 97.2%, main input 3.30M (+10%), `browser_eval_js` 49. **Jev was
+never asked**: one result went over 4 KB and it was graded `sensitive`, because
+every eval site is served from 127.0.0.1, which the privacy rule treats as
+intranet (§5.8). The model used `recall` once on it. The +10% input is the
+cost of aged-shrink being off with nothing graded in its place.
+
+Consequence: neither J20 nor the `jev` task set can measure Jev grading (or
+G2) while the sites are on loopback; that needs a decision (a public host for
+the eval sites, or an eval-only exception to the loopback rule).
+
 
 - Agent-loop tasks have no deadline on the daemon side: `wall_clock_secs`
   bounds only the script backend, and `DELETE /tasks/:id` only marks the task
