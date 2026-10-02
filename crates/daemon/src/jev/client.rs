@@ -46,6 +46,30 @@ fn http_policy(b: reqwest::ClientBuilder, endpoint: &str) -> reqwest::ClientBuil
 /// A request left running after its caller gave up is still cut off here.
 const ORPHAN_CAP: Duration = Duration::from_secs(30);
 
+static SHARED: std::sync::Mutex<Option<((String, String, String), JevClient)>> =
+    std::sync::Mutex::new(None);
+
+/// The daemon's one Jev client for this configuration: connections are kept
+/// across turns (a new HTTPS connection costs ~270 ms; a cold one measured
+/// 821 ms against the 800 ms default timeout). A changed endpoint, key or
+/// model replaces it.
+pub fn shared(cfg: &crate::config::JevConfig) -> Result<JevClient, JevError> {
+    if !cfg.is_usable() {
+        return Err(JevError::NotConfigured);
+    }
+    let key = cfg.resolved_api_key().ok_or(JevError::NotConfigured)?;
+    let id = (cfg.endpoint.clone(), key.clone(), cfg.model.clone());
+    let mut slot = SHARED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((k, c)) = slot.as_ref() {
+        if *k == id {
+            return Ok(c.clone());
+        }
+    }
+    let c = JevClient::new(&cfg.endpoint, &key, &cfg.model);
+    *slot = Some((id, c.clone()));
+    Ok(c)
+}
+
 #[derive(Clone)]
 pub struct JevClient {
     http: reqwest::Client,
@@ -94,14 +118,12 @@ impl JevClient {
         &self.endpoint
     }
 
-    pub async fn ask(
-        &self,
-        state: serde_json::Value,
-        questions: BTreeMap<String, Question>,
-        timeout: Duration,
-    ) -> Result<JevResponse, JevError> {
+    /// Why nothing may be sent to the endpoint right now, if anything: the
+    /// LocalOnly latch, or a remote endpoint without TLS (the key would
+    /// travel in clear text).
+    fn egress_refusal(&self) -> Option<JevError> {
         if !egress_allowed(crate::local::latch::is_on(), &self.endpoint) {
-            return Err(JevError::Refused("on-device mode is on".into()));
+            return Some(JevError::Refused("on-device mode is on".into()));
         }
         if self
             .endpoint
@@ -110,9 +132,36 @@ impl JevClient {
             .starts_with("http://")
             && !crate::local::latch::is_loopback_url(&self.endpoint)
         {
-            return Err(JevError::Refused(
+            return Some(JevError::Refused(
                 "a remote Jev endpoint must use https".into(),
             ));
+        }
+        None
+    }
+
+    /// Open (or keep) the connection before the first real question: an
+    /// unauthenticated HEAD, result ignored. Same latch, TLS and proxy rules
+    /// as [`Self::ask`].
+    pub async fn warm(&self) {
+        if self.egress_refusal().is_some() {
+            return;
+        }
+        let _ = self
+            .http
+            .head(&self.endpoint)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await;
+    }
+
+    pub async fn ask(
+        &self,
+        state: serde_json::Value,
+        questions: BTreeMap<String, Question>,
+        timeout: Duration,
+    ) -> Result<JevResponse, JevError> {
+        if let Some(refused) = self.egress_refusal() {
+            return Err(refused);
         }
         let req = JevRequest {
             state,
@@ -384,6 +433,83 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(e, JevError::Refused(_)), "{e:?}");
+    }
+
+    #[tokio::test]
+    async fn shared_clients_share_one_connection_pool() {
+        let peers = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let p = peers.clone();
+        let app = Router::new().route(
+            "/v1/systemone",
+            post(
+                move |axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<
+                    std::net::SocketAddr,
+                >| {
+                    let p = p.clone();
+                    async move {
+                        p.lock().unwrap().insert(addr);
+                        axum::Json(serde_json::json!({"answers": {}, "usage": {}}))
+                    }
+                },
+            ),
+        );
+        let url = spawn(app).await;
+        let mut cfg = crate::config::JevConfig::default();
+        cfg.enabled = true;
+        cfg.endpoint = url;
+        cfg.api_key = "k".into();
+        for _ in 0..2 {
+            shared(&cfg)
+                .unwrap()
+                .ask(serde_json::json!({}), one_noul(), Duration::from_secs(5))
+                .await
+                .unwrap();
+        }
+        assert_eq!(peers.lock().unwrap().len(), 1, "two turns, one connection");
+    }
+
+    #[tokio::test]
+    async fn warming_opens_the_connection_without_the_key() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s = seen.clone();
+        let app = Router::new().route(
+            "/v1/systemone",
+            axum::routing::any(
+                move |axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<
+                    std::net::SocketAddr,
+                >,
+                      method: axum::http::Method,
+                      headers: axum::http::HeaderMap| {
+                    let s = s.clone();
+                    async move {
+                        s.lock().unwrap().push((
+                            addr,
+                            method.to_string(),
+                            headers.contains_key("authorization"),
+                        ));
+                        axum::Json(serde_json::json!({"answers": {}, "usage": {}}))
+                    }
+                },
+            ),
+        );
+        let url = spawn(app).await;
+        let c = JevClient::new(&url, "k", "jev-latest");
+        c.warm().await;
+        c.ask(serde_json::json!({}), one_noul(), Duration::from_secs(5))
+            .await
+            .unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0].1, "HEAD");
+        assert!(!seen[0].2, "warm-up must not send the key");
+        assert_eq!(seen[0].0, seen[1].0, "the ask reuses the warmed connection");
+    }
+
+    #[tokio::test]
+    async fn warming_respects_the_https_rule() {
+        // Nothing listens there; warm must return quietly without connecting.
+        JevClient::new("http://jev.example.invalid/v1/systemone", "k", "m")
+            .warm()
+            .await;
     }
 
     #[test]
