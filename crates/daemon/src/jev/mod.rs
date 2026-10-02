@@ -2,6 +2,7 @@
 
 pub mod client;
 pub mod export;
+pub mod history;
 pub mod oracle;
 pub mod privacy;
 pub mod render;
