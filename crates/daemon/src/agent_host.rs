@@ -2281,6 +2281,62 @@ impl HostFunctions for DaemonHostFunctions {
         })
     }
 
+    fn rebuild_history(
+        &self,
+        req: &nevoflux_builtin_wasm::RebuildRequest<'_>,
+    ) -> Option<Vec<nevoflux_builtin_wasm::Message>> {
+        if !self.signals_active() {
+            return None;
+        }
+        let services = self.services.as_ref()?;
+        let session = self.session_id.clone()?;
+        let cfg = &self.config;
+        let wire = cfg
+            .llm
+            .active_provider()
+            .and_then(|p| cfg.llm.resolve_wire(p))?;
+        let mut events =
+            nevoflux_storage::repositories::SessionEventRepository::new(&services.database)
+                .list(&session)
+                .ok()?;
+        // Earlier turns only: this turn's messages stay as the loop has them.
+        if let Some(i) = events.iter().rposition(|e| {
+            matches!(
+                e.payload,
+                nevoflux_protocol::session_event::SessionEventPayload::TurnStart { .. }
+            )
+        }) {
+            events.truncate(i);
+        }
+        let h = self
+            .latest_signals
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().and_then(|s| s.h));
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let env = crate::jev::rebuild::RebuildEnv {
+            jev: &cfg.jev,
+            wire,
+            events,
+            query: req.query,
+            writer: self.event_writer().map(Arc::new),
+            stats: self.turn_stats.clone(),
+            opts: crate::jev::history::HistoryOpts {
+                max_messages: cfg.daemon.context.max_history_messages as usize,
+                max_bytes: 32_000,
+            },
+            now_ms,
+        };
+        let h = crate::jev::economics::remaining_requests(h);
+        let runtime = self.runtime.clone();
+        tokio::task::block_in_place(|| {
+            runtime.block_on(crate::jev::rebuild::polluted_rebuild(&env, h))
+        })
+    }
+
     fn record_correction(&self, step: u32, triggers: &[&str], entries: u32) {
         if let Some(w) = self.event_writer() {
             w.append(

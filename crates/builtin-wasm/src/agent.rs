@@ -1892,6 +1892,10 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
         // Entries already listed in a note: a new trigger kind over the same
         // attempts is the same episode, not a reason for another note.
         let mut noted: Vec<String> = Vec::new();
+        // Earlier-turn messages after the system prompt, and whether this run
+        // already asked for a polluted rebuild (at most once per turn).
+        let mut history_count = input.history.len();
+        let mut rebuilt = false;
 
         let mut iterations = 0;
         let mut final_text = String::new();
@@ -1946,6 +1950,40 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                 shrink_aged_tool_results_with(&mut messages, budget);
             }
 
+            // Polluted earlier turns (Jev's irrelevant bulk over θ, fresh):
+            // ask once per turn for a rebuild of them; this turn's messages
+            // stay as they are (spec §5.6.3, §5.7).
+            if signals && !rebuilt && step >= 1 && history_count > 1 {
+                let fresh_bulk = self.host.latest_signals().is_some_and(|s| {
+                    step <= s.step + 2 && s.irrelevant_bulk.is_some_and(|p| p > POLLUTION_THETA)
+                });
+                if fresh_bulk {
+                    rebuilt = true;
+                    if let Some(new) = self.host.rebuild_history(&crate::host::RebuildRequest {
+                        query: &input.user_message,
+                        reason: "polluted",
+                        history_len: history_count,
+                    }) {
+                        let old_end = 1 + history_count;
+                        let delta = new.len() as isize - history_count as isize;
+                        messages.splice(1..old_end, new.iter().cloned());
+                        chunks = chunks
+                            .into_iter()
+                            .map(|(k, v)| {
+                                if k >= old_end {
+                                    ((k as isize + delta) as usize, v)
+                                } else {
+                                    (k, v)
+                                }
+                            })
+                            .collect();
+                        history_count = new.len();
+                        self.history_anchor
+                            .set((history_count > 0).then(|| 1 + history_count));
+                    }
+                }
+            }
+
             // A polluted turn gets one correction note at the tail: at most
             // once per 3 steps, unless a kind of trigger not seen yet appears.
             if signals {
@@ -1954,6 +1992,7 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                     self.host.latest_signals().as_ref(),
                     POLLUTION_THETA,
                     step,
+                    messages.iter().map(|m| m.content.len()).sum(),
                 ) {
                     let new_kind = p.triggers.iter().any(|t| !correction_kinds.contains(t));
                     let new_entries =
@@ -2259,6 +2298,10 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                         result.content.hash(&mut h);
                         h.finish()
                     };
+                    let target = ["url", "file_path", "path"]
+                        .iter()
+                        .find_map(|k| tool_call.arguments[*k].as_str())
+                        .map(str::to_string);
                     action_log.push(crate::pollution::ActionRecord {
                         step,
                         tool: tool_call.name.clone(),
@@ -2266,6 +2309,8 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                         ok: result.success && class.is_none(),
                         error_class: class,
                         result_key,
+                        target,
+                        bytes: result.content.len(),
                     });
                 }
 
@@ -8962,6 +9007,95 @@ mod tests {
         let agent = session_log_agent(mock);
         agent.run(&input()).unwrap();
         assert_eq!(agent.host.captured_requests.borrow()[0].history_len, None);
+    }
+
+    fn reads(args: serde_json::Value) -> LlmResponse {
+        LlmResponse {
+            text: "".into(),
+            tool_calls: vec![a_tool_call("read", args)],
+            reasoning: None,
+        }
+    }
+
+    #[test]
+    fn stale_content_adds_a_correction() {
+        let mock = MockHostFunctions::new();
+        mock.signals.set(true);
+        *mock.read_text.borrow_mut() = Some("x".repeat(20_000));
+        mock.add_llm_response(reads(
+            serde_json::json!({"file_path": "a.txt", "offset": 1}),
+        ));
+        mock.add_llm_response(reads(serde_json::json!({"file_path": "a.txt"})));
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        agent.run(&session_log_input("go")).unwrap();
+        let c = agent.host.corrections.borrow();
+        assert_eq!(c.len(), 1, "{c:?}");
+        assert!(c[0].contains(&"stale_content".to_string()), "{c:?}");
+    }
+
+    fn polluted_run(steps: usize) -> (Agent<MockHostFunctions>, AgentInput) {
+        let mock = MockHostFunctions::new();
+        mock.signals.set(true);
+        *mock.latest.borrow_mut() = Some(crate::host::StepSignalsView {
+            step: 0,
+            drift: None,
+            irrelevant_bulk: Some(0.95),
+        });
+        *mock.rebuild_with.borrow_mut() = Some(vec![
+            Message::user("earlier (rebuilt)"),
+            Message::assistant("answer (rebuilt)"),
+        ]);
+        for i in 0..steps {
+            mock.add_llm_response(thinks(&format!("t{i}")));
+        }
+        mock.add_llm_response(says("done"));
+        let mut input = session_log_input("go");
+        input.history = vec![
+            Message::user("q1"),
+            Message::assistant("a1"),
+            Message::user("q2"),
+            Message::assistant("a2"),
+        ];
+        (session_log_agent(mock), input)
+    }
+
+    #[test]
+    fn a_mid_turn_rebuild_keeps_the_current_turn_verbatim() {
+        let (agent, input) = polluted_run(1);
+        agent.run(&input).unwrap();
+        let reqs = agent.host.captured_requests.borrow();
+        let before = &reqs[0].messages;
+        let after = &reqs[1].messages;
+        assert_eq!(before.len(), 6, "system + 4 history + user");
+        assert_eq!(after[1].content, "earlier (rebuilt)");
+        assert_eq!(after[2].content, "answer (rebuilt)");
+        // the current turn: the user message, then step 0's call and result
+        assert_eq!(after[3].content, before[5].content);
+        assert!(matches!(after[4].role, MessageRole::Assistant));
+        assert_eq!(after[4].tool_calls.len(), 1);
+        assert!(matches!(after[5].role, MessageRole::Tool));
+        assert_eq!(after.len(), 6);
+        assert_eq!(reqs[1].history_len, Some(3));
+        assert_eq!(
+            *agent.host.rebuild_asked.borrow(),
+            vec!["polluted".to_string()]
+        );
+    }
+
+    #[test]
+    fn rebuild_is_asked_at_most_once_per_turn() {
+        let (agent, input) = polluted_run(4);
+        agent.run(&input).unwrap();
+        assert_eq!(agent.host.rebuild_asked.borrow().len(), 1);
+    }
+
+    #[test]
+    fn with_signals_off_no_rebuild_is_asked() {
+        let (agent, input) = polluted_run(2);
+        agent.host.signals.set(false);
+        agent.run(&input).unwrap();
+        assert!(agent.host.rebuild_asked.borrow().is_empty());
     }
 
     fn a_tool_call(name: &str, args: serde_json::Value) -> ToolCall {

@@ -38,8 +38,8 @@ pub mod types;
 pub use agent::{Agent, AgentConfig, ASYNC_SAFE_TOOLS};
 pub mod pollution;
 pub use host::{
-    HostError, HostFunctions, HostResult, RenderRequest, Rendered, StepSignalsRequest,
-    StepSignalsView,
+    HostError, HostFunctions, HostResult, RebuildRequest, RenderRequest, Rendered,
+    StepSignalsRequest, StepSignalsView,
 };
 pub use nevoflux_protocol::LocalFileRef;
 pub use types::{

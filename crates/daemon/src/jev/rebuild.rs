@@ -306,6 +306,44 @@ pub async fn history_for_turn(env: &RebuildEnv<'_>) -> Vec<Message> {
     }
 }
 
+/// Mid-turn, the earlier turns polluted (spec §5.7): re-grade them against
+/// the current query and rebuild when that costs at most ρ more than
+/// keeping. The cache is warm mid-turn. `env.events` must hold the earlier
+/// turns only. `None` keeps them (also on a Jev failure, §5.8).
+pub async fn polluted_rebuild(env: &RebuildEnv<'_>, h: u32) -> Option<Vec<Message>> {
+    let old = grades(&env.events);
+    let keep = derive_history(&env.events, u32::MAX, &old, &env.opts);
+    if keep.is_empty() {
+        return None;
+    }
+    let p = tokens(&keep);
+    let rate = cache_rate(env.wire, &env.jev.cache);
+    let keep_c = keep_cost(p as f64, h, rate, true);
+    match regrade(env, env.query).await {
+        Err(_) => {
+            log_rebuild(env, "polluted", "keep_fallback", keep_c, keep_c, h, p, p, 0);
+            None
+        }
+        Ok((new, n, jev_tokens)) => {
+            let mut merged = old;
+            merged.extend(new);
+            let rebuilt = derive_history(&env.events, u32::MAX, &merged, &env.opts);
+            let a = tokens(&rebuilt);
+            let rebuild_c = rebuild_cost(a as f64, h, rate, jev_tokens);
+            match decide(keep_c, rebuild_c, true) {
+                Decision::Rebuild => {
+                    log_rebuild(env, "polluted", "rebuild", keep_c, rebuild_c, h, p, a, n);
+                    Some(rebuilt)
+                }
+                Decision::Keep => {
+                    log_rebuild(env, "polluted", "keep", keep_c, rebuild_c, h, p, p, n);
+                    None
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -517,6 +555,42 @@ mod tests {
         assert!(logged(&db).iter().any(
             |e| matches!(e, SessionEventPayload::ContextRebuild { h, .. } if *h == DEFAULT_H)
         ));
+    }
+
+    async fn polluted(level: &str) -> (Option<Vec<Message>>, Vec<SessionEventPayload>) {
+        let (url, _) = answering(answer(level, "1"), Duration::ZERO).await;
+        let (w, db) = writer();
+        let j = jev_cfg(&url, 2000);
+        let env = RebuildEnv {
+            jev: &j,
+            wire: ProviderType::Anthropic,
+            events: one_turn(NOW - 30_000, "jev", &hundred_lines("a")),
+            query: "only the summary matters now",
+            writer: Some(w),
+            stats: None,
+            opts: HistoryOpts {
+                max_messages: 50,
+                max_bytes: 32_000,
+            },
+            now_ms: NOW,
+        };
+        let out = polluted_rebuild(&env, 3).await;
+        (out, logged(&db))
+    }
+
+    #[tokio::test]
+    async fn a_polluted_rebuild_respects_rho() {
+        // Everything hidden: a much smaller history → rebuild.
+        let (out, ev) = polluted("hide").await;
+        assert!(out.is_some());
+        assert!(ev.iter().any(|e| matches!(e,
+            SessionEventPayload::ContextRebuild { reason, decision, .. } if reason == "polluted" && decision == "rebuild")));
+        // Everything kept full: rebuilding re-writes the whole prefix, far
+        // more than keep·(1+ρ) on a warm cache → keep.
+        let (out, ev) = polluted("full").await;
+        assert!(out.is_none());
+        assert!(ev.iter().any(|e| matches!(e,
+            SessionEventPayload::ContextRebuild { reason, decision, .. } if reason == "polluted" && decision == "keep")));
     }
 
     #[test]

@@ -67,6 +67,16 @@ pub struct StepSignalsView {
     pub irrelevant_bulk: Option<f64>,
 }
 
+/// A polluted run asks the host to rebuild its earlier turns (Jev P2-3b).
+pub struct RebuildRequest<'a> {
+    /// The query driving this run.
+    pub query: &'a str,
+    /// `polluted`.
+    pub reason: &'a str,
+    /// Messages after the system prompt that are earlier turns.
+    pub history_len: usize,
+}
+
 /// What the host made of a tool result: the text the model sees and, when
 /// the full text was stored, the chunk `recall` takes.
 #[derive(Debug, Clone, PartialEq)]
@@ -1067,6 +1077,12 @@ pub trait HostFunctions {
     /// A correction note was appended before `step` (spec §5.7).
     fn record_correction(&self, _step: u32, _triggers: &[&str], _entries: u32) {}
 
+    /// The earlier turns rebuilt for this run's query, when the economics
+    /// favour it; `None` keeps them (spec §5.7: polluted earlier turns).
+    fn rebuild_history(&self, _req: &RebuildRequest<'_>) -> Option<Vec<Message>> {
+        None
+    }
+
     /// The full text of an earlier result shown shortened or hidden, from
     /// byte `offset`.
     fn tool_recall(&self, _chunk_id: &str, _offset: u64) -> HostResult<String> {
@@ -1258,6 +1274,12 @@ pub struct MockHostFunctions {
     pub settled: std::cell::Cell<u32>,
     /// When set, `tool_read` fails with this message.
     pub tool_read_error: std::cell::RefCell<Option<String>>,
+    /// What `rebuild_history` returns.
+    pub rebuild_with: std::cell::RefCell<Option<Vec<Message>>>,
+    /// When set, what `tool_read` returns as the file content.
+    pub read_text: std::cell::RefCell<Option<String>>,
+    /// Reasons `rebuild_history` was asked with.
+    pub rebuild_asked: std::cell::RefCell<Vec<String>>,
 }
 
 #[cfg(test)]
@@ -1301,6 +1323,9 @@ impl MockHostFunctions {
             corrections: std::cell::RefCell::new(vec![]),
             settled: std::cell::Cell::new(0),
             tool_read_error: std::cell::RefCell::new(None),
+            rebuild_with: std::cell::RefCell::new(None),
+            read_text: std::cell::RefCell::new(None),
+            rebuild_asked: std::cell::RefCell::new(vec![]),
         }
     }
 
@@ -1433,6 +1458,11 @@ impl HostFunctions for MockHostFunctions {
 
     fn settle_signals(&self) {
         self.settled.set(self.settled.get() + 1);
+    }
+
+    fn rebuild_history(&self, req: &RebuildRequest<'_>) -> Option<Vec<Message>> {
+        self.rebuild_asked.borrow_mut().push(req.reason.to_string());
+        self.rebuild_with.borrow().clone()
     }
 
     fn record_correction(&self, _step: u32, triggers: &[&str], _entries: u32) {
@@ -1572,7 +1602,11 @@ impl HostFunctions for MockHostFunctions {
             total_bytes: 12,
             returned_lines: 1,
             offset: 0,
-            content: "File content".into(),
+            content: self
+                .read_text
+                .borrow()
+                .clone()
+                .unwrap_or_else(|| "File content".into()),
             truncated: false,
         })
     }
