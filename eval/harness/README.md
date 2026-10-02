@@ -336,6 +336,36 @@ Against the real TypeSafe endpoint (public synthetic page only):
 The fake model needs no quota, so it is the way to check Jev wiring after a
 change; it says nothing about quality (G2).
 
+## Jev P2-3b (rebuild), 2026-10-02
+
+Agent `feat/jev-p2-3b`: with Jev on, earlier turns come from the session log,
+with their tool calls and results kept and each result shown at its grade:
+- hidden and short results fold into the step's text;
+- the 60 newest graded chunks keep their grade, older ones are hidden;
+- a cache breakpoint marks the end of the history.
+
+At turn start the economics decide keep or rebuild:
+- the cache rates and TTL are per wire;
+- H = Jev's remaining steps + 1;
+- re-grading uses the new query.
+
+Mid-turn, polluted earlier turns are rebuilt within ρ, and stale or failed
+output over 30% of the context adds a correction note. Chat, `/tasks`
+follow-ups and agent_exec runs all take this path. `run` refuses an agent
+binary older than the last commit under `crates/` (`--allow-stale-agent`
+skips the check).
+
+**End to end with the fake model** (`jev-flights-followup`: turn 2 starts
+360 s after turn 1, so the 5-minute cache has expired; real TypeSafe):
+- turn 2 logged `context/rebuild{reason:"ttl_expired", decision:"keep",
+  h:2, before_tokens:299, regraded:0}`. Turn 1's results were all ≤ 4 KB, so
+  there was nothing to re-grade, and with equal costs keeping wins.
+- turn 2's `jev` usage: 1 063 input / 71 output tokens in 1 call.
+
+The two failing checks are the fake model's turn-1 text, which is not part
+of what is being checked. Re-grading itself is covered by unit tests against
+a fake Jev (`jev::rebuild`).
+
 ## Known gaps
 
 - Agent-loop tasks have no deadline on the daemon side: `wall_clock_secs`
