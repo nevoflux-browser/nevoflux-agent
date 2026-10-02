@@ -288,6 +288,29 @@ pub enum SessionEventPayload {
         /// Time spent grading.
         elapsed_ms: u64,
     },
+    /// Jev's per-step signals (request ①, spec §5.4), logged when they land.
+    #[serde(rename = "jev/signals")]
+    JevSignals {
+        /// 0-based step the signals were asked for.
+        step: u32,
+        /// H: P25 of the remaining-steps distribution, in steps.
+        h: Option<u32>,
+        drift: Option<f64>,
+        irrelevant_bulk: Option<f64>,
+        needs_action: Option<f64>,
+        /// Time from asking to the answer.
+        elapsed_ms: u64,
+    },
+    /// An in-turn correction note was appended at the tail (spec §5.7).
+    #[serde(rename = "context/correction")]
+    ContextCorrection {
+        /// Step before which it was appended.
+        step: u32,
+        /// `repeat_call`, `error_streak`, `bad_args`, `drift`, `irrelevant_bulk`.
+        triggers: Vec<String>,
+        /// Failed attempts listed in the note.
+        entries: u32,
+    },
 }
 
 impl SessionEventPayload {
@@ -315,6 +338,8 @@ impl SessionEventPayload {
             Self::ToolSpill { .. } => "tool/spill",
             Self::JevFallback { .. } => "jev/fallback",
             Self::JevVisibility { .. } => "jev/visibility",
+            Self::JevSignals { .. } => "jev/signals",
+            Self::ContextCorrection { .. } => "context/correction",
         }
     }
 }
@@ -362,6 +387,39 @@ pub fn tools_hash(names: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jev_signals_event_wire_shape() {
+        let p = SessionEventPayload::JevSignals {
+            step: 3,
+            h: Some(4),
+            drift: Some(0.12),
+            irrelevant_bulk: None,
+            needs_action: Some(0.9),
+            elapsed_ms: 310,
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["type"], "jev/signals");
+        assert_eq!(v["h"], 4);
+        assert_eq!(p.type_str(), "jev/signals");
+        let back: SessionEventPayload = serde_json::from_value(v).unwrap();
+        assert_eq!(back, p);
+    }
+
+    #[test]
+    fn context_correction_event_wire_shape() {
+        let p = SessionEventPayload::ContextCorrection {
+            step: 5,
+            triggers: vec!["repeat_call".into(), "drift".into()],
+            entries: 2,
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["type"], "context/correction");
+        assert_eq!(v["triggers"][1], "drift");
+        assert_eq!(p.type_str(), "context/correction");
+        let back: SessionEventPayload = serde_json::from_value(v).unwrap();
+        assert_eq!(back, p);
+    }
 
     #[test]
     fn jev_visibility_event_wire_shape() {
