@@ -1,0 +1,24 @@
+{
+  "alphabet": "0123456789ABCDEFGHJKMNPQRSTVWXYZ",
+  "rules": [
+    "remove every character outside [0-9A-Za-z]",
+    "uppercase",
+    "map I and L to 1, O to 0",
+    "require exactly 13 characters, all in the alphabet; otherwise reject, never guess",
+    "regroup as X-XXXX-XXXX-XXXX joined by ASCII '-'; its UTF-8 bytes are the KDF password"
+  ],
+  "valid": [
+    {"input": "x abcd efgh jkmn", "canonical": "X-ABCD-EFGH-JKMN"},
+    {"input": "X-ILOI-OLIO-1234", "canonical": "X-1101-0110-1234"},
+    {"input": "X–ABCD–EFGH–JKMN", "canonical": "X-ABCD-EFGH-JKMN"},
+    {"input": "X—ABCD—EFGH—JKMN", "canonical": "X-ABCD-EFGH-JKMN"},
+    {"input": "X－ABCD－EFGH－JKMN", "canonical": "X-ABCD-EFGH-JKMN"},
+    {"input": "XABCDEFGHJKMN", "canonical": "X-ABCD-EFGH-JKMN"},
+    {"input": "  X-abcd-efgh-jkmn  ", "canonical": "X-ABCD-EFGH-JKMN"}
+  ],
+  "invalid": [
+    "X-ABCD-EFGH-JKM",
+    "X-ABCU-EFGH-JKMN",
+    "----------------"
+  ]
+}

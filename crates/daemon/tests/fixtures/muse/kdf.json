@@ -1,0 +1,7 @@
+{
+  "description": "Argon2id v0x13, m=65536 KiB, t=3, p=4, 32-byte output; password = normalized pairing code (UTF-8); salt = \"{code}|{channel_id}\" (UTF-8).",
+  "vectors": [
+    {"code": "X-7Q2K-9ABC-DEF3", "channel_id": "chan-abc", "key_hex": "28e46d59a2d65dc30e6548e710bc313deba05afbb32241f3991f1bca01d2de5a"},
+    {"code": "X-7Q2K-9ABC-DEF3", "channel_id": "chan-xyz", "key_hex": "ae967f202ce5f0c543cebc8f706ab7e8c24dde59dbb6596454c19cb5f5c652ed"}
+  ]
+}

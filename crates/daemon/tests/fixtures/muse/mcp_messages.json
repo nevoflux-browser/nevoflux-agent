@@ -1,0 +1,14 @@
+{
+  "requests": [
+    {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "nevoflux-muse", "version": "0.1.0"}}},
+    {"jsonrpc": "2.0", "method": "notifications/initialized"},
+    {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+    {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "browser_snapshot", "arguments": {}}},
+    {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "bash", "arguments": {"command": "id"}}}
+  ],
+  "expected": {
+    "initialize_result": {"serverInfo": {"name": "nevoflux-head"}, "capabilities": {"experimental": {"nevoflux": {"protocol": 1}}}},
+    "not_allowed_error": {"code": -32602, "data": {"code": "not_allowed"}},
+    "unavailable_error": {"code": -32602, "data": {"code": "unavailable"}}
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "challenge": "AAECAwQFBgcICQoLDA0ODw",
+  "bad_frame_limit": 8,
+  "cases": [
+    {"name": "first_frame", "prior": [], "frame": {"d": "c2h", "n": 0, "ch": "AAECAwQFBgcICQoLDA0ODw", "m": {"jsonrpc": "2.0", "id": 1, "method": "ping"}}, "expect": "accept"},
+    {"name": "gap_is_fine", "prior": [{"d": "c2h", "n": 0, "ch": "AAECAwQFBgcICQoLDA0ODw", "m": {"jsonrpc": "2.0", "id": 1, "method": "ping"}}], "frame": {"d": "c2h", "n": 5, "ch": "AAECAwQFBgcICQoLDA0ODw", "m": {"jsonrpc": "2.0", "id": 2, "method": "ping"}}, "expect": "accept"},
+    {"name": "replay", "prior": [{"d": "c2h", "n": 0, "ch": "AAECAwQFBgcICQoLDA0ODw", "m": {"jsonrpc": "2.0", "id": 1, "method": "ping"}}], "frame": {"d": "c2h", "n": 0, "ch": "AAECAwQFBgcICQoLDA0ODw", "m": {"jsonrpc": "2.0", "id": 1, "method": "ping"}}, "expect": "reject:counter_regression"},
+    {"name": "backwards", "prior": [{"d": "c2h", "n": 0, "ch": "AAECAwQFBgcICQoLDA0ODw", "m": {"jsonrpc": "2.0", "id": 1, "method": "ping"}}, {"d": "c2h", "n": 3, "ch": "AAECAwQFBgcICQoLDA0ODw", "m": {"jsonrpc": "2.0", "id": 2, "method": "ping"}}], "frame": {"d": "c2h", "n": 2, "ch": "AAECAwQFBgcICQoLDA0ODw", "m": {"jsonrpc": "2.0", "id": 3, "method": "ping"}}, "expect": "reject:counter_regression"},
+    {"name": "reflection", "prior": [], "frame": {"d": "h2c", "n": 1, "ch": "AAECAwQFBgcICQoLDA0ODw", "m": {"jsonrpc": "2.0", "id": 1, "result": {}}}, "expect": "reject:wrong_direction"},
+    {"name": "old_connection", "prior": [], "frame": {"d": "c2h", "n": 0, "ch": "ZZZZZZZZZZZZZZZZZZZZZZ", "m": {"jsonrpc": "2.0", "id": 1, "method": "ping"}}, "expect": "reject:challenge_mismatch"},
+    {"name": "missing_m", "prior": [], "frame": {"d": "c2h", "n": 0, "ch": "AAECAwQFBgcICQoLDA0ODw"}, "expect": "reject:malformed"},
+    {"name": "null_m_from_agent", "prior": [], "frame": {"d": "c2h", "n": 0, "ch": "AAECAwQFBgcICQoLDA0ODw", "m": null}, "expect": "reject:malformed"},
+    {"name": "not_an_object", "prior": [], "frame": "hello", "expect": "reject:malformed"},
+    {"name": "negative_counter", "prior": [], "frame": {"d": "c2h", "n": -1, "ch": "AAECAwQFBgcICQoLDA0ODw", "m": {"jsonrpc": "2.0", "id": 1, "method": "ping"}}, "expect": "reject:malformed"}
+  ]
+}

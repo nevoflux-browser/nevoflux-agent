@@ -1,0 +1,7 @@
+{
+  "description": "AES-256-GCM. Wire bytes = nonce(12) || ciphertext || tag(16). Plaintext is a WireMessage JSON with lowercase \"k\" and no \"seq\".",
+  "key_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "nonce_hex": "6465666768696a6b6c6d6e6f",
+  "plaintext": {"k": "frame", "frame": {"d": "h2c", "n": 0, "ch": "AAECAwQFBgcICQoLDA0ODw", "m": null}},
+  "sealed_hex": "6465666768696a6b6c6d6e6f3339b54443cb30ec5f0f3acaf6470c8f23af6328b117d11685eb8e20c9c08764b68762fa7c3eb96795d1421dbc038f8c5a2cc9a1622d2261b9a0c39aabc095c54cfbf922f426193fe51a812f6cf722958e05c1acfc986432ac4f97324723"
+}
