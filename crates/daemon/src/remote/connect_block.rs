@@ -40,6 +40,20 @@ pub fn render(id: &ControlIdentity, portal_base: &str, mode: &str, tier: &str) -
     )
 }
 
+/// The block a person pastes into an AI agent to pair it (design §4.1).
+///
+/// Four lines and nothing else: the agent reads them by prefix, and anything
+/// extra in a paste is something extra to misread.
+pub fn render_agent_block(relay: &str, channel_id: &str, code: &str) -> String {
+    format!(
+        "NEVOFLUX_AGENT_PAIRING
+relay: {relay}
+channel: {channel_id}
+code: {code}
+"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,6 +131,25 @@ mod tests {
         assert_eq!(
             code.find(&rest).expect("no pairing code").as_str(),
             real.pairing_code
+        );
+    }
+
+    #[test]
+    fn the_agent_block_carries_three_parseable_lines() {
+        let block = render_agent_block(
+            "wss://relay.nevoflux.app",
+            "2f1c4a90-7b3e-4d1a-9c58-0e6a2b7d4f31",
+            "A-BCDE-FGHJ-KMNP",
+        );
+        let lines: Vec<&str> = block.lines().collect();
+        assert_eq!(lines[0], "NEVOFLUX_AGENT_PAIRING");
+        assert_eq!(lines[1], "relay: wss://relay.nevoflux.app");
+        assert_eq!(lines[2], "channel: 2f1c4a90-7b3e-4d1a-9c58-0e6a2b7d4f31");
+        assert_eq!(lines[3], "code: A-BCDE-FGHJ-KMNP");
+        assert_eq!(
+            lines.len(),
+            4,
+            "nothing else, so a paste carries nothing else"
         );
     }
 }

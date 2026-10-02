@@ -33,16 +33,37 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// What sits at the far end of a pairing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PairingKind {
+    /// A phone or tablet: control channel + data channel (the original shape).
+    #[default]
+    Device,
+    /// An AI agent: one MCP channel (design §4.1). It reuses
+    /// `control_channel_id` / `control_key` for that channel, because the
+    /// store is keyed by `control_channel_id`; the data fields stay empty.
+    Agent,
+}
+
+impl PairingKind {
+    pub fn is_device(&self) -> bool {
+        matches!(self, PairingKind::Device)
+    }
+}
+
 /// One paired device.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pairing {
     /// The always-on channel carrying the session list.
     pub control_channel_id: String,
     /// The channel a conversation is projected onto when one is attached.
+    #[serde(default)]
     pub data_channel_id: String,
     /// Derived from `(code, control_channel_id)`. Hex, 32 bytes.
     pub control_key: String,
     /// Derived from `(code, data_channel_id)`. Hex, 32 bytes.
+    #[serde(default)]
     pub data_key: String,
     /// Unix seconds, for the device list.
     pub created_at: i64,
@@ -57,9 +78,15 @@ pub struct Pairing {
     /// exactly that behind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub push: Option<super::web_push::Subscription>,
+    #[serde(default, skip_serializing_if = "PairingKind::is_device")]
+    pub kind: PairingKind,
 }
 
 impl Pairing {
+    pub fn is_agent(&self) -> bool {
+        self.kind == PairingKind::Agent
+    }
+
     /// The control channel's key, or `None` if what is stored is not 32 bytes.
     pub fn control_key(&self) -> Option<[u8; 32]> {
         unhex(&self.control_key)
@@ -242,6 +269,7 @@ pub fn mint(code: &str) -> Option<Pairing> {
         created_at: now(),
         label: None,
         push: None,
+        kind: PairingKind::Device,
     })
 }
 
@@ -250,7 +278,33 @@ pub fn mint(code: &str) -> Option<Pairing> {
 /// Two 64 MiB Argon2id derivations are hundreds of milliseconds of solid CPU;
 /// running them on a worker thread would stall every other task on it.
 pub async fn mint_blocking(code: String) -> Option<Pairing> {
-    tokio::task::spawn_blocking(move || mint(&code)).await.ok()?
+    tokio::task::spawn_blocking(move || mint(&code))
+        .await
+        .ok()?
+}
+
+/// Mint an agent pairing: one channel, one key (design §4.1).
+pub fn mint_agent(code: &str) -> Option<Pairing> {
+    let channel_id = uuid::Uuid::new_v4().to_string();
+    let key = super::crypto::derive_channel_key(code, &channel_id).ok()?;
+    Some(Pairing {
+        control_channel_id: channel_id,
+        data_channel_id: String::new(),
+        control_key: hex(&key),
+        data_key: String::new(),
+        created_at: now(),
+        label: None,
+        push: None,
+        kind: PairingKind::Agent,
+    })
+}
+
+/// [`mint_agent`] off the async runtime: the derivation is a 64 MiB Argon2id pass.
+pub async fn mint_agent_blocking(code: String) -> Option<Pairing> {
+    tokio::task::spawn_blocking(move || mint_agent(&code))
+        .await
+        .ok()
+        .flatten()
 }
 
 fn now() -> i64 {
@@ -294,6 +348,7 @@ mod tests {
             created_at: 1,
             label: None,
             push: None,
+            kind: PairingKind::Device,
         }
     }
 
@@ -428,8 +483,52 @@ mod tests {
         // same answer, and the daemon no longer has to recompute it at boot.
         let code = "X-7Q2K-9ABC-DEF3";
         let p = mint(code).expect("mint");
-        let expected = super::super::crypto::derive_channel_key(code, &p.control_channel_id)
-            .expect("derive");
+        let expected =
+            super::super::crypto::derive_channel_key(code, &p.control_channel_id).expect("derive");
         assert_eq!(p.control_key(), Some(expected));
+    }
+
+    #[test]
+    fn an_agent_pairing_has_one_channel_and_one_key() {
+        let p = mint_agent("A-BCDE-FGHJ-KMNP").expect("minted");
+        assert!(p.is_agent());
+        assert_eq!(p.kind, PairingKind::Agent);
+        assert!(uuid::Uuid::parse_str(&p.control_channel_id).is_ok());
+        assert!(p.control_key().is_some());
+        assert!(p.data_channel_id.is_empty());
+        assert_eq!(p.data_key(), None);
+        let expected =
+            crate::remote::crypto::derive_channel_key("A-BCDE-FGHJ-KMNP", &p.control_channel_id)
+                .unwrap();
+        assert_eq!(p.control_key(), Some(expected));
+    }
+
+    #[test]
+    fn an_agent_pairing_round_trips_through_the_store() {
+        let (store, _dir) = store();
+        let p = mint_agent("A-BCDE-FGHJ-KMNP").unwrap();
+        store.add(p.clone()).unwrap();
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded, vec![p]);
+    }
+
+    #[test]
+    fn a_file_written_before_kinds_existed_loads_as_devices() {
+        let (store, dir) = store();
+        let old = r#"[{"control_channel_id":"c","data_channel_id":"d","control_key":"aa","data_key":"bb","created_at":1}]"#;
+        std::fs::write(dir.path().join("pairings.json"), old).unwrap();
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded[0].kind, PairingKind::Device);
+    }
+
+    #[test]
+    fn device_pairings_are_written_without_a_kind() {
+        let text = serde_json::to_string(&pairing("x")).unwrap();
+        assert!(
+            !text.contains("\"kind\""),
+            "device files stay byte-compatible: {text}"
+        );
+        let agent = serde_json::to_string(&mint_agent("A-BCDE-FGHJ-KMNP").unwrap()).unwrap();
+        assert!(agent.contains("\"kind\":\"agent\""));
     }
 }
