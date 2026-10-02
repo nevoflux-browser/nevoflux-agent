@@ -264,9 +264,27 @@ pub enum SessionEventPayload {
     JevFallback {
         /// The decision point (`tools`, `skills`, `visibility`, …).
         point: String,
-        /// Why: `timeout`, `http 429`, `refused`, …
+        /// Why: `timeout`, `http_429`, `refused`, `transport`, `decode`, …
         reason: String,
         /// Time spent before falling back.
+        elapsed_ms: u64,
+    },
+    /// A large tool result was graded for the model's context (spec §5.6).
+    #[serde(rename = "jev/visibility")]
+    JevVisibility {
+        /// Tool call id, which is also the chunk id `recall` takes.
+        id: String,
+        /// Tool name.
+        tool: String,
+        /// Byte length of the full result.
+        bytes: u64,
+        /// `hide`, `short`, `long` or `full`.
+        level: String,
+        /// `jev`, `fallback` (Jev failed) or `sensitive` (never sent, §5.8).
+        graded_by: String,
+        /// Lines kept by a long grade, 0 otherwise.
+        kept_lines: u64,
+        /// Time spent grading.
         elapsed_ms: u64,
     },
 }
@@ -295,6 +313,7 @@ impl SessionEventPayload {
             Self::ContextCompact { .. } => "context/compact",
             Self::ToolSpill { .. } => "tool/spill",
             Self::JevFallback { .. } => "jev/fallback",
+            Self::JevVisibility { .. } => "jev/visibility",
         }
     }
 }
@@ -342,6 +361,26 @@ pub fn tools_hash(names: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jev_visibility_event_wire_shape() {
+        let p = SessionEventPayload::JevVisibility {
+            id: "call_1".into(),
+            tool: "browser_get_markdown".into(),
+            bytes: 24_310,
+            level: "long".into(),
+            graded_by: "jev".into(),
+            kept_lines: 25,
+            elapsed_ms: 412,
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["type"], "jev/visibility");
+        assert_eq!(v["graded_by"], "jev");
+        assert_eq!(v["kept_lines"], 25);
+        assert_eq!(p.type_str(), "jev/visibility");
+        let back: SessionEventPayload = serde_json::from_value(v).unwrap();
+        assert_eq!(back, p);
+    }
 
     #[test]
     fn jev_fallback_event_wire_shape() {
