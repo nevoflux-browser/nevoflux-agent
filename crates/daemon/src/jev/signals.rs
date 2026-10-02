@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 
 use super::oracle::{DecisionOracle, JevOracle, OracleContext, Verdict};
+use super::privacy::{scope_for, Scope};
 use super::wire::{Answer, JevResponse, Question};
 
 /// Jev's semantic pollution signals count above this (spec §5.7, θ).
@@ -35,6 +36,8 @@ const SAFE_ARG_KEYS: &[&str] = &[
     "tool_name",
 ];
 const ARG_VALUE_CHARS: usize = 120;
+/// The query as sent in the state (the request cap is 64k tokens).
+const QUERY_CHARS: usize = 1_000;
 
 /// One tool call of the step being signalled.
 pub struct StepCall<'a> {
@@ -67,7 +70,7 @@ pub struct StepSignals {
 
 /// Keys of `arguments` with their values blanked, except locator keys (cut to
 /// 120 chars). One level into `arguments`, for `tool_call_dynamic`.
-pub fn arg_summary(arguments: &serde_json::Value) -> serde_json::Value {
+pub fn arg_summary(arguments: &serde_json::Value, sensitive: &[String]) -> serde_json::Value {
     let Some(obj) = arguments.as_object() else {
         return serde_json::Value::Null;
     };
@@ -76,20 +79,33 @@ pub fn arg_summary(arguments: &serde_json::Value) -> serde_json::Value {
         let kept = if k == "arguments" && v.is_object() {
             let mut inner = serde_json::Map::new();
             for (ik, iv) in v.as_object().into_iter().flatten() {
-                inner.insert(ik.clone(), safe_value(ik, iv));
+                inner.insert(ik.clone(), safe_value(ik, iv, sensitive));
             }
             serde_json::Value::Object(inner)
         } else {
-            safe_value(k, v)
+            safe_value(k, v, sensitive)
         };
         out.insert(k.clone(), kept);
     }
     serde_json::Value::Object(out)
 }
 
-fn safe_value(key: &str, v: &serde_json::Value) -> serde_json::Value {
+fn safe_value(key: &str, v: &serde_json::Value, sensitive: &[String]) -> serde_json::Value {
     if !SAFE_ARG_KEYS.contains(&key) {
         return serde_json::Value::String("…".into());
+    }
+    // A sensitive site's URL is reduced to its host (§5.8): paths and
+    // queries can carry account ids or tokens.
+    if key == "url" {
+        if let Some(u) = v.as_str() {
+            if scope_for(u, sensitive) == Scope::MetadataOnly {
+                let host = reqwest::Url::parse(u)
+                    .ok()
+                    .and_then(|p| p.host_str().map(str::to_string))
+                    .unwrap_or_else(|| "…".to_string());
+                return serde_json::Value::String(host);
+            }
+        }
     }
     match v {
         serde_json::Value::String(s) => {
@@ -101,14 +117,14 @@ fn safe_value(key: &str, v: &serde_json::Value) -> serde_json::Value {
 }
 
 /// The request ① state.
-pub fn state(input: &SignalInput) -> serde_json::Value {
+pub fn state(input: &SignalInput, sensitive: &[String]) -> serde_json::Value {
     let actions: Vec<serde_json::Value> = input
         .calls
         .iter()
-        .map(|c| serde_json::json!({"tool": c.name, "args": arg_summary(c.arguments)}))
+        .map(|c| serde_json::json!({"tool": c.name, "args": arg_summary(c.arguments, sensitive)}))
         .collect();
     let mut st = serde_json::json!({
-        "query": input.query,
+        "query": input.query.chars().take(QUERY_CHARS).collect::<String>(),
         "step": input.step,
         "actions": actions,
         "loaded_tools": input.loaded_tools,
@@ -209,13 +225,49 @@ pub fn parse(step: u32, r: &JevResponse) -> StepSignals {
     }
 }
 
+/// What request ① may be asked against, from the browser's live tab list
+/// (the turn-start tab goes stale after a navigate).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignalScope {
+    /// The active tab is known and ordinary: (url, title).
+    Page(String, String),
+    /// A candidate tab is sensitive or unknown: do not ask this step.
+    Skip,
+    /// No browser: no page in the state.
+    NoTab,
+}
+
+pub fn signal_scope(tabs: Option<&serde_json::Value>, sensitive: &[String]) -> SignalScope {
+    let Some(tabs) = tabs else {
+        return SignalScope::NoTab;
+    };
+    let Some(urls) = super::visibility::candidate_urls(tabs, &serde_json::json!({})) else {
+        return SignalScope::Skip;
+    };
+    if urls.is_empty() || urls.iter().any(|u| scope_for(u, sensitive) != Scope::Full) {
+        return SignalScope::Skip;
+    }
+    let title = tabs
+        .get("tabs")
+        .and_then(|t| t.as_array())
+        .and_then(|list| {
+            list.iter()
+                .find(|t| t.get("url").and_then(|u| u.as_str()) == Some(urls[0].as_str()))
+        })
+        .and_then(|t| t.get("title").and_then(|x| x.as_str()))
+        .unwrap_or("")
+        .to_string();
+    SignalScope::Page(urls[0].clone(), title)
+}
+
 /// Ask request ①; `None` when Jev fell back (the oracle logged it).
 pub async fn ask_signals(
     oracle: &JevOracle,
     ctx: &OracleContext,
     input: &SignalInput<'_>,
+    sensitive: &[String],
 ) -> Option<StepSignals> {
-    match oracle.ask(ctx, state(input), questions()).await {
+    match oracle.ask(ctx, state(input, sensitive), questions()).await {
         Verdict::Answered(r) => Some(parse(input.step, &r)),
         Verdict::Fallback { .. } => None,
     }
@@ -228,12 +280,59 @@ mod tests {
     #[test]
     fn arg_summary_never_carries_values() {
         let a = serde_json::json!({"selector": "#password", "value": "hunter2", "text": "my secret note", "url": "https://a.example/"});
-        let s = arg_summary(&a).to_string();
+        let s = arg_summary(&a, &[]).to_string();
         assert!(s.contains("#password") && s.contains("https://a.example/"));
         assert!(!s.contains("hunter2") && !s.contains("secret note"));
         let dynamic = serde_json::json!({"tool_name": "send_mail", "arguments": {"to": "x@y.z", "body": "private"}});
-        let d = arg_summary(&dynamic).to_string();
+        let d = arg_summary(&dynamic, &[]).to_string();
         assert!(d.contains("send_mail") && !d.contains("private") && !d.contains("x@y.z"));
+    }
+
+    #[test]
+    fn sensitive_urls_are_reduced_to_their_domain() {
+        // Review I4: request ① must honour the sensitive-site list too.
+        let a = serde_json::json!({"url": "https://www.paypal.com/myaccount/123?token=x"});
+        let s = arg_summary(&a, &[]).to_string();
+        assert!(s.contains("www.paypal.com"), "{s}");
+        assert!(!s.contains("myaccount") && !s.contains("token"), "{s}");
+        let user = serde_json::json!({"url": "https://intranet.acme.example/hr/42"});
+        let u = arg_summary(&user, &["acme.example".into()]).to_string();
+        assert!(!u.contains("/hr/42"), "{u}");
+        let ok = serde_json::json!({"url": "https://en.wikipedia.org/wiki/Rust"});
+        assert!(arg_summary(&ok, &[]).to_string().contains("/wiki/Rust"));
+    }
+
+    #[test]
+    fn the_state_caps_the_query() {
+        let q = "q".repeat(10_000);
+        let st = state(
+            &SignalInput {
+                query: &q,
+                step: 0,
+                calls: &[],
+                loaded_tools: &[],
+                chunk_stubs: &[],
+                tab: None,
+            },
+            &[],
+        );
+        assert!(st["query"].as_str().unwrap().len() <= 1_000);
+    }
+
+    #[test]
+    fn the_scope_comes_from_the_live_tabs() {
+        let tabs = serde_json::json!({"tabs": [
+            {"id": 1, "url": "https://shop.example/cart", "title": "Cart", "active": true}
+        ]});
+        assert_eq!(
+            signal_scope(Some(&tabs), &[]),
+            SignalScope::Page("https://shop.example/cart".into(), "Cart".into())
+        );
+        let bank = serde_json::json!({"tabs": [
+            {"id": 1, "url": "https://www.paypal.com/x", "title": "PayPal", "active": true}
+        ]});
+        assert_eq!(signal_scope(Some(&bank), &[]), SignalScope::Skip);
+        assert_eq!(signal_scope(None, &[]), SignalScope::NoTab);
     }
 
     #[test]
@@ -243,14 +342,17 @@ mod tests {
             name: "browser_click_by_id",
             arguments: &args,
         }];
-        let st = state(&SignalInput {
-            query: "buy socks",
-            step: 2,
-            calls: &calls,
-            loaded_tools: &["browser_navigate".into()],
-            chunk_stubs: &["[c1 · read · 9000 bytes · short]".into()],
-            tab: Some(("https://shop.example/cart", "Cart")),
-        });
+        let st = state(
+            &SignalInput {
+                query: "buy socks",
+                step: 2,
+                calls: &calls,
+                loaded_tools: &["browser_navigate".into()],
+                chunk_stubs: &["[c1 · read · 9000 bytes · short]".into()],
+                tab: Some(("https://shop.example/cart", "Cart")),
+            },
+            &[],
+        );
         assert_eq!(st["tab"]["domain"], "shop.example");
         assert_eq!(st["tab"]["title"], "Cart");
         assert_eq!(st["actions"][0]["tool"], "browser_click_by_id");

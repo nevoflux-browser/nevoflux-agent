@@ -1256,6 +1256,8 @@ pub struct MockHostFunctions {
     pub corrections: std::cell::RefCell<Vec<Vec<String>>>,
     /// `settle_signals` calls.
     pub settled: std::cell::Cell<u32>,
+    /// When set, `tool_read` fails with this message.
+    pub tool_read_error: std::cell::RefCell<Option<String>>,
 }
 
 #[cfg(test)]
@@ -1298,6 +1300,7 @@ impl MockHostFunctions {
             latest: std::cell::RefCell::new(None),
             corrections: std::cell::RefCell::new(vec![]),
             settled: std::cell::Cell::new(0),
+            tool_read_error: std::cell::RefCell::new(None),
         }
     }
 
@@ -1552,6 +1555,12 @@ impl HostFunctions for MockHostFunctions {
         _limit: Option<u64>,
     ) -> HostResult<ReadResult> {
         self.tool_read_calls.set(self.tool_read_calls.get() + 1);
+        if let Some(msg) = self.tool_read_error.borrow().clone() {
+            return Err(HostError {
+                code: 1,
+                message: msg,
+            });
+        }
         // Lets a test produce a measurable tool duration without depending on
         // how fast the machine is.
         let delay = self.tool_read_delay_ms.get();

@@ -1540,6 +1540,13 @@ impl DaemonHostFunctions {
     /// adaptation): for judging which page a result came from. `None` when
     /// there is no browser or it does not answer within 5 s.
     fn list_tabs_quietly(&self) -> Option<serde_json::Value> {
+        let probe = self.tab_probe()?;
+        let runtime = self.runtime.clone();
+        tokio::task::block_in_place(|| runtime.block_on(ask_tabs(probe)))
+    }
+
+    /// The pieces needed to ask the browser for its tabs from any task.
+    fn tab_probe(&self) -> Option<TabProbe> {
         use crate::wasm::services::BrowserRequest;
         let services = self.services.as_ref()?;
         let sender = services.browser_sender.as_ref()?.clone();
@@ -1553,22 +1560,7 @@ impl DaemonHostFunctions {
             client_identity: services.client_identity.clone(),
             proxy_id: services.proxy_id.clone(),
         };
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let runtime = self.runtime.clone();
-        let response = tokio::task::block_in_place(|| {
-            runtime.block_on(async {
-                sender.send((request, tx)).await.ok()?;
-                tokio::time::timeout(std::time::Duration::from_secs(5), rx)
-                    .await
-                    .ok()?
-                    .ok()
-            })
-        })?;
-        if response.success {
-            response.result
-        } else {
-            None
-        }
+        Some((sender, request))
     }
 
     /// Where a tool result of this session is spilled: one file per tool id,
@@ -1795,6 +1787,26 @@ fn consent_to_deactivate(
          deactivated.\nThis is a policy decision, not a tool failure. Do not retry \
          this call."
     ))
+}
+
+type TabProbe = (
+    crate::wasm::services::BrowserSender,
+    crate::wasm::services::BrowserRequest,
+);
+
+/// Ask the browser for its tab list; `None` when it does not answer in 5 s.
+async fn ask_tabs((sender, request): TabProbe) -> Option<serde_json::Value> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    sender.send((request, tx)).await.ok()?;
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+        .await
+        .ok()?
+        .ok()?;
+    if response.success {
+        response.result
+    } else {
+        None
+    }
 }
 
 impl HostFunctions for DaemonHostFunctions {
@@ -2178,14 +2190,31 @@ impl HostFunctions for DaemonHostFunctions {
             .collect();
         let loaded = req.loaded_tools.clone();
         let stubs = req.chunk_stubs.clone();
-        let tab_url = req.tab_url.map(str::to_string);
-        let tab_title = req.tab_title.map(str::to_string);
+        // The turn-start tab goes stale after a navigate: the task asks the
+        // browser for the live tabs before choosing the scope.
+        let probe = self.tab_probe();
         let events = self.event_writer().map(Arc::new);
         let stats = self.turn_stats.clone();
         let latest = self.latest_signals.clone();
         let handle = self.runtime.spawn(async move {
-            use crate::jev::signals::{ask_signals, SignalInput, StepCall};
+            use crate::jev::signals::{
+                ask_signals, signal_scope, SignalInput, SignalScope, StepCall,
+            };
             let started = std::time::Instant::now();
+            let scope = match probe {
+                // A browser that does not answer: its tabs are unknown.
+                Some(p) => match ask_tabs(p).await {
+                    Some(tabs) => signal_scope(Some(&tabs), &jev.sensitive_domains),
+                    None => SignalScope::Skip,
+                },
+                None => SignalScope::NoTab,
+            };
+            let (tab_url, tab_title) = match scope {
+                // A sensitive or unknown tab: no request this step (§5.8).
+                SignalScope::Skip => return,
+                SignalScope::Page(u, t) => (Some(u), Some(t)),
+                SignalScope::NoTab => (None, None),
+            };
             let timeout = std::time::Duration::from_millis(jev.timeout_ms);
             let oracle = crate::jev::oracle::JevOracle::new(
                 client,
@@ -2213,7 +2242,7 @@ impl HostFunctions for DaemonHostFunctions {
                     .as_deref()
                     .map(|u| (u, tab_title.as_deref().unwrap_or(""))),
             };
-            let Some(s) = ask_signals(&oracle, &ctx, &input).await else {
+            let Some(s) = ask_signals(&oracle, &ctx, &input, &jev.sensitive_domains).await else {
                 return;
             };
             if let Some(w) = &events {

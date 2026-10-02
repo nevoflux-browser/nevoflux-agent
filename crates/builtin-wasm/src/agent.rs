@@ -1867,8 +1867,10 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
         // Jev visibility (spec §5.6): cloud turns only (§3.2), asked once.
         let visibility = input.local.is_none() && self.host.visibility_active();
         self.visibility_on.set(visibility);
-        // tool_call_id → (chunk id, offset): what an aged result's stub points at.
-        let mut chunks: std::collections::HashMap<String, (String, u64)> =
+        // message index → (chunk id, offset): what an aged result's stub points
+        // at. Keyed by position, not tool_call_id: Gemini reuses the function
+        // name as the call id, and `messages` only grows within a run.
+        let mut chunks: std::collections::HashMap<usize, (String, u64)> =
             std::collections::HashMap::new();
         // Jev per-step signals (request ①) and the in-turn correction (§5.7).
         let signals = input.local.is_none() && self.host.signals_active();
@@ -1879,6 +1881,9 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
         let mut action_log: Vec<crate::pollution::ActionRecord> = Vec::new();
         let mut last_correction: Option<u32> = None;
         let mut correction_kinds: Vec<&'static str> = Vec::new();
+        // Entries already listed in a note: a new trigger kind over the same
+        // attempts is the same episode, not a reason for another note.
+        let mut noted: Vec<String> = Vec::new();
 
         let mut iterations = 0;
         let mut final_text = String::new();
@@ -1940,8 +1945,12 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                     &action_log,
                     self.host.latest_signals().as_ref(),
                     POLLUTION_THETA,
+                    step,
                 ) {
-                    let fresh = p.triggers.iter().any(|t| !correction_kinds.contains(t));
+                    let new_kind = p.triggers.iter().any(|t| !correction_kinds.contains(t));
+                    let new_entries =
+                        p.entries.is_empty() || p.entries.iter().any(|e| !noted.contains(e));
+                    let fresh = new_kind && new_entries;
                     let due = last_correction.map_or(true, |s| step >= s + 3);
                     let tail = messages
                         .iter_mut()
@@ -1954,6 +1963,11 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                         self.host
                             .record_correction(step, &p.triggers, p.entries.len() as u32);
                         last_correction = Some(step);
+                        for e in &p.entries {
+                            if !noted.contains(e) {
+                                noted.push(e.clone());
+                            }
+                        }
                         for t in &p.triggers {
                             if !correction_kinds.contains(t) {
                                 correction_kinds.push(t);
@@ -2185,13 +2199,12 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                     None
                 };
                 let chunk = rendered.as_ref().and_then(|r| r.chunk_id.clone());
-                if let Some(c) = &chunk {
-                    chunks.insert(result.tool_call_id.clone(), (c.clone(), 0));
-                }
+                // Recorded against this result's message once it is pushed.
+                let mut chunk_entry = chunk.clone().map(|c| (c, 0));
                 if visibility && tool_call.name == "recall" {
                     if let Some(id) = tool_call.arguments["chunk_id"].as_str() {
                         let offset = tool_call.arguments["offset"].as_u64().unwrap_or(0);
-                        chunks.insert(result.tool_call_id.clone(), (id.to_string(), offset));
+                        chunk_entry = Some((id.to_string(), offset));
                     }
                 }
                 let source = rendered
@@ -2226,13 +2239,24 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                 };
 
                 if signals {
-                    let class = crate::pollution::error_class(&result.content);
+                    let class = crate::pollution::error_class(
+                        &tool_call.name,
+                        result.success,
+                        &result.content,
+                    );
+                    let result_key = {
+                        use std::hash::{Hash, Hasher};
+                        let mut h = std::collections::hash_map::DefaultHasher::new();
+                        result.content.hash(&mut h);
+                        h.finish()
+                    };
                     action_log.push(crate::pollution::ActionRecord {
                         step,
                         tool: tool_call.name.clone(),
                         args_key: serde_json::to_string(&tool_call.arguments).unwrap_or_default(),
                         ok: result.success && class.is_none(),
                         error_class: class,
+                        result_key,
                     });
                 }
 
@@ -2270,6 +2294,9 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                     attachments,
                     reasoning: None,
                 });
+                if let Some(entry) = chunk_entry {
+                    chunks.insert(messages.len() - 1, entry);
+                }
 
                 // Check interrupt after each tool execution
                 if self.host.is_interrupted()? {
@@ -7008,13 +7035,10 @@ fn shrunk(content: &str, budget: ResultBudget) -> String {
 fn stub_aged_tool_results_with(
     messages: &mut [Message],
     budget: ResultBudget,
-    chunks: &std::collections::HashMap<String, (String, u64)>,
+    chunks: &std::collections::HashMap<usize, (String, u64)>,
 ) {
     for i in aged_selection(messages, budget) {
-        let known = messages[i]
-            .tool_call_id
-            .as_ref()
-            .and_then(|id| chunks.get(id));
+        let known = chunks.get(&i);
         messages[i].content = match known {
             Some((chunk, offset)) => {
                 let at = if *offset > 0 {
@@ -8834,6 +8858,75 @@ mod tests {
         assert_eq!(agent.host.settled.get(), 0);
         for r in agent.host.captured_requests.borrow().iter() {
             assert!(tool_texts(r).iter().all(|t| !t.contains("[Correction]")));
+        }
+    }
+
+    #[test]
+    fn a_failing_read_loop_gets_one_correction() {
+        // The plan's Focus 3 case (review I1): repeat_call at step 2, then
+        // error_streak at step 3 over the same attempts — still one note.
+        let mock = MockHostFunctions::new();
+        mock.signals.set(true);
+        *mock.tool_read_error.borrow_mut() = Some("not found".into());
+        for _ in 0..4 {
+            mock.add_llm_response(LlmResponse {
+                text: "".into(),
+                tool_calls: vec![a_tool_call(
+                    "read",
+                    serde_json::json!({"file_path": "missing.txt"}),
+                )],
+                reasoning: None,
+            });
+        }
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        agent.run(&session_log_input("go")).unwrap();
+        assert_eq!(
+            agent.host.corrections.borrow().len(),
+            1,
+            "{:?}",
+            agent.host.corrections.borrow()
+        );
+        let reqs = agent.host.captured_requests.borrow();
+        let last = tool_texts(reqs.last().unwrap());
+        let note = last
+            .iter()
+            .find(|t| t.contains("[Correction]"))
+            .expect("note");
+        assert!(
+            note.contains("read(") && note.contains("not found"),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn results_sharing_a_call_id_keep_their_own_stubs() {
+        // Review I5: Gemini reuses the function name as the call id.
+        let big = "z".repeat(13_000);
+        let mock = MockHostFunctions::new();
+        mock.visibility.set(true);
+        *mock.render_with.borrow_mut() = Some(big);
+        let same: Vec<ToolCall> = (0..18)
+            .map(|_| ToolCall {
+                id: "think".into(),
+                call_id: None,
+                name: "think".into(),
+                arguments: serde_json::json!({ "thought": "x" }),
+                signature: None,
+            })
+            .collect();
+        mock.add_llm_response(LlmResponse {
+            text: "".into(),
+            tool_calls: same,
+            reasoning: None,
+        });
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        agent.run(&session_log_input("go")).unwrap();
+        let req = agent.host.captured_requests.borrow()[1].clone();
+        let texts = tool_texts(&req);
+        for (i, t) in texts.iter().enumerate().take(6) {
+            assert!(t.contains(&format!("recall(\"c{i}\")")), "{i}: {t}");
         }
     }
 
