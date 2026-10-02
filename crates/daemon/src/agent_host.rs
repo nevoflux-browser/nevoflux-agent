@@ -2248,6 +2248,18 @@ impl HostFunctions for DaemonHostFunctions {
         })
     }
 
+    fn record_correction(&self, step: u32, triggers: &[&str], entries: u32) {
+        if let Some(w) = self.event_writer() {
+            w.append(
+                nevoflux_protocol::session_event::SessionEventPayload::ContextCorrection {
+                    step,
+                    triggers: triggers.iter().map(|t| t.to_string()).collect(),
+                    entries,
+                },
+            );
+        }
+    }
+
     fn settle_signals(&self) {
         let handles: Vec<_> = match self.pending_signals.lock() {
             Ok(mut p) => p.drain(..).collect(),

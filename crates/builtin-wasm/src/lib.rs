@@ -36,6 +36,7 @@ pub mod local_mode;
 pub mod types;
 
 pub use agent::{Agent, AgentConfig, ASYNC_SAFE_TOOLS};
+pub mod pollution;
 pub use host::{
     HostError, HostFunctions, HostResult, RenderRequest, Rendered, StepSignalsRequest,
     StepSignalsView,

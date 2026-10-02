@@ -1870,6 +1870,15 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
         // tool_call_id → (chunk id, offset): what an aged result's stub points at.
         let mut chunks: std::collections::HashMap<String, (String, u64)> =
             std::collections::HashMap::new();
+        // Jev per-step signals (request ①) and the in-turn correction (§5.7).
+        let signals = input.local.is_none() && self.host.signals_active();
+        let _settle = SettleSignals {
+            host: &self.host,
+            active: signals,
+        };
+        let mut action_log: Vec<crate::pollution::ActionRecord> = Vec::new();
+        let mut last_correction: Option<u32> = None;
+        let mut correction_kinds: Vec<&'static str> = Vec::new();
 
         let mut iterations = 0;
         let mut final_text = String::new();
@@ -1924,6 +1933,36 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                 shrink_aged_tool_results_with(&mut messages, budget);
             }
 
+            // A polluted turn gets one correction note at the tail: at most
+            // once per 3 steps, unless a kind of trigger not seen yet appears.
+            if signals {
+                if let Some(p) = crate::pollution::detect(
+                    &action_log,
+                    self.host.latest_signals().as_ref(),
+                    POLLUTION_THETA,
+                ) {
+                    let fresh = p.triggers.iter().any(|t| !correction_kinds.contains(t));
+                    let due = last_correction.map_or(true, |s| step >= s + 3);
+                    let tail = messages
+                        .iter_mut()
+                        .rev()
+                        .find(|m| matches!(m.role, MessageRole::Tool));
+                    if let (true, Some(tail)) = (fresh || due, tail) {
+                        tail.content.push_str("\n\n");
+                        tail.content
+                            .push_str(&crate::pollution::correction_text(&input.user_message, &p));
+                        self.host
+                            .record_correction(step, &p.triggers, p.entries.len() as u32);
+                        last_correction = Some(step);
+                        for t in &p.triggers {
+                            if !correction_kinds.contains(t) {
+                                correction_kinds.push(t);
+                            }
+                        }
+                    }
+                }
+            }
+
             // `recall` rides on every request while visibility is on; the
             // gates above rebuild `active_tools` and would drop it.
             let offered = if visibility {
@@ -1968,6 +2007,29 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
 
             // Extract keywords from LLM reasoning text once (invariant across tool calls)
             let llm_kws = Self::extract_keywords_from_text(&response.text);
+
+            // Jev request ①: asked now, in parallel with the tools; never waited for.
+            if signals {
+                let stubs: Vec<String> = chunks
+                    .values()
+                    .map(|(c, o)| format!("[{c} · offset {o}]"))
+                    .collect();
+                self.host.step_signals(&crate::host::StepSignalsRequest {
+                    step,
+                    query: &input.user_message,
+                    calls: &tool_calls,
+                    loaded_tools: offered.iter().map(|t| t.name.clone()).collect(),
+                    chunk_stubs: stubs,
+                    tab_url: active_tab_info
+                        .as_ref()
+                        .map(|t| t.url.as_str())
+                        .filter(|u| !u.is_empty()),
+                    tab_title: active_tab_info
+                        .as_ref()
+                        .map(|t| t.tab_title.as_str())
+                        .filter(|t| !t.is_empty()),
+                });
+            }
 
             for tool_call in &tool_calls {
                 // Stop before starting anything new.
@@ -2162,6 +2224,17 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                 } else {
                     trimmed
                 };
+
+                if signals {
+                    let class = crate::pollution::error_class(&result.content);
+                    action_log.push(crate::pollution::ActionRecord {
+                        step,
+                        tool: tool_call.name.clone(),
+                        args_key: serde_json::to_string(&tool_call.arguments).unwrap_or_default(),
+                        ok: result.success && class.is_none(),
+                        error_class: class,
+                    });
+                }
 
                 // Check if there's a cached screenshot to attach (base64 stays out of content)
                 let attachments = if tool_call.name == "browser_screenshot" {
@@ -6860,6 +6933,24 @@ fn shrink_aged_tool_results(messages: &mut [Message]) {
 ///
 /// Idempotent: a result already under budget is left alone, so repeated calls
 /// across loop iterations converge instead of eating into it each time.
+/// Jev's drift / irrelevant-bulk count as pollution above this (spec §5.7, θ).
+const POLLUTION_THETA: f64 = 0.8;
+
+/// Waits (bounded) for in-flight Jev signals when a run ends, on every exit
+/// path, so their cost lands in this turn's usage.
+struct SettleSignals<'a, H: HostFunctions> {
+    host: &'a H,
+    active: bool,
+}
+
+impl<H: HostFunctions> Drop for SettleSignals<'_, H> {
+    fn drop(&mut self) {
+        if self.active {
+            self.host.settle_signals();
+        }
+    }
+}
+
 fn shrink_aged_tool_results_with(messages: &mut [Message], budget: ResultBudget) {
     for i in aged_selection(messages, budget) {
         messages[i].content = shrunk(&messages[i].content, budget);
@@ -8531,7 +8622,10 @@ mod tests {
             // pointer to its stored original — never a stub.
             assert!(m.content.len() > 10_000, "{}", m.content.len());
             if m.content.len() < big.len() {
-                assert!(m.content.contains("recall(\"c"), "trimmed without a pointer");
+                assert!(
+                    m.content.contains("recall(\"c"),
+                    "trimmed without a pointer"
+                );
             }
         }
     }
@@ -8636,6 +8730,111 @@ mod tests {
         let agent = session_log_agent(mock);
         agent.run(&session_log_input("go")).unwrap();
         assert!(agent.host.recalls.borrow().is_empty());
+    }
+
+    fn thinks(thought: &str) -> LlmResponse {
+        LlmResponse {
+            text: "".into(),
+            tool_calls: vec![a_tool_call(
+                "think",
+                serde_json::json!({ "thought": thought }),
+            )],
+            reasoning: None,
+        }
+    }
+
+    fn tool_texts(req: &LlmRequest) -> Vec<String> {
+        req.messages
+            .iter()
+            .filter(|m| matches!(m.role, MessageRole::Tool))
+            .map(|m| m.content.clone())
+            .collect()
+    }
+
+    #[test]
+    fn signals_are_asked_once_per_tool_step_and_never_for_the_final_answer() {
+        let mock = MockHostFunctions::new();
+        mock.signals.set(true);
+        mock.add_llm_response(thinks("a"));
+        mock.add_llm_response(thinks("b"));
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        agent.run(&session_log_input("go")).unwrap();
+        assert_eq!(*agent.host.asked.borrow(), vec![0, 1]);
+        assert_eq!(agent.host.settled.get(), 1);
+    }
+
+    #[test]
+    fn a_repeated_call_gets_one_correction() {
+        let mock = MockHostFunctions::new();
+        mock.signals.set(true);
+        for _ in 0..4 {
+            mock.add_llm_response(thinks("same"));
+        }
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        agent.run(&session_log_input("go")).unwrap();
+        assert_eq!(agent.host.corrections.borrow().len(), 1);
+        assert_eq!(
+            agent.host.corrections.borrow()[0],
+            vec!["repeat_call".to_string()]
+        );
+        let reqs = agent.host.captured_requests.borrow();
+        let third = tool_texts(&reqs[2]);
+        assert!(
+            third.last().unwrap().contains("[Correction]"),
+            "{:?}",
+            third
+        );
+        assert!(third.last().unwrap().contains("think"));
+        let all: usize = reqs
+            .iter()
+            .map(|r| {
+                tool_texts(r)
+                    .iter()
+                    .filter(|t| t.contains("[Correction]"))
+                    .count()
+            })
+            .max()
+            .unwrap();
+        assert_eq!(all, 1, "the note is added once, not per step");
+    }
+
+    #[test]
+    fn a_slow_signal_is_used_when_it_lands() {
+        let mock = MockHostFunctions::new();
+        mock.signals.set(true);
+        *mock.latest.borrow_mut() = Some(crate::host::StepSignalsView {
+            step: 0,
+            drift: Some(0.95),
+            irrelevant_bulk: None,
+        });
+        mock.add_llm_response(thinks("a"));
+        mock.add_llm_response(thinks("b"));
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        agent.run(&session_log_input("go")).unwrap();
+        assert_eq!(
+            agent.host.corrections.borrow()[0],
+            vec!["drift".to_string()]
+        );
+    }
+
+    #[test]
+    fn with_signals_off_nothing_is_asked() {
+        let mock = MockHostFunctions::new();
+        for _ in 0..4 {
+            mock.add_llm_response(thinks("same"));
+        }
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        agent.run(&session_log_input("go")).unwrap();
+        assert!(agent.host.asked.borrow().is_empty());
+        assert!(agent.host.corrections.borrow().is_empty());
+        assert_eq!(agent.host.settled.get(), 0);
+        for r in agent.host.captured_requests.borrow().iter() {
+            assert!(tool_texts(r).iter().all(|t| !t.contains("[Correction]")));
+        }
     }
 
     fn a_tool_call(name: &str, args: serde_json::Value) -> ToolCall {

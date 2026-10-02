@@ -1064,6 +1064,9 @@ pub trait HostFunctions {
     /// cost is counted in this turn.
     fn settle_signals(&self) {}
 
+    /// A correction note was appended before `step` (spec §5.7).
+    fn record_correction(&self, _step: u32, _triggers: &[&str], _entries: u32) {}
+
     /// The full text of an earlier result shown shortened or hidden, from
     /// byte `offset`.
     fn tool_recall(&self, _chunk_id: &str, _offset: u64) -> HostResult<String> {
@@ -1243,6 +1246,16 @@ pub struct MockHostFunctions {
     pub render_ids: std::cell::Cell<u32>,
     /// What `tool_recall` returns.
     pub recall_text: std::cell::RefCell<String>,
+    /// What `signals_active` answers.
+    pub signals: std::cell::Cell<bool>,
+    /// Steps `step_signals` was called for.
+    pub asked: std::cell::RefCell<Vec<u32>>,
+    /// What `latest_signals` returns.
+    pub latest: std::cell::RefCell<Option<StepSignalsView>>,
+    /// Triggers of each recorded correction.
+    pub corrections: std::cell::RefCell<Vec<Vec<String>>>,
+    /// `settle_signals` calls.
+    pub settled: std::cell::Cell<u32>,
 }
 
 #[cfg(test)]
@@ -1280,6 +1293,11 @@ impl MockHostFunctions {
             recalls: std::cell::RefCell::new(vec![]),
             render_ids: std::cell::Cell::new(0),
             recall_text: std::cell::RefCell::new("FULL TEXT".into()),
+            signals: std::cell::Cell::new(false),
+            asked: std::cell::RefCell::new(vec![]),
+            latest: std::cell::RefCell::new(None),
+            corrections: std::cell::RefCell::new(vec![]),
+            settled: std::cell::Cell::new(0),
         }
     }
 
@@ -1396,6 +1414,28 @@ impl HostFunctions for MockHostFunctions {
             content,
             chunk_id: Some(format!("c{n}")),
         })
+    }
+
+    fn signals_active(&self) -> bool {
+        self.signals.get()
+    }
+
+    fn step_signals(&self, req: &StepSignalsRequest<'_>) {
+        self.asked.borrow_mut().push(req.step);
+    }
+
+    fn latest_signals(&self) -> Option<StepSignalsView> {
+        self.latest.borrow().clone()
+    }
+
+    fn settle_signals(&self) {
+        self.settled.set(self.settled.get() + 1);
+    }
+
+    fn record_correction(&self, _step: u32, triggers: &[&str], _entries: u32) {
+        self.corrections
+            .borrow_mut()
+            .push(triggers.iter().map(|t| t.to_string()).collect());
     }
 
     fn tool_recall(&self, chunk_id: &str, offset: u64) -> HostResult<String> {
