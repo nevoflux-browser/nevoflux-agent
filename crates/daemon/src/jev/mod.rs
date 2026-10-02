@@ -6,6 +6,7 @@ pub mod export;
 pub mod history;
 pub mod oracle;
 pub mod privacy;
+pub mod rebuild;
 pub mod render;
 pub mod rpc;
 pub mod signals;

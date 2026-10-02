@@ -6010,8 +6010,18 @@ async fn load_session_history(
     {
         Ok(mut messages) => {
             // Remove the last message (the current user message we just saved)
-            if !messages.is_empty() {
-                messages.pop();
+            let current = messages.pop();
+            // Jev on: earlier turns come from the session log with their tool
+            // results, graded (spec §5.2); the messages table stays the source
+            // otherwise.
+            if let (Some(cfg), Some(query)) = (services.agent_config.as_ref(), current.as_ref()) {
+                if crate::jev::rebuild::rebuild_point_on(cfg) {
+                    if let Some(history) =
+                        jev_history(cfg, session_id, &query.content, max_messages, services).await
+                    {
+                        return history;
+                    }
+                }
             }
             let registry = services.role_registry();
             let display_name = |slug: &str| -> String {
@@ -6032,6 +6042,47 @@ async fn load_session_history(
             vec![]
         }
     }
+}
+
+/// Earlier turns from the session log, kept or rebuilt (Jev P2-3b). `None`
+/// when the log cannot be read, so the caller falls back to the messages
+/// table.
+async fn jev_history(
+    cfg: &crate::config::AgentConfig,
+    session_id: &str,
+    query: &str,
+    max_messages: u32,
+    services: &HostServices,
+) -> Option<Vec<WasmMessage>> {
+    let events = nevoflux_storage::repositories::SessionEventRepository::new(&services.database)
+        .list(session_id)
+        .ok()?;
+    let wire = cfg
+        .llm
+        .active_provider()
+        .and_then(|p| cfg.llm.resolve_wire(p))?;
+    let writer = Arc::new(crate::session_events::SessionEventWriter::new(
+        services.database.clone(),
+        session_id.to_string(),
+    ));
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let env = crate::jev::rebuild::RebuildEnv {
+        jev: &cfg.jev,
+        wire,
+        events,
+        query,
+        writer: Some(writer),
+        stats: None,
+        opts: crate::jev::history::HistoryOpts {
+            max_messages: max_messages as usize,
+            max_bytes: 32_000,
+        },
+        now_ms,
+    };
+    Some(crate::jev::rebuild::history_for_turn(&env).await)
 }
 
 /// Build the synthetic `chat_message` payload that re-enters
