@@ -395,6 +395,8 @@ pub struct DaemonHostFunctions {
     /// Usage accounting for in-flight streams, keyed by stream_id.
     /// Only populated when [`Self::turn_stats`] is `Some`.
     stream_stats_data: Arc<Mutex<HashMap<u64, StreamStatsData>>>,
+    /// Whether Jev visibility is on for this run, decided once.
+    visibility: std::sync::OnceLock<bool>,
     // Note: always_allowed_tools is on HostServices (shared across requests),
     // not here (per-request DaemonHostFunctions).
 }
@@ -443,6 +445,7 @@ impl DaemonHostFunctions {
             token_budget: None,
             turn_stats: None,
             stream_stats_data: Arc::new(Mutex::new(HashMap::new())),
+            visibility: std::sync::OnceLock::new(),
         }
     }
 
@@ -1507,6 +1510,30 @@ impl DaemonHostFunctions {
         }
     }
 
+    /// Where a tool result of this session is spilled: one file per tool id,
+    /// both path segments sanitised, so an id can only name a file in this
+    /// session's directory. `None` without services or a session.
+    fn spill_path(&self, tool_id: &str) -> Option<std::path::PathBuf> {
+        let services = self.services.as_ref()?;
+        let session_id = self
+            .session_id
+            .as_deref()
+            .unwrap_or(services.session_id.as_str());
+        if session_id.is_empty() {
+            return None;
+        }
+        // `tool-spill`, not `spill`: `spill_attachments_to_local_files` in
+        // server.rs already owns the bare word for remote image attachments,
+        // and two unrelated spills in one crate would read as one thing.
+        Some(
+            crate::paths::resolve_from_daemon()
+                .data_dir
+                .join("tool-spill")
+                .join(sanitise_path_segment(session_id))
+                .join(format!("{}.txt", sanitise_path_segment(tool_id))),
+        )
+    }
+
     /// Build a session event writer for the current session, if there is one.
     ///
     /// Returns `None` when there are no services (unit tests) or no session id
@@ -2061,29 +2088,54 @@ impl HostFunctions for DaemonHostFunctions {
         Ok(names)
     }
 
+    fn visibility_active(&self) -> bool {
+        *self.visibility.get_or_init(|| {
+            let jev = &self.config.jev;
+            let on = jev.is_usable()
+                && jev.points.visibility
+                && crate::jev::client::egress_allowed(crate::local::latch::is_on(), &jev.endpoint);
+            if on {
+                // Open the connection while the first LLM call runs: a cold
+                // one (821 ms measured) misses the 800 ms default timeout.
+                if let Ok(client) = crate::jev::client::shared(jev) {
+                    self.runtime.spawn(async move { client.warm().await });
+                }
+            }
+            on
+        })
+    }
+
+    fn render_tool_result(&self, req: &nevoflux_builtin_wasm::RenderRequest<'_>) -> Option<String> {
+        let store = |id: &str, content: &str| self.spill_tool_result(id, content).is_some();
+        let env = crate::jev::render::RenderEnv {
+            jev: &self.config.jev,
+            current_url: self.current_browser_url.lock().ok().and_then(|u| u.clone()),
+            events: self.event_writer().map(Arc::new),
+            stats: self.turn_stats.clone(),
+            store: &store,
+        };
+        let runtime = self.runtime.clone();
+        tokio::task::block_in_place(|| runtime.block_on(crate::jev::render::render(&env, req)))
+    }
+
+    fn tool_recall(&self, chunk_id: &str, offset: u64) -> HostResult<String> {
+        let unknown = || HostError {
+            code: 404,
+            message: format!("unknown chunk {chunk_id:?}"),
+        };
+        let path = self.spill_path(chunk_id).ok_or_else(unknown)?;
+        let full = std::fs::read_to_string(&path).map_err(|_| unknown())?;
+        Ok(crate::jev::render::recall_slice(&full, offset, chunk_id))
+    }
+
     fn spill_tool_result(&self, tool_id: &str, content: &str) -> Option<String> {
-        let services = self.services.as_ref()?;
-        let session_id = self
-            .session_id
-            .as_deref()
-            .unwrap_or(services.session_id.as_str());
-        if session_id.is_empty() {
-            return None;
+        let path = self.spill_path(tool_id)?;
+        if let Some(dir) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                tracing::warn!(error = %e, "tool spill: cannot create directory; truncation stands");
+                return None;
+            }
         }
-
-        // `tool-spill`, not `spill`: `spill_attachments_to_local_files` in
-        // server.rs already owns the bare word for remote image attachments,
-        // and two unrelated spills in one crate would read as one thing.
-        let dir = crate::paths::resolve_from_daemon()
-            .data_dir
-            .join("tool-spill")
-            .join(sanitise_path_segment(session_id));
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            tracing::warn!(error = %e, "tool spill: cannot create directory; truncation stands");
-            return None;
-        }
-
-        let path = dir.join(format!("{}.txt", sanitise_path_segment(tool_id)));
         if let Err(e) = std::fs::write(&path, content) {
             tracing::warn!(error = %e, "tool spill: write failed; truncation stands");
             return None;
@@ -7861,6 +7913,7 @@ impl DaemonHostFunctions {
             // the reply the user is looking at.
             turn_stats: self.turn_stats.clone(),
             stream_stats_data: Arc::new(Mutex::new(HashMap::new())),
+            visibility: std::sync::OnceLock::new(),
         }
     }
 
@@ -9152,6 +9205,64 @@ mod tests {
             .map(|r| (r.session_id.as_str(), r.role.as_str(), r.input))
             .collect();
         assert_eq!(got, vec![("chat-7", "main", 40), ("chat-7", "jev", 9)]);
+    }
+
+    fn host_in(
+        session: &str,
+        db: std::sync::Arc<nevoflux_storage::Database>,
+    ) -> super::DaemonHostFunctions {
+        super::DaemonHostFunctions::new(
+            std::sync::Arc::new(crate::config::AgentConfig::default()),
+            tokio::runtime::Handle::current(),
+        )
+        .with_session_id(session)
+        .with_services(crate::wasm::services::HostServices::new(db))
+    }
+
+    #[tokio::test]
+    async fn recall_cannot_leave_the_session_directory() {
+        use nevoflux_builtin_wasm::HostFunctions;
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        let unique = format!("recall-test-{}", std::process::id());
+        let other = host_in(&format!("{unique}-s2"), db.clone());
+        assert!(other.spill_tool_result("call_x", "secret of s2").is_some());
+        let mine = host_in(&format!("{unique}-s1"), db);
+        assert_eq!(
+            mine.tool_recall("../../etc/passwd", 0).unwrap_err().code,
+            404
+        );
+        assert_eq!(mine.tool_recall("call_x", 0).unwrap_err().code, 404);
+        assert_eq!(other.tool_recall("call_x", 0).unwrap(), "secret of s2");
+        let _ = std::fs::remove_dir_all(
+            crate::paths::resolve_from_daemon()
+                .data_dir
+                .join("tool-spill")
+                .join(format!("{unique}-s2")),
+        );
+    }
+
+    #[test]
+    fn visibility_is_off_by_default_and_with_the_latch_on() {
+        use nevoflux_builtin_wasm::HostFunctions;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let off = super::DaemonHostFunctions::new(
+            std::sync::Arc::new(crate::config::AgentConfig::default()),
+            rt.handle().clone(),
+        );
+        assert!(!off.visibility_active());
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.jev.enabled = true;
+        cfg.jev.api_key = "k".into();
+        let _g = crate::local::latch::test_serial();
+        crate::local::latch::set(true);
+        let latched =
+            super::DaemonHostFunctions::new(std::sync::Arc::new(cfg), rt.handle().clone());
+        let on = latched.visibility_active();
+        crate::local::latch::set(false);
+        assert!(!on, "remote endpoint with the LocalOnly latch on");
     }
 
     fn host_with_prompt_held_by(pack: &str) -> super::DaemonHostFunctions {

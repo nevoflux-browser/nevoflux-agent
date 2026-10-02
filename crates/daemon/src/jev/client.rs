@@ -46,13 +46,18 @@ fn http_policy(b: reqwest::ClientBuilder, endpoint: &str) -> reqwest::ClientBuil
 /// A request left running after its caller gave up is still cut off here.
 const ORPHAN_CAP: Duration = Duration::from_secs(30);
 
-static SHARED: std::sync::Mutex<Option<((String, String, String), JevClient)>> =
-    std::sync::Mutex::new(None);
+type SharedKey = (String, String, String);
 
-/// The daemon's one Jev client for this configuration: connections are kept
+/// Clients by (endpoint, key, model). Normally one entry; a few configs can
+/// coexist briefly (a settings change mid-turn, tests in parallel).
+static SHARED: std::sync::Mutex<Option<std::collections::HashMap<SharedKey, JevClient>>> =
+    std::sync::Mutex::new(None);
+/// Past this many configurations the cache starts over.
+const SHARED_MAX: usize = 8;
+
+/// The daemon's Jev client for this configuration: connections are kept
 /// across turns (a new HTTPS connection costs ~270 ms; a cold one measured
-/// 821 ms against the 800 ms default timeout). A changed endpoint, key or
-/// model replaces it.
+/// 821 ms against the 800 ms default timeout).
 pub fn shared(cfg: &crate::config::JevConfig) -> Result<JevClient, JevError> {
     if !cfg.is_usable() {
         return Err(JevError::NotConfigured);
@@ -60,13 +65,15 @@ pub fn shared(cfg: &crate::config::JevConfig) -> Result<JevClient, JevError> {
     let key = cfg.resolved_api_key().ok_or(JevError::NotConfigured)?;
     let id = (cfg.endpoint.clone(), key.clone(), cfg.model.clone());
     let mut slot = SHARED.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((k, c)) = slot.as_ref() {
-        if *k == id {
-            return Ok(c.clone());
-        }
+    let map = slot.get_or_insert_with(std::collections::HashMap::new);
+    if let Some(c) = map.get(&id) {
+        return Ok(c.clone());
+    }
+    if map.len() >= SHARED_MAX {
+        map.clear();
     }
     let c = JevClient::new(&cfg.endpoint, &key, &cfg.model);
-    *slot = Some((id, c.clone()));
+    map.insert(id, c.clone());
     Ok(c)
 }
 

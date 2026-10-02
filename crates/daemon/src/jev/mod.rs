@@ -4,6 +4,7 @@ pub mod client;
 pub mod export;
 pub mod oracle;
 pub mod privacy;
+pub mod render;
 pub mod rpc;
 #[cfg(test)]
 pub(crate) mod test_support;
