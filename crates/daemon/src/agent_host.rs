@@ -397,6 +397,12 @@ pub struct DaemonHostFunctions {
     stream_stats_data: Arc<Mutex<HashMap<u64, StreamStatsData>>>,
     /// Whether Jev visibility is on for this run, decided once.
     visibility: std::sync::OnceLock<bool>,
+    /// Whether per-step Jev signals are asked this run, decided once.
+    signals: std::sync::OnceLock<bool>,
+    /// The latest per-step signals that landed (highest step wins).
+    latest_signals: Arc<Mutex<Option<crate::jev::signals::StepSignals>>>,
+    /// Signal requests still in flight, awaited (bounded) at run end.
+    pending_signals: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     // Note: always_allowed_tools is on HostServices (shared across requests),
     // not here (per-request DaemonHostFunctions).
 }
@@ -446,6 +452,9 @@ impl DaemonHostFunctions {
             turn_stats: None,
             stream_stats_data: Arc::new(Mutex::new(HashMap::new())),
             visibility: std::sync::OnceLock::new(),
+            signals: std::sync::OnceLock::new(),
+            latest_signals: Arc::new(Mutex::new(None)),
+            pending_signals: Mutex::new(Vec::new()),
         }
     }
 
@@ -1510,6 +1519,23 @@ impl DaemonHostFunctions {
         }
     }
 
+    /// Jev is configured, egress is allowed (LocalOnly latch) and decision
+    /// point `point` is enabled. The first time it holds, the shared client
+    /// is warmed while the first LLM call runs: a cold connection (821 ms
+    /// measured) misses the 800 ms default timeout.
+    fn jev_point_on(&self, point: bool) -> bool {
+        let jev = &self.config.jev;
+        let on = jev.is_usable()
+            && point
+            && crate::jev::client::egress_allowed(crate::local::latch::is_on(), &jev.endpoint);
+        if on {
+            if let Ok(client) = crate::jev::client::shared(jev) {
+                self.runtime.spawn(async move { client.warm().await });
+            }
+        }
+        on
+    }
+
     /// The browser's tab list, asked directly (no tool-call log, no site
     /// adaptation): for judging which page a result came from. `None` when
     /// there is no browser or it does not answer within 5 s.
@@ -2124,20 +2150,119 @@ impl HostFunctions for DaemonHostFunctions {
     }
 
     fn visibility_active(&self) -> bool {
-        *self.visibility.get_or_init(|| {
-            let jev = &self.config.jev;
-            let on = jev.is_usable()
-                && jev.points.visibility
-                && crate::jev::client::egress_allowed(crate::local::latch::is_on(), &jev.endpoint);
-            if on {
-                // Open the connection while the first LLM call runs: a cold
-                // one (821 ms measured) misses the 800 ms default timeout.
-                if let Ok(client) = crate::jev::client::shared(jev) {
-                    self.runtime.spawn(async move { client.warm().await });
+        *self
+            .visibility
+            .get_or_init(|| self.jev_point_on(self.config.jev.points.visibility))
+    }
+
+    fn signals_active(&self) -> bool {
+        *self
+            .signals
+            .get_or_init(|| self.jev_point_on(self.config.jev.points.rebuild))
+    }
+
+    fn step_signals(&self, req: &nevoflux_builtin_wasm::StepSignalsRequest<'_>) {
+        if !self.signals_active() {
+            return;
+        }
+        let jev = self.config.jev.clone();
+        let Ok(client) = crate::jev::client::shared(&jev) else {
+            return;
+        };
+        let step = req.step;
+        let query = req.query.to_string();
+        let calls: Vec<(String, serde_json::Value)> = req
+            .calls
+            .iter()
+            .map(|c| (c.name.clone(), c.arguments.clone()))
+            .collect();
+        let loaded = req.loaded_tools.clone();
+        let stubs = req.chunk_stubs.clone();
+        let tab_url = req.tab_url.map(str::to_string);
+        let tab_title = req.tab_title.map(str::to_string);
+        let events = self.event_writer().map(Arc::new);
+        let stats = self.turn_stats.clone();
+        let latest = self.latest_signals.clone();
+        let handle = self.runtime.spawn(async move {
+            use crate::jev::signals::{ask_signals, SignalInput, StepCall};
+            let started = std::time::Instant::now();
+            let timeout = std::time::Duration::from_millis(jev.timeout_ms);
+            let oracle = crate::jev::oracle::JevOracle::new(
+                client,
+                jev.sensitive_domains.clone(),
+                events.clone(),
+                stats,
+            );
+            // No page content is in the state; a known tab still decides the
+            // scope, so a sensitive one sends only the metadata keys.
+            let ctx = match &tab_url {
+                Some(u) => crate::jev::oracle::OracleContext::page("signals", u.clone(), timeout),
+                None => crate::jev::oracle::OracleContext::no_page("signals", timeout),
+            };
+            let step_calls: Vec<StepCall> = calls
+                .iter()
+                .map(|(name, arguments)| StepCall { name, arguments })
+                .collect();
+            let input = SignalInput {
+                query: &query,
+                step,
+                calls: &step_calls,
+                loaded_tools: &loaded,
+                chunk_stubs: &stubs,
+                tab: tab_url
+                    .as_deref()
+                    .map(|u| (u, tab_title.as_deref().unwrap_or(""))),
+            };
+            let Some(s) = ask_signals(&oracle, &ctx, &input).await else {
+                return;
+            };
+            if let Some(w) = &events {
+                w.append(
+                    nevoflux_protocol::session_event::SessionEventPayload::JevSignals {
+                        step: s.step,
+                        h: s.h,
+                        drift: s.drift,
+                        irrelevant_bulk: s.irrelevant_bulk,
+                        needs_action: s.needs_action,
+                        elapsed_ms: started.elapsed().as_millis() as u64,
+                    },
+                );
+            }
+            if let Ok(mut g) = latest.lock() {
+                if g.as_ref().map_or(true, |old| old.step <= s.step) {
+                    *g = Some(s);
                 }
             }
-            on
+        });
+        if let Ok(mut p) = self.pending_signals.lock() {
+            p.push(handle);
+        }
+    }
+
+    fn latest_signals(&self) -> Option<nevoflux_builtin_wasm::StepSignalsView> {
+        let g = self.latest_signals.lock().ok()?;
+        g.as_ref().map(|s| nevoflux_builtin_wasm::StepSignalsView {
+            step: s.step,
+            drift: s.drift,
+            irrelevant_bulk: s.irrelevant_bulk,
         })
+    }
+
+    fn settle_signals(&self) {
+        let handles: Vec<_> = match self.pending_signals.lock() {
+            Ok(mut p) => p.drain(..).collect(),
+            Err(_) => return,
+        };
+        if handles.is_empty() {
+            return;
+        }
+        let wait = std::time::Duration::from_millis(self.config.jev.timeout_ms);
+        let runtime = self.runtime.clone();
+        tokio::task::block_in_place(|| {
+            runtime.block_on(async {
+                let _ = tokio::time::timeout(wait, futures::future::join_all(handles)).await;
+            })
+        });
     }
 
     fn render_tool_result(
@@ -7972,6 +8097,9 @@ impl DaemonHostFunctions {
             turn_stats: self.turn_stats.clone(),
             stream_stats_data: Arc::new(Mutex::new(HashMap::new())),
             visibility: std::sync::OnceLock::new(),
+            signals: std::sync::OnceLock::new(),
+            latest_signals: Arc::new(Mutex::new(None)),
+            pending_signals: Mutex::new(Vec::new()),
         }
     }
 
@@ -9321,6 +9449,131 @@ mod tests {
         let on = latched.visibility_active();
         crate::local::latch::set(false);
         assert!(!on, "remote endpoint with the LocalOnly latch on");
+    }
+
+    fn signals_host(
+        url: &str,
+        timeout_ms: u64,
+        rebuild: bool,
+    ) -> (
+        super::DaemonHostFunctions,
+        std::sync::Arc<nevoflux_storage::Database>,
+    ) {
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.jev.enabled = true;
+        cfg.jev.endpoint = url.to_string();
+        cfg.jev.api_key = "k".into();
+        cfg.jev.timeout_ms = timeout_ms;
+        cfg.jev.points.rebuild = rebuild;
+        let host = super::DaemonHostFunctions::new(
+            std::sync::Arc::new(cfg),
+            tokio::runtime::Handle::current(),
+        )
+        .with_session_id("sig-1")
+        .with_services(crate::wasm::services::HostServices::new(db.clone()));
+        (host, db)
+    }
+
+    fn ask_once(host: &super::DaemonHostFunctions) {
+        use nevoflux_builtin_wasm::HostFunctions;
+        let calls = vec![nevoflux_builtin_wasm::ToolCall {
+            id: "t1".into(),
+            call_id: None,
+            name: "read".into(),
+            arguments: serde_json::json!({"file_path": "a.txt"}),
+            signature: None,
+        }];
+        host.step_signals(&nevoflux_builtin_wasm::StepSignalsRequest {
+            step: 2,
+            query: "summarise a.txt",
+            calls: &calls,
+            loaded_tools: vec!["read".into()],
+            chunk_stubs: vec![],
+            tab_url: None,
+            tab_title: None,
+        });
+    }
+
+    fn signals_answer() -> serde_json::Value {
+        serde_json::json!({"answers": {
+            "drift": {"noul": 0.92},
+            "remaining_steps": {"type": "score", "probabilities": {"0": 0.3}}
+        }, "usage": {"input_tokens": 50, "output_tokens": 4}})
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn signals_never_block_the_step() {
+        use nevoflux_builtin_wasm::HostFunctions;
+        let (url, _) = crate::jev::test_support::answering(
+            signals_answer(),
+            std::time::Duration::from_millis(500),
+        )
+        .await;
+        let (host, _db) = signals_host(&url, 2000, true);
+        assert!(host.signals_active());
+        let t = std::time::Instant::now();
+        ask_once(&host);
+        assert!(
+            t.elapsed() < std::time::Duration::from_millis(50),
+            "{:?}",
+            t.elapsed()
+        );
+        host.settle_signals();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn latest_signals_holds_the_answer_once_it_lands() {
+        use nevoflux_builtin_wasm::HostFunctions;
+        let (url, bodies) =
+            crate::jev::test_support::answering(signals_answer(), std::time::Duration::ZERO).await;
+        let (host, db) = signals_host(&url, 2000, true);
+        ask_once(&host);
+        host.settle_signals();
+        let latest = host.latest_signals().expect("landed");
+        assert_eq!((latest.step, latest.drift), (2, Some(0.92)));
+        let sent = bodies.lock().unwrap().join("\n");
+        assert!(sent.contains("summarise a.txt") && sent.contains("a.txt"));
+        let events = nevoflux_storage::repositories::SessionEventRepository::new(&db)
+            .list("sig-1")
+            .unwrap();
+        assert!(events.iter().any(|e| matches!(
+            &e.payload,
+            nevoflux_protocol::session_event::SessionEventPayload::JevSignals {
+                step: 2,
+                h: Some(1),
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn settle_waits_at_most_the_timeout() {
+        use nevoflux_builtin_wasm::HostFunctions;
+        let (url, _) = crate::jev::test_support::answering(
+            signals_answer(),
+            std::time::Duration::from_secs(3),
+        )
+        .await;
+        let (host, _db) = signals_host(&url, 200, true);
+        ask_once(&host);
+        let t = std::time::Instant::now();
+        host.settle_signals();
+        assert!(
+            t.elapsed() < std::time::Duration::from_millis(1500),
+            "{:?}",
+            t.elapsed()
+        );
+        assert!(host.latest_signals().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn signals_are_off_without_points_rebuild() {
+        use nevoflux_builtin_wasm::HostFunctions;
+        let (url, _) =
+            crate::jev::test_support::answering(signals_answer(), std::time::Duration::ZERO).await;
+        let (host, _db) = signals_host(&url, 2000, false);
+        assert!(!host.signals_active());
     }
 
     fn host_with_prompt_held_by(pack: &str) -> super::DaemonHostFunctions {

@@ -44,6 +44,29 @@ pub struct RenderRequest<'a> {
     pub max_bytes: usize,
 }
 
+/// The step whose signals are being asked (Jev request ①, spec §5.4).
+pub struct StepSignalsRequest<'a> {
+    /// 0-based step.
+    pub step: u32,
+    pub query: &'a str,
+    /// The tool calls this step is about to run.
+    pub calls: &'a [ToolCall],
+    /// Names of the tools offered on this step.
+    pub loaded_tools: Vec<String>,
+    /// One stub line per stored (compressed) chunk.
+    pub chunk_stubs: Vec<String>,
+    pub tab_url: Option<&'a str>,
+    pub tab_title: Option<&'a str>,
+}
+
+/// What the loop needs of the latest signals that landed.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StepSignalsView {
+    pub step: u32,
+    pub drift: Option<f64>,
+    pub irrelevant_bulk: Option<f64>,
+}
+
 /// What the host made of a tool result: the text the model sees and, when
 /// the full text was stored, the chunk `recall` takes.
 #[derive(Debug, Clone, PartialEq)]
@@ -1023,6 +1046,23 @@ pub trait HostFunctions {
     fn render_tool_result(&self, _req: &RenderRequest<'_>) -> Option<Rendered> {
         None
     }
+
+    /// Whether per-step Jev signals are asked this run. Asked once per run.
+    fn signals_active(&self) -> bool {
+        false
+    }
+
+    /// Ask this step's signals without waiting for them.
+    fn step_signals(&self, _req: &StepSignalsRequest<'_>) {}
+
+    /// The latest signals that have landed, if any.
+    fn latest_signals(&self) -> Option<StepSignalsView> {
+        None
+    }
+
+    /// Wait (at most the Jev timeout) for signals still in flight, so their
+    /// cost is counted in this turn.
+    fn settle_signals(&self) {}
 
     /// The full text of an earlier result shown shortened or hidden, from
     /// byte `offset`.
