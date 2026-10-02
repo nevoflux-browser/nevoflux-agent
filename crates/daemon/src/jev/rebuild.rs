@@ -344,6 +344,56 @@ pub async fn polluted_rebuild(env: &RebuildEnv<'_>, h: u32) -> Option<Vec<Messag
     }
 }
 
+/// Earlier turns from the session log, kept or rebuilt for `query` — the
+/// Jev history path shared by chat and tasks. `None` when the log cannot be
+/// read or the provider has no wire.
+pub async fn history_from_log(
+    cfg: &crate::config::AgentConfig,
+    database: &Arc<nevoflux_storage::Database>,
+    session_id: &str,
+    query: &str,
+    max_messages: usize,
+) -> Option<Vec<Message>> {
+    let events = nevoflux_storage::repositories::SessionEventRepository::new(database)
+        .list(session_id)
+        .ok()?;
+    let wire = cfg
+        .llm
+        .active_provider()
+        .and_then(|p| cfg.llm.resolve_wire(p))?;
+    let writer = Arc::new(SessionEventWriter::new(
+        database.clone(),
+        session_id.to_string(),
+    ));
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let env = RebuildEnv {
+        jev: &cfg.jev,
+        wire,
+        events,
+        query,
+        writer: Some(writer),
+        stats: None,
+        opts: HistoryOpts {
+            max_messages,
+            max_bytes: 32_000,
+        },
+        now_ms,
+    };
+    Some(history_for_turn(&env).await)
+}
+
+/// The log's history when it has turns, the caller's otherwise (a task's
+/// caller may supply history the log never saw, e.g. A2A).
+pub fn prefer_log(log: Option<Vec<Message>>, text: Vec<Message>) -> Vec<Message> {
+    match log {
+        Some(h) if !h.is_empty() => h,
+        _ => text,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,6 +641,21 @@ mod tests {
         assert!(out.is_none());
         assert!(ev.iter().any(|e| matches!(e,
             SessionEventPayload::ContextRebuild { reason, decision, .. } if reason == "polluted" && decision == "keep")));
+    }
+
+    #[test]
+    fn log_history_wins_only_when_it_has_turns() {
+        let text = vec![Message::user("from the caller")];
+        let log = vec![Message::user("from the log")];
+        assert_eq!(
+            prefer_log(Some(log.clone()), text.clone())[0].content,
+            "from the log"
+        );
+        assert_eq!(
+            prefer_log(Some(vec![]), text.clone())[0].content,
+            "from the caller"
+        );
+        assert_eq!(prefer_log(None, text)[0].content, "from the caller");
     }
 
     #[test]

@@ -6054,35 +6054,14 @@ async fn jev_history(
     max_messages: u32,
     services: &HostServices,
 ) -> Option<Vec<WasmMessage>> {
-    let events = nevoflux_storage::repositories::SessionEventRepository::new(&services.database)
-        .list(session_id)
-        .ok()?;
-    let wire = cfg
-        .llm
-        .active_provider()
-        .and_then(|p| cfg.llm.resolve_wire(p))?;
-    let writer = Arc::new(crate::session_events::SessionEventWriter::new(
-        services.database.clone(),
-        session_id.to_string(),
-    ));
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    let env = crate::jev::rebuild::RebuildEnv {
-        jev: &cfg.jev,
-        wire,
-        events,
+    crate::jev::rebuild::history_from_log(
+        cfg,
+        &services.database,
+        session_id,
         query,
-        writer: Some(writer),
-        stats: None,
-        opts: crate::jev::history::HistoryOpts {
-            max_messages: max_messages as usize,
-            max_bytes: 32_000,
-        },
-        now_ms,
-    };
-    Some(crate::jev::rebuild::history_for_turn(&env).await)
+        max_messages as usize,
+    )
+    .await
 }
 
 /// Build the synthetic `chat_message` payload that re-enters
