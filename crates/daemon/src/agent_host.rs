@@ -2140,7 +2140,10 @@ impl HostFunctions for DaemonHostFunctions {
         })
     }
 
-    fn render_tool_result(&self, req: &nevoflux_builtin_wasm::RenderRequest<'_>) -> Option<String> {
+    fn render_tool_result(
+        &self,
+        req: &nevoflux_builtin_wasm::RenderRequest<'_>,
+    ) -> Option<nevoflux_builtin_wasm::Rendered> {
         let store = |id: &str, content: &str| self.spill_tool_result(id, content).is_some();
         // A browser result is judged by the tab the browser says it is on now;
         // the last navigate URL goes stale after a click or a redirect.

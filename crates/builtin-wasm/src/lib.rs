@@ -36,7 +36,7 @@ pub mod local_mode;
 pub mod types;
 
 pub use agent::{Agent, AgentConfig, ASYNC_SAFE_TOOLS};
-pub use host::{HostError, HostFunctions, HostResult, RenderRequest};
+pub use host::{HostError, HostFunctions, HostResult, RenderRequest, Rendered};
 pub use nevoflux_protocol::LocalFileRef;
 pub use types::{
     AgentInput, AgentMode, AgentOutput, Attachment, BashResult, BashStatus, BrowserToolResult,

@@ -1867,6 +1867,9 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
         // Jev visibility (spec §5.6): cloud turns only (§3.2), asked once.
         let visibility = input.local.is_none() && self.host.visibility_active();
         self.visibility_on.set(visibility);
+        // tool_call_id → (chunk id, offset): what an aged result's stub points at.
+        let mut chunks: std::collections::HashMap<String, (String, u64)> =
+            std::collections::HashMap::new();
 
         let mut iterations = 0;
         let mut final_text = String::new();
@@ -1913,7 +1916,11 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
             // With Jev visibility on, large results are already graded at
             // insertion and reachable with `recall`; aged-shrink is off
             // (spec §5.6.7).
-            if !visibility {
+            if visibility {
+                // Same selection as aged-shrink, but a stored result becomes a
+                // recall stub (lossless) instead of a cut head.
+                stub_aged_tool_results_with(&mut messages, budget, &chunks);
+            } else {
                 shrink_aged_tool_results_with(&mut messages, budget);
             }
 
@@ -2115,13 +2122,32 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                 } else {
                     None
                 };
-                let source = rendered.as_deref().unwrap_or(&result.content);
+                let chunk = rendered.as_ref().and_then(|r| r.chunk_id.clone());
+                if let Some(c) = &chunk {
+                    chunks.insert(result.tool_call_id.clone(), (c.clone(), 0));
+                }
+                if visibility && tool_call.name == "recall" {
+                    if let Some(id) = tool_call.arguments["chunk_id"].as_str() {
+                        let offset = tool_call.arguments["offset"].as_u64().unwrap_or(0);
+                        chunks.insert(result.tool_call_id.clone(), (id.to_string(), offset));
+                    }
+                }
+                let source = rendered
+                    .as_ref()
+                    .map(|r| r.content.as_str())
+                    .unwrap_or(&result.content);
 
                 let trimmed = truncate_tool_result_with(&messages, source, budget);
                 let content = if trimmed.len() < source.len() && rendered.is_some() {
-                    // A rendition already points at its stored original
-                    // (its first line); spilling it would overwrite that.
-                    trimmed
+                    // The original is stored already; spilling this text would
+                    // overwrite it. A rendition names its chunk on its first
+                    // line; a full text kept as it was does not, so say where.
+                    match &chunk {
+                        Some(c) if !trimmed.contains("recall(") => format!(
+                            "{trimmed}\n\n[shortened — recall(\"{c}\") returns the full text]"
+                        ),
+                        _ => trimmed,
+                    }
                 } else if trimmed.len() < source.len() {
                     match self.host.spill_tool_result(&result.tool_call_id, source) {
                         Some(path) => format!(
@@ -6835,6 +6861,16 @@ fn shrink_aged_tool_results(messages: &mut [Message]) {
 /// Idempotent: a result already under budget is left alone, so repeated calls
 /// across loop iterations converge instead of eating into it each time.
 fn shrink_aged_tool_results_with(messages: &mut [Message], budget: ResultBudget) {
+    for i in aged_selection(messages, budget) {
+        messages[i].content = shrunk(&messages[i].content, budget);
+    }
+}
+
+/// Indices of the aged tool results to replace this time: the results older
+/// than the [`RECENT_TOOL_RESULTS_KEPT_WHOLE`] newest that are over
+/// `budget.aged`, and only once those add up to more than
+/// `budget.aged_watermark` (batched, so the cached prefix changes rarely).
+fn aged_selection(messages: &[Message], budget: ResultBudget) -> Vec<usize> {
     let results: Vec<usize> = messages
         .iter()
         .enumerate()
@@ -6842,7 +6878,7 @@ fn shrink_aged_tool_results_with(messages: &mut [Message], budget: ResultBudget)
         .map(|(i, _)| i)
         .collect();
     if results.len() <= RECENT_TOOL_RESULTS_KEPT_WHOLE {
-        return;
+        return Vec::new();
     }
     let aged = &results[..results.len() - RECENT_TOOL_RESULTS_KEPT_WHOLE];
     let pending: usize = aged
@@ -6851,24 +6887,57 @@ fn shrink_aged_tool_results_with(messages: &mut [Message], budget: ResultBudget)
         .filter(|&len| len > budget.aged)
         .sum();
     if pending <= budget.aged_watermark {
-        return;
+        return Vec::new();
     }
-    for &i in aged {
-        let full = messages[i].content.len();
-        if full <= budget.aged {
-            continue;
-        }
-        // The note counts against the budget, so that what comes out is *under*
-        // it and the `<=` above skips this result next time. Idempotence by
-        // construction rather than by recognising our own note — a tool result
-        // is free to contain any text, including that note.
-        let note = format!(
-            "...\n\n[Earlier tool result: {full} bytes, shortened. Ask again if \
-             this turn still needs it.]"
-        );
-        let head_budget = budget.aged.saturating_sub(note.len());
-        let head = truncate_string_safe(&messages[i].content, head_budget).to_string();
-        messages[i].content = head + &note;
+    aged.iter()
+        .copied()
+        .filter(|&i| messages[i].content.len() > budget.aged)
+        .collect()
+}
+
+/// The aged-shrink text: the head, then a note.
+fn shrunk(content: &str, budget: ResultBudget) -> String {
+    let full = content.len();
+    // The note counts against the budget, so that what comes out is *under*
+    // it and the selection skips this result next time. Idempotence by
+    // construction rather than by recognising our own note — a tool result
+    // is free to contain any text, including that note.
+    let note = format!(
+        "...\n\n[Earlier tool result: {full} bytes, shortened. Ask again if \
+         this turn still needs it.]"
+    );
+    let head_budget = budget.aged.saturating_sub(note.len());
+    truncate_string_safe(content, head_budget).to_string() + &note
+}
+
+/// Jev visibility's aged pass: the same selection as
+/// [`shrink_aged_tool_results_with`], but a result whose full text is stored
+/// (`chunks`: tool_call_id → (chunk id, offset)) becomes a one-line `recall`
+/// stub — nothing is lost. Results with no stored text are shrunk as usual.
+fn stub_aged_tool_results_with(
+    messages: &mut [Message],
+    budget: ResultBudget,
+    chunks: &std::collections::HashMap<String, (String, u64)>,
+) {
+    for i in aged_selection(messages, budget) {
+        let known = messages[i]
+            .tool_call_id
+            .as_ref()
+            .and_then(|id| chunks.get(id));
+        messages[i].content = match known {
+            Some((chunk, offset)) => {
+                let at = if *offset > 0 {
+                    format!(", offset={offset}")
+                } else {
+                    String::new()
+                };
+                format!(
+                    "[{chunk} · aged · {} bytes] — recall(\"{chunk}\"{at}) returns it",
+                    messages[i].content.len()
+                )
+            }
+            None => shrunk(&messages[i].content, budget),
+        };
     }
 }
 
@@ -8426,10 +8495,10 @@ mod tests {
     }
 
     #[test]
-    fn aged_results_are_not_shrunk_while_visibility_is_on() {
-        // 18 results of 13 KB in one step: with aged-shrink, the 6 oldest
-        // (78 KB, over the 64 KB watermark) would be cut to 4 KB before the
-        // next call. With visibility on they must reach it whole.
+    fn aged_results_become_recall_stubs_while_visibility_is_on() {
+        // 18 results of 13 KB in one step: the 6 oldest (78 KB, over the
+        // 64 KB watermark) are replaced by stubs naming their chunks; the 12
+        // newest stay whole.
         let big = "z".repeat(13_000);
         let mock = MockHostFunctions::new();
         mock.visibility.set(true);
@@ -8443,15 +8512,72 @@ mod tests {
         let agent = session_log_agent(mock);
         agent.run(&session_log_input("go")).unwrap();
         let req = agent.host.captured_requests.borrow()[1].clone();
-        let first = req
+        let results: Vec<&Message> = req
             .messages
             .iter()
-            .find(|m| matches!(m.role, MessageRole::Tool))
-            .unwrap();
-        assert_eq!(
-            first.content.len(),
-            big.len(),
-            "the oldest result was shrunk"
+            .filter(|m| matches!(m.role, MessageRole::Tool))
+            .collect();
+        assert_eq!(results.len(), 18);
+        for (i, m) in results.iter().enumerate().take(6) {
+            assert!(m.content.len() < 300, "{}", m.content.len());
+            assert!(
+                m.content.contains(&format!("recall(\"c{i}\")")),
+                "{}",
+                m.content
+            );
+        }
+        for m in &results[6..] {
+            // Whole, or (once the context budget is used up) trimmed with a
+            // pointer to its stored original — never a stub.
+            assert!(m.content.len() > 10_000, "{}", m.content.len());
+            if m.content.len() < big.len() {
+                assert!(m.content.contains("recall(\"c"), "trimmed without a pointer");
+            }
+        }
+    }
+
+    #[test]
+    fn an_aged_recall_becomes_a_stub_for_its_source() {
+        let mock = MockHostFunctions::new();
+        mock.visibility.set(true);
+        *mock.recall_text.borrow_mut() = "R".repeat(30_000);
+        let recalls: Vec<ToolCall> = (0..16)
+            .map(|i| ToolCall {
+                id: format!("r{i}"),
+                call_id: None,
+                name: "recall".into(),
+                arguments: serde_json::json!({"chunk_id": "cA", "offset": i * 32_000}),
+                signature: None,
+            })
+            .collect();
+        mock.add_llm_response(LlmResponse {
+            text: "".into(),
+            tool_calls: recalls,
+            reasoning: None,
+        });
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        agent.run(&session_log_input("go")).unwrap();
+        let req = agent.host.captured_requests.borrow()[1].clone();
+        let results: Vec<&Message> = req
+            .messages
+            .iter()
+            .filter(|m| matches!(m.role, MessageRole::Tool))
+            .collect();
+        assert!(
+            results[0].content.contains("recall(\"cA\")"),
+            "{}",
+            results[0].content
+        );
+        assert!(
+            !results[0].content.contains("offset="),
+            "{}",
+            results[0].content
+        );
+        assert!(
+            results[1].content.contains("recall(\"cA\", offset=32000)"),
+            "{}",
+            results[1].content
         );
     }
 

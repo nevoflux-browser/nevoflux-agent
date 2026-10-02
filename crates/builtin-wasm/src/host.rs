@@ -44,6 +44,14 @@ pub struct RenderRequest<'a> {
     pub max_bytes: usize,
 }
 
+/// What the host made of a tool result: the text the model sees and, when
+/// the full text was stored, the chunk `recall` takes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rendered {
+    pub content: String,
+    pub chunk_id: Option<String>,
+}
+
 /// Host function interface.
 ///
 /// This trait defines all host functions available to the Wasm guest.
@@ -1012,7 +1020,7 @@ pub trait HostFunctions {
 
     /// The text to show the model instead of `req.content`, or `None` to
     /// keep it. Called after the result was recorded in full.
-    fn render_tool_result(&self, _req: &RenderRequest<'_>) -> Option<String> {
+    fn render_tool_result(&self, _req: &RenderRequest<'_>) -> Option<Rendered> {
         None
     }
 
@@ -1191,6 +1199,10 @@ pub struct MockHostFunctions {
     pub render_with: std::cell::RefCell<Option<String>>,
     /// `tool_recall` calls, as (chunk id, offset).
     pub recalls: std::cell::RefCell<Vec<(String, u64)>>,
+    /// Chunk ids handed out by `render_tool_result`: `c0`, `c1`, …
+    pub render_ids: std::cell::Cell<u32>,
+    /// What `tool_recall` returns.
+    pub recall_text: std::cell::RefCell<String>,
 }
 
 #[cfg(test)]
@@ -1226,6 +1238,8 @@ impl MockHostFunctions {
             rendered: std::cell::RefCell::new(vec![]),
             render_with: std::cell::RefCell::new(None),
             recalls: std::cell::RefCell::new(vec![]),
+            render_ids: std::cell::Cell::new(0),
+            recall_text: std::cell::RefCell::new("FULL TEXT".into()),
         }
     }
 
@@ -1331,18 +1345,24 @@ impl HostFunctions for MockHostFunctions {
         self.visibility.get()
     }
 
-    fn render_tool_result(&self, req: &RenderRequest<'_>) -> Option<String> {
+    fn render_tool_result(&self, req: &RenderRequest<'_>) -> Option<Rendered> {
         self.rendered
             .borrow_mut()
             .push((req.call.name.clone(), req.content.len()));
-        self.render_with.borrow().clone()
+        let content = self.render_with.borrow().clone()?;
+        let n = self.render_ids.get();
+        self.render_ids.set(n + 1);
+        Some(Rendered {
+            content,
+            chunk_id: Some(format!("c{n}")),
+        })
     }
 
     fn tool_recall(&self, chunk_id: &str, offset: u64) -> HostResult<String> {
         self.recalls
             .borrow_mut()
             .push((chunk_id.to_string(), offset));
-        Ok("FULL TEXT".into())
+        Ok(self.recall_text.borrow().clone())
     }
 
     fn record_turn_boundary(&self, turn: u32, start: bool) {

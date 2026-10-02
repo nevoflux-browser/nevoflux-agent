@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use nevoflux_builtin_wasm::RenderRequest;
+use nevoflux_builtin_wasm::{RenderRequest, Rendered};
 use nevoflux_protocol::session_event::SessionEventPayload;
 
 use super::client;
@@ -34,7 +34,7 @@ pub struct RenderEnv<'a> {
 }
 
 /// Grade and render one tool result, or `None` to leave it as it is.
-pub async fn render(env: &RenderEnv<'_>, req: &RenderRequest<'_>) -> Option<String> {
+pub async fn render(env: &RenderEnv<'_>, req: &RenderRequest<'_>) -> Option<Rendered> {
     let content = req.content;
     if content.len() <= SMALL {
         return None;
@@ -67,27 +67,33 @@ pub async fn render(env: &RenderEnv<'_>, req: &RenderRequest<'_>) -> Option<Stri
     };
     // Sensitive or unknown pages are never sent (§5.8): the local rule.
     if ctx.scope(&env.jev.sensitive_domains) == Scope::MetadataOnly {
-        return Some(finish(
-            env,
-            req,
+        return Some(named(
             &chunk,
-            Level::Short,
-            &lines,
-            &[],
-            "sensitive",
-            started,
+            finish(
+                env,
+                req,
+                &chunk,
+                Level::Short,
+                &lines,
+                &[],
+                "sensitive",
+                started,
+            ),
         ));
     }
     let Ok(jev_client) = client::shared(env.jev) else {
-        return Some(finish(
-            env,
-            req,
+        return Some(named(
             &chunk,
-            Level::Short,
-            &lines,
-            &[],
-            "fallback",
-            started,
+            finish(
+                env,
+                req,
+                &chunk,
+                Level::Short,
+                &lines,
+                &[],
+                "fallback",
+                started,
+            ),
         ));
     };
     let oracle = JevOracle::new(
@@ -109,15 +115,18 @@ pub async fn render(env: &RenderEnv<'_>, req: &RenderRequest<'_>) -> Option<Stri
             Verdict::Answered(r) => answers.push(r),
             // Each failing part was logged as jev/fallback by the oracle.
             Verdict::Fallback { .. } => {
-                return Some(finish(
-                    env,
-                    req,
+                return Some(named(
                     &chunk,
-                    Level::Short,
-                    &lines,
-                    &[],
-                    "fallback",
-                    started,
+                    finish(
+                        env,
+                        req,
+                        &chunk,
+                        Level::Short,
+                        &lines,
+                        &[],
+                        "fallback",
+                        started,
+                    ),
                 ));
             }
         }
@@ -125,18 +134,28 @@ pub async fn render(env: &RenderEnv<'_>, req: &RenderRequest<'_>) -> Option<Stri
     let grade = combine(&ps, &answers);
     if grade.level == Level::Full && content.len() <= req.max_bytes {
         log(env, req, &chunk, Level::Full, 0, "jev", started);
-        return None;
+        return Some(named(&chunk, req.content.to_string()));
     }
-    Some(finish(
-        env,
-        req,
+    Some(named(
         &chunk,
-        grade.level,
-        &lines,
-        &grade.kept,
-        "jev",
-        started,
+        finish(
+            env,
+            req,
+            &chunk,
+            grade.level,
+            &lines,
+            &grade.kept,
+            "jev",
+            started,
+        ),
     ))
+}
+
+fn named(chunk: &str, content: String) -> Rendered {
+    Rendered {
+        content,
+        chunk_id: Some(chunk.to_string()),
+    }
 }
 
 fn finish(
@@ -276,6 +295,7 @@ mod tests {
 
     struct Run {
         out: Option<String>,
+        chunk: Option<String>,
         stored: HashMap<String, String>,
     }
 
@@ -313,9 +333,10 @@ mod tests {
             content,
             max_bytes: 32_000,
         };
-        let out = render(&env, &req).await;
+        let rendered = render(&env, &req).await;
         Run {
-            out,
+            out: rendered.as_ref().map(|r| r.content.clone()),
+            chunk: rendered.and_then(|r| r.chunk_id),
             stored: stored.into_inner(),
         }
     }
@@ -393,19 +414,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_full_grade_that_fits_is_left_alone() {
+    async fn a_full_grade_that_fits_keeps_the_text_and_names_the_chunk() {
         let (url, _) = answering(answer("full", &[]), Duration::ZERO).await;
+        let content = hundred_lines();
         let r = run(
             &jev(&url, 2000),
             "read",
             serde_json::json!({}),
             None,
-            &hundred_lines(),
+            &content,
             true,
             None,
         )
         .await;
-        assert!(r.out.is_none());
+        assert_eq!(r.out.as_deref(), Some(content.as_str()));
+        let chunk = r.chunk.expect("chunk id");
+        assert_eq!(r.stored.get(&chunk), Some(&content));
     }
 
     #[tokio::test]
