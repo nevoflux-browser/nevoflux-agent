@@ -7518,6 +7518,7 @@ mod tests {
         let agent = Agent::new(mock);
 
         let input = AgentInput {
+            jev_tools: None,
             session_id: "sess-001".into(),
             mode: AgentMode::Agent,
             user_message: "Search for files".into(),
@@ -8151,6 +8152,7 @@ mod tests {
 
     fn local_input(mode: AgentMode, message: &str, carried: &[&str]) -> AgentInput {
         AgentInput {
+            jev_tools: None,
             session_id: "t".into(),
             mode,
             user_message: message.into(),
@@ -9582,6 +9584,7 @@ mod tests {
         let agent = Agent::new(mock);
 
         let input = AgentInput {
+            jev_tools: None,
             session_id: "sess-001".into(),
             mode: AgentMode::Chat,
             user_message: "Hello".into(),
@@ -9611,6 +9614,7 @@ mod tests {
         let agent = Agent::new(mock);
 
         let input = AgentInput {
+            jev_tools: None,
             session_id: "sess-001".into(),
             mode: AgentMode::Browser,
             user_message: "Click the button".into(),
@@ -9640,6 +9644,7 @@ mod tests {
         let agent = Agent::new(mock);
 
         let input = AgentInput {
+            jev_tools: None,
             session_id: "sess-001".into(),
             mode: AgentMode::Agent,
             user_message: "List files".into(),
@@ -9692,6 +9697,7 @@ mod tests {
         };
         let agent = Agent::with_config(mock, config);
         let input = AgentInput {
+            jev_tools: None,
             session_id: "sess-001".into(),
             mode: AgentMode::Chat,
             user_message: "Tell me about Rust".into(),
@@ -10116,6 +10122,7 @@ mod tests {
         let agent = Agent::with_config(mock, config);
         let tools = agent.get_browser_tools();
         let input = AgentInput {
+            jev_tools: None,
             session_id: "t".into(),
             mode: AgentMode::Browser,
             user_message: "click the thing".into(),
@@ -10487,6 +10494,7 @@ mod tests {
         let tools = agent.get_chat_tools();
 
         let input = AgentInput {
+            jev_tools: None,
             session_id: "t".into(),
             mode: AgentMode::Chat,
             user_message: "make me a short promo video".into(),
@@ -10821,6 +10829,7 @@ mod tests {
         let agent = Agent::new(mock);
 
         let input = AgentInput {
+            jev_tools: None,
             session_id: "sess-001".into(),
             mode: AgentMode::Chat,
             user_message: "Hello".into(),
@@ -10854,6 +10863,7 @@ mod tests {
         let agent = Agent::new(mock);
 
         let input = AgentInput {
+            jev_tools: None,
             session_id: "sess-001".into(),
             mode: AgentMode::Chat,
             user_message: "Hello".into(),

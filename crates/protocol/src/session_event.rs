@@ -343,6 +343,25 @@ pub enum SessionEventPayload {
         /// Chunks re-graded by Jev.
         regraded: u32,
     },
+    /// A decision about the tools offered to the model (Jev tool assembly,
+    /// spec §5.5).
+    #[serde(rename = "tools/select")]
+    ToolsSelect {
+        /// `initial`, `ttl_expired`, `tool_change`, `kept`, `fallback`,
+        /// `missed` (the model called a tool it was not offered) or `act`.
+        reason: String,
+        /// The full set after the decision, core tools included, sorted.
+        names: Vec<String>,
+        /// Tools in the new set but not the previous one.
+        #[serde(default)]
+        added: Vec<String>,
+        /// Tools in the previous set but not the new one.
+        #[serde(default)]
+        removed: Vec<String>,
+        /// Time spent asking Jev (0 when it was not asked).
+        #[serde(default)]
+        elapsed_ms: u64,
+    },
 }
 
 impl SessionEventPayload {
@@ -373,6 +392,7 @@ impl SessionEventPayload {
             Self::JevSignals { .. } => "jev/signals",
             Self::ContextCorrection { .. } => "context/correction",
             Self::ContextRebuild { .. } => "context/rebuild",
+            Self::ToolsSelect { .. } => "tools/select",
         }
     }
 }
@@ -502,6 +522,23 @@ mod tests {
         assert_eq!(v["type"], "context/correction");
         assert_eq!(v["triggers"][1], "drift");
         assert_eq!(p.type_str(), "context/correction");
+        let back: SessionEventPayload = serde_json::from_value(v).unwrap();
+        assert_eq!(back, p);
+    }
+
+    #[test]
+    fn tools_select_wire_shape() {
+        let p = SessionEventPayload::ToolsSelect {
+            reason: "tool_change".into(),
+            names: vec!["browser_navigate".into(), "web_search".into()],
+            added: vec!["web_search".into()],
+            removed: vec!["think".into()],
+            elapsed_ms: 420,
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["type"], "tools/select");
+        assert_eq!(v["added"][0], "web_search");
+        assert_eq!(p.type_str(), "tools/select");
         let back: SessionEventPayload = serde_json::from_value(v).unwrap();
         assert_eq!(back, p);
     }

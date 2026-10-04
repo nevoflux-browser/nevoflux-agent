@@ -6917,6 +6917,7 @@ async fn handle_chat_message_streaming(
     let local_mode_active = config.llm.active_provider() == Some("local");
 
     let input = AgentInput {
+        jev_tools: None,
         session_id: session_id.clone(),
         mode,
         user_message: effective_message,
@@ -7534,6 +7535,7 @@ async fn handle_chat_message_streaming(
 
                         // Build new input with plan as user message
                         let rerun_input = AgentInput {
+                            jev_tools: None,
                             session_id: session_id.clone(),
                             mode,
                             user_message: plan_text.clone(),
@@ -8771,6 +8773,7 @@ async fn handle_chat_message(
 
             // Build agent input with skill context injected into system prompt
             let input = AgentInput {
+                jev_tools: None,
                 session_id: session_id.clone(),
                 mode,
                 user_message,

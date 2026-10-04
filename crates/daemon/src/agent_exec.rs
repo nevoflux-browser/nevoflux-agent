@@ -310,6 +310,7 @@ pub async fn run_agent_once(
     );
 
     let input = AgentInput {
+        jev_tools: None,
         // No soul is bound on this path, so every skill stays suggested.
         skills_filter: None,
         session_id: req.session_id.clone(),

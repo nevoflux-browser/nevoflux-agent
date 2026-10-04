@@ -378,6 +378,10 @@ pub struct AgentInput {
     /// on-device engine. `None` for every cloud-model turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local: Option<LocalModeInput>,
+    /// Jev's tool set for this turn (spec §5.5); `None` offers the mode's
+    /// tools as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jev_tools: Option<Vec<String>>,
 }
 
 /// Skill context for injection into system prompt.
@@ -835,6 +839,7 @@ mod tests {
     #[test]
     fn test_agent_input() {
         let input = AgentInput {
+            jev_tools: None,
             session_id: "sess-001".into(),
             mode: AgentMode::Agent,
             user_message: "Help me".into(),
@@ -861,6 +866,7 @@ mod tests {
     #[test]
     fn test_agent_input_with_custom_prompt() {
         let input = AgentInput {
+            jev_tools: None,
             session_id: "sess-001".into(),
             mode: AgentMode::Agent,
             user_message: "Search for files".into(),
@@ -890,6 +896,7 @@ mod tests {
     #[test]
     fn test_agent_input_custom_prompt_serialization() {
         let input = AgentInput {
+            jev_tools: None,
             session_id: "sess-001".into(),
             mode: AgentMode::Chat,
             user_message: "Hello".into(),
@@ -914,6 +921,7 @@ mod tests {
 
         // Verify None is not serialized
         let input_no_prompt = AgentInput {
+            jev_tools: None,
             session_id: "sess-001".into(),
             mode: AgentMode::Chat,
             user_message: "Hello".into(),
@@ -1136,6 +1144,7 @@ mod tests {
     #[test]
     fn test_agent_input_with_local_files() {
         let input = AgentInput {
+            jev_tools: None,
             session_id: "sess-001".into(),
             mode: AgentMode::Chat,
             user_message: "Analyze this file".into(),
@@ -1171,6 +1180,7 @@ mod tests {
     #[test]
     fn test_agent_input_local_files_empty_not_serialized() {
         let input = AgentInput {
+            jev_tools: None,
             session_id: "sess-001".into(),
             mode: AgentMode::Chat,
             user_message: "Hello".into(),
@@ -1197,6 +1207,7 @@ mod tests {
     #[test]
     fn test_agent_input_with_tab_id() {
         let input = AgentInput {
+            jev_tools: None,
             session_id: "sess-001".into(),
             mode: AgentMode::Browser,
             user_message: "Summarize this page".into(),
@@ -1223,6 +1234,7 @@ mod tests {
 
         // Verify None is not serialized
         let input_no_tab = AgentInput {
+            jev_tools: None,
             session_id: "sess-001".into(),
             mode: AgentMode::Chat,
             user_message: "Hello".into(),
@@ -1248,6 +1260,7 @@ mod tests {
     #[test]
     fn test_agent_input_with_tab_ids() {
         let input = AgentInput {
+            jev_tools: None,
             session_id: "sess-001".into(),
             mode: AgentMode::Browser,
             user_message: "Compare these tabs".into(),
@@ -1301,6 +1314,7 @@ mod tests {
 
         // Verify empty vec is not serialized
         let input_no_tabs = AgentInput {
+            jev_tools: None,
             session_id: "sess-001".into(),
             mode: AgentMode::Chat,
             user_message: "Hello".into(),

@@ -346,6 +346,7 @@ async fn run_one_turn(
     let allowlist = policy.tool_allowlist(&mode_tools);
 
     let input = nevoflux_builtin_wasm::AgentInput {
+        jev_tools: None,
         // No soul is bound on this path, so every skill stays suggested.
         skills_filter: None,
         session_id,

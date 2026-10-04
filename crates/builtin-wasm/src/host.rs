@@ -2373,6 +2373,7 @@ mod tests {
     fn test_mock_host_functions_builtin_proxy() {
         let mock = MockHostFunctions::new();
         let input = AgentInput {
+            jev_tools: None,
             session_id: "sess-001".into(),
             mode: AgentMode::Chat,
             user_message: "Hello".into(),

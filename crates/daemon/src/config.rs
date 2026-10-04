@@ -1739,6 +1739,8 @@ pub struct JevConfig {
     /// Prompt-cache rates by wire (`anthropic`, `deepseek`, `openai`),
     /// overriding the built-in ones (spec §9 M6).
     pub cache: std::collections::BTreeMap<String, crate::jev::economics::CacheRate>,
+    /// Tools Jev picks for a task beyond the core ones (spec §5.5, K).
+    pub tools_k: usize,
 }
 
 impl Default for JevConfig {
@@ -1752,6 +1754,7 @@ impl Default for JevConfig {
             points: JevPoints::default(),
             sensitive_domains: Vec::new(),
             cache: std::collections::BTreeMap::new(),
+            tools_k: 10,
         }
     }
 }
@@ -2245,6 +2248,15 @@ mod tests {
         assert!(j.points.tools && j.points.skills && j.points.visibility && j.points.rebuild);
         assert!(!j.points.permissions);
         assert!(j.sensitive_domains.is_empty());
+    }
+
+    #[test]
+    fn jev_tools_k_defaults_to_ten_and_reads_from_toml() {
+        assert_eq!(JevConfig::default().tools_k, 10);
+        let c: AgentConfig = toml::from_str("[jev]
+tools_k = 6
+").unwrap();
+        assert_eq!(c.jev.tools_k, 6);
     }
 
     #[test]

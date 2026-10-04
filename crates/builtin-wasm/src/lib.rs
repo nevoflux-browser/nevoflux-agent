@@ -184,6 +184,7 @@ mod tests {
         let agent = Agent::new(mock);
 
         let input = AgentInput {
+            jev_tools: None,
             session_id: "sess-001".into(),
             mode: AgentMode::Chat,
             user_message: "Hello".into(),
@@ -221,6 +222,7 @@ mod tests {
             let agent = Agent::new(mock);
 
             let input = AgentInput {
+                jev_tools: None,
                 session_id: "sess-001".into(),
                 mode,
                 user_message: "Test".into(),
@@ -251,6 +253,7 @@ mod tests {
         let agent = Agent::new(mock);
 
         let input = AgentInput {
+            jev_tools: None,
             session_id: "sess-001".into(),
             mode: AgentMode::Chat,
             user_message: "Continue our conversation".into(),
@@ -286,6 +289,7 @@ mod tests {
         let agent = Agent::with_config(mock, config);
 
         let input = AgentInput {
+            jev_tools: None,
             session_id: "sess-001".into(),
             mode: AgentMode::Chat,
             user_message: "Test".into(),

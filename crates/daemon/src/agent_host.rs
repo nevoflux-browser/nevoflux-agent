@@ -8886,6 +8886,7 @@ impl DaemonHostFunctions {
                         .to_string()
                 });
                 let input = AgentInput {
+                    jev_tools: None,
                     // Builtin proxy dispatch: no soul, so every skill stays suggested.
                     skills_filter: None,
                     session_id: format!("subagent-{}", id),
