@@ -366,6 +366,41 @@ The two failing checks are the fake model's turn-1 text, which is not part
 of what is being checked. Re-grading itself is covered by unit tests against
 a fake Jev (`jev::rebuild`).
 
+## Jev P2-4 (tools), 2026-10-04
+
+Agent `feat/jev-p2-4`: with Jev on, a cloud turn is offered a chosen set
+instead of every tool:
+- the core tools (`browser_navigate`, `browser_get_markdown`,
+  `browser_get_tabs`), `recall`, `act(intent)`, and the K = 10 tools Jev
+  rates most likely for the request (`[jev] tools_k`);
+- the system prompt carries a one-line index of every tool, the same bytes
+  whatever the set;
+- the set is chosen at turn start and kept across turns. It is re-chosen
+  when the cache has expired, or when a warm turn finds a new tool at
+  p ≥ 0.7 (`tool_change`, which also forces the history decision);
+- mid-turn it only grows: a tool the model calls by name (`missed`) or
+  asks for with `act` is offered from the next request;
+- a tool with a native call pair in the history stays loaded.
+
+`tools/select` logs every decision; `jev_summary` counts them
+(`tool_sets`, `missed`, `tool_change_rebuilds`, `tool_set_size`,
+`tool_select_ms`). `tasks/fake/` holds fake-model-only tasks
+(`[fake:act]` scripts navigate → `act` → the loaded tool → answer).
+
+**End to end with the fake model** (real TypeSafe):
+- `fake-act`: `tools/select{initial}` with 13 names, chosen in 795 ms
+  (~110 Nouls in two requests; the tools request may take 3 × `timeout_ms`).
+  `act("think about the result")` loaded `think` (`tools/select{act}`,
+  request header `tools_changed`), and the next step called it. The turn's
+  Jev spend was 4 645 input / 918 output tokens over 4 calls.
+- `jev-flights-followup`: turn 1 chose 13 tools in 590 ms; the scripted
+  `think` call was loaded as `missed`. Turn 2, 360 s later (cache expired),
+  re-chose the set (`ttl_expired`, 827 ms): 7 added, 7 removed.
+- The first `fake-act` run found `act` refused with `NOT_IN_ALLOWLIST`: a
+  task runs under an allowlist of mode tools, and Jev's own tools are not
+  mode tools. `recall` had the same problem since P2-2. Both now pass while
+  they are offered.
+
 ## Known gaps
 
 - Agent-loop tasks have no deadline on the daemon side: `wall_clock_secs`
