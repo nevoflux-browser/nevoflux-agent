@@ -1309,6 +1309,8 @@ pub struct MockHostFunctions {
     pub tool_sets: std::cell::RefCell<Vec<(String, Vec<String>)>>,
     /// What `choose_tool` answers.
     pub choose_with: std::cell::RefCell<Option<String>>,
+    /// The run allowlist each `tool_pre` saw.
+    pub pre_allowed: std::cell::RefCell<Vec<Option<Vec<String>>>>,
 }
 
 #[cfg(test)]
@@ -1358,6 +1360,7 @@ impl MockHostFunctions {
             rebuild_current: std::cell::RefCell::new(vec![]),
             tool_sets: std::cell::RefCell::new(vec![]),
             choose_with: std::cell::RefCell::new(None),
+            pre_allowed: std::cell::RefCell::new(vec![]),
         }
     }
 
@@ -1448,7 +1451,10 @@ impl HostFunctions for MockHostFunctions {
         *self.prompt_sections.borrow_mut() = sections.to_vec();
     }
 
-    fn tool_pre(&self, _call: &ToolCall, _ctx: &ToolContext) -> ToolGate {
+    fn tool_pre(&self, _call: &ToolCall, ctx: &ToolContext) -> ToolGate {
+        self.pre_allowed
+            .borrow_mut()
+            .push(ctx.allowed_tools.clone());
         self.gate.borrow().clone()
     }
 

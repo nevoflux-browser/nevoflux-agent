@@ -2218,7 +2218,19 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                     // every tool, which the tool set already reflects.
                     allowed_tools: match &input.tools_config {
                         Some(nevoflux_protocol::subagent::ToolsConfig::Allow(list)) => {
-                            Some(list.clone())
+                            // Jev's own tools are not mode tools, so no
+                            // allowlist names them: `recall` reads this
+                            // session's stored results, `act` loads only
+                            // tools from the allowlisted list. They pass
+                            // while they are offered.
+                            let mut list = list.clone();
+                            if self.visibility_on.get() {
+                                list.push("recall".to_string());
+                            }
+                            if self.act_on.get() {
+                                list.push("act".to_string());
+                            }
+                            Some(list)
                         }
                         _ => None,
                     },
@@ -9565,6 +9577,49 @@ mod tests {
             act_result(&agent).contains("No tool fits"),
             "{}",
             act_result(&agent)
+        );
+    }
+
+    #[test]
+    fn jev_tools_are_in_the_run_allowlist() {
+        // A task or a soul runs under an allowlist of mode tools; the
+        // daemon refuses anything outside it. `act` (and `recall`) are the
+        // agent's own and must pass while they are offered.
+        let mock = MockHostFunctions::new();
+        mock.visibility.set(true);
+        mock.add_llm_response(acts("reason about it"));
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        let mut input = jev_input(&["think"]);
+        input.tools_config = Some(nevoflux_protocol::subagent::ToolsConfig::Allow(vec![
+            "think".into(),
+            "browser_navigate".into(),
+        ]));
+        agent.run(&input).unwrap();
+        let seen = agent.host.pre_allowed.borrow();
+        let list = seen[0].as_ref().expect("an allowlist");
+        assert!(list.contains(&"act".to_string()), "{list:?}");
+        assert!(list.contains(&"recall".to_string()), "{list:?}");
+    }
+
+    #[test]
+    fn without_jev_the_run_allowlist_is_unchanged() {
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(LlmResponse {
+            text: "".into(),
+            tool_calls: vec![a_tool_call("think", serde_json::json!({"thought": "x"}))],
+            reasoning: None,
+        });
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        let mut input = session_log_input("go");
+        input.tools_config = Some(nevoflux_protocol::subagent::ToolsConfig::Allow(vec![
+            "think".into(),
+        ]));
+        agent.run(&input).unwrap();
+        assert_eq!(
+            agent.host.pre_allowed.borrow()[0],
+            Some(vec!["think".to_string()])
         );
     }
 
