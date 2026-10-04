@@ -7541,21 +7541,31 @@ async fn handle_chat_message_streaming(
                         let rerun_agent = Agent::new(rerun_host);
 
                         // Build new input with plan as user message
+                        let rerun_history = load_session_history(
+                            session_manager,
+                            &session_id,
+                            config.daemon.context.max_history_messages,
+                            &services,
+                            active_soul.as_deref(),
+                            None,
+                        )
+                        .await
+                        .0;
+                        // The re-run continues this turn: its tools as they
+                        // stand now, plus any its history's pairs need.
+                        let rerun_tools = jev_tools_for_rerun.as_ref().and_then(|_| {
+                            crate::jev::turn::rerun_tools(
+                                &services.database,
+                                &session_id,
+                                &rerun_history,
+                            )
+                        });
                         let rerun_input = AgentInput {
-                            jev_tools: jev_tools_for_rerun.clone(),
+                            jev_tools: rerun_tools,
                             session_id: session_id.clone(),
                             mode,
                             user_message: plan_text.clone(),
-                            history: load_session_history(
-                                session_manager,
-                                &session_id,
-                                config.daemon.context.max_history_messages,
-                                &services,
-                                active_soul.as_deref(),
-                                None,
-                            )
-                            .await
-                            .0,
+                            history: rerun_history,
                             attachments: vec![],
                             local_files: vec![],
                             custom_system_prompt: None,

@@ -18,7 +18,8 @@ use super::rebuild::{
     history_for_turn, history_opts, last_request_ms, rebuild_point_on, RebuildEnv,
 };
 use super::tools::{
-    candidates, decide_set, pinned, probabilities, questions, with_core, MAX_NOULS_PER_REQUEST,
+    asked, candidates, decide_set, pinned, probabilities, questions, with_core,
+    MAX_NOULS_PER_REQUEST,
 };
 use crate::session_events::SessionEventWriter;
 
@@ -37,24 +38,60 @@ pub fn tools_point_on(cfg: &crate::config::AgentConfig) -> bool {
         .active_provider()
         .and_then(|p| cfg.llm.resolve_wire(p))
         .is_some_and(|w| w != ProviderType::Local);
+    // ACP agents call tools through the MCP bridge, which has no `act` and
+    // no missed-tool loading: v1 is the native loop only.
     jev.is_usable()
         && jev.points.tools
         && cloud
+        && !cfg.llm.active_provider_is_acp()
         && client::egress_allowed(crate::local::latch::is_on(), &jev.endpoint)
 }
 
-/// The set the last `tools/select` event left, if any (a subagent's nested
-/// run aside).
+/// The set the last turn ran with: the last `tools/select` logged for it
+/// (just before its `turn/start`, or during it). `None` when that turn had
+/// none — it was offered every tool — even if an older turn had a set. A
+/// subagent's nested run is not a turn.
 pub fn current_set(events: &[SessionEvent]) -> Option<Vec<String>> {
     let nested = nested(events);
+    let starts: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(i, e)| !nested[*i] && matches!(e.payload, SessionEventPayload::TurnStart { .. }))
+        .map(|(i, _)| i)
+        .collect();
+    // The last turn's set is logged after the turn before it started.
+    let from = match starts.len() {
+        0 | 1 => 0,
+        n => starts[n - 2] + 1,
+    };
     events
         .iter()
         .enumerate()
+        .skip(from)
         .rev()
         .find_map(|(i, e)| match &e.payload {
             SessionEventPayload::ToolsSelect { names, .. } if !nested[i] => Some(names.clone()),
             _ => None,
         })
+}
+
+/// A plan re-run continues the current turn: its set as it stands now (the
+/// turn-start set plus tools loaded since) and the tools whose native pairs
+/// the re-run's history carries. `None` when the turn had no set.
+pub fn rerun_set(events: &[SessionEvent], history: &[Message]) -> Option<Vec<String>> {
+    current_set(events).map(|set| with_core(set.into_iter().chain(pinned(history))))
+}
+
+/// [`rerun_set`] from the session log.
+pub fn rerun_tools(
+    database: &Arc<nevoflux_storage::Database>,
+    session_id: &str,
+    history: &[Message],
+) -> Option<Vec<String>> {
+    let events = nevoflux_storage::repositories::SessionEventRepository::new(database)
+        .list(session_id)
+        .ok()?;
+    rerun_set(&events, history)
 }
 
 /// What a turn starts with.
@@ -75,6 +112,9 @@ async fn ask_tools(
     query: &str,
     cands: &[(String, String)],
 ) -> Option<BTreeMap<String, f64>> {
+    if cands.is_empty() {
+        return Some(BTreeMap::new());
+    }
     let c = client::shared(&cfg.jev).ok()?;
     let oracle = JevOracle::new(c, cfg.jev.sensitive_domains.clone(), writer, None);
     let ctx = OracleContext::no_page(
@@ -95,7 +135,7 @@ async fn ask_tools(
             Verdict::Fallback { .. } => return None,
         }
     }
-    Some(probabilities(&answers))
+    asked(probabilities(&answers), cands)
 }
 
 /// Turn start with Jev on: the tool set (when `catalog` is given and the
@@ -133,18 +173,28 @@ pub async fn turn_start(
 
     // Tools first: a change rewrites the cache, so it forces the history.
     let started = Instant::now();
-    let current = current_set(&events);
+    let is_warm = warm(
+        last_request_ms(&events),
+        now_ms,
+        cache_rate(wire, &cfg.jev.cache),
+    );
+    // A soul with no tools has nothing to choose from: no set, not core.
+    let catalog = catalog.filter(|c| !c.is_empty() && tools_point_on(cfg));
+    // The last turn's set, if it still fits the catalog (a soul switch or
+    // a changed allowlist makes it stale: choose again).
+    let current = current_set(&events).filter(|set| {
+        catalog.is_some_and(|c| {
+            set.iter().all(|n| {
+                super::tools::CORE_TOOLS.contains(&n.as_str()) || c.iter().any(|t| t.name == *n)
+            })
+        })
+    });
     let mut set: Option<(Option<Vec<String>>, &'static str)> = None;
-    if let Some(catalog) = catalog.filter(|_| tools_point_on(cfg)) {
+    if let Some(catalog) = catalog {
         let cands = candidates(catalog);
         set = Some(
             match ask_tools(cfg, Some(writer.clone()), query, &cands).await {
                 Some(p) => {
-                    let is_warm = warm(
-                        last_request_ms(&events),
-                        now_ms,
-                        cache_rate(wire, &cfg.jev.cache),
-                    );
                     let d = decide_set(current.as_deref(), &p, cfg.jev.tools_k, is_warm);
                     (Some(d.names), d.reason)
                 }
@@ -154,10 +204,13 @@ pub async fn turn_start(
         );
     }
     let elapsed_ms = started.elapsed().as_millis() as u64;
-    let forced = set
-        .as_ref()
-        .is_some_and(|(_, r)| *r == "tool_change")
-        .then_some("tool_change");
+    // Any change of what the last turn was offered — a new set, a set
+    // replacing the full list — rewrites a warm cache (spec §5.7).
+    let offered_changed = match &set {
+        Some((names, _)) => *names != current,
+        None => false,
+    };
+    let forced = (offered_changed && is_warm).then_some("tool_change");
 
     let history = if rebuild_point_on(cfg) {
         let env = RebuildEnv {
@@ -496,5 +549,169 @@ mod tests {
         assert!(!logged(&db)
             .iter()
             .any(|e| matches!(e, SessionEventPayload::ToolsSelect { .. })));
+    }
+
+    fn graded_earlier_turn() -> Vec<serde_json::Value> {
+        let mut ev = earlier_turn();
+        let big = "x".repeat(6000);
+        ev.insert(2, json!({"type": "assistant/message", "content": "", "tool_calls": [{"id": "t1", "name": "read", "args": {}}], "model": "m", "provider": "anthropic"}));
+        ev.insert(
+            3,
+            json!({"type": "tool/call", "id": "t1", "name": "read", "args": {}, "origin": "model"}),
+        );
+        ev.insert(4, json!({"type": "tool/result", "id": "t1", "content": big, "is_error": false, "duration_ms": 1}));
+        ev.insert(5, json!({"type": "jev/visibility", "id": "c1", "tool": "read", "bytes": 6000, "level": "full",
+                            "graded_by": "jev", "kept_lines": 0, "elapsed_ms": 1, "call_id": "t1"}));
+        ev
+    }
+
+    #[test]
+    fn acp_providers_do_not_get_a_tool_set() {
+        // ACP agents call tools through the MCP bridge: no `act`, no
+        // missed-tool loading there (spec: v1 is the native loop only).
+        let mut c = cfg("http://127.0.0.1:1", 2000);
+        c.llm.provider = Some("claude-code".into());
+        assert!(!tools_point_on(&c));
+    }
+
+    #[tokio::test]
+    async fn an_empty_catalog_selects_nothing() {
+        // A soul with `tools: none`: nothing to choose, so no set — never
+        // a set of core tools the soul does not have.
+        let (url, bodies) = answering(answer(), Duration::ZERO).await;
+        let db = db_with(earlier_turn());
+        let ts = turn_start(&cfg(&url, 2000), &db, "s1", "q", 50, vec![], Some(&[])).await;
+        assert_eq!(ts.tools, None);
+        assert!(bodies.lock().unwrap().iter().all(|b| !b.contains("noul")));
+    }
+
+    #[tokio::test]
+    async fn an_answer_without_the_nouls_is_a_fallback() {
+        let empty = json!({"answers": {}, "usage": {"input_tokens": 1, "output_tokens": 1}});
+        let (url, _) = answering(empty.clone(), Duration::ZERO).await;
+        let db = db_with(earlier_turn());
+        assert_eq!(
+            start(&cfg(&url, 2000), &db).await.tools,
+            None,
+            "no set yet: the full list"
+        );
+
+        let (url, _) = answering(empty, Duration::ZERO).await;
+        let mut ev = earlier_turn();
+        ev.insert(
+            1,
+            prior_set(&[
+                "browser_get_markdown",
+                "browser_get_tabs",
+                "browser_navigate",
+                "think",
+            ]),
+        );
+        let db = db_with(ev);
+        assert_eq!(
+            start(&cfg(&url, 2000), &db).await.tools,
+            Some(core_plus(&["think"]))
+        );
+        assert!(logged(&db).iter().any(|e| matches!(e,
+            SessionEventPayload::ToolsSelect { reason, .. } if reason == "fallback")));
+    }
+
+    #[test]
+    fn a_set_from_before_a_turn_without_one_is_not_current() {
+        let ev: Vec<SessionEvent> = [
+            prior_set(&["browser_navigate", "think"]),
+            json!({"type": "turn/start", "turn": 1}),
+            json!({"type": "turn/end", "turn": 1}),
+            json!({"type": "turn/start", "turn": 2}),
+            json!({"type": "turn/end", "turn": 2}),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| SessionEvent {
+            seq: i as i64 + 1,
+            ts: 0,
+            payload: serde_json::from_value(v).unwrap(),
+        })
+        .collect();
+        assert_eq!(current_set(&ev), None, "turn 2 ran with the full list");
+        assert_eq!(
+            current_set(&ev[..3]),
+            Some(vec!["browser_navigate".to_string(), "think".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_set_with_tools_outside_the_catalog_is_chosen_again() {
+        // A soul switch: the old set names a tool the new catalog lacks. No
+        // tool is strong enough for a warm tool_change, so only the stale
+        // set itself can make it choose again.
+        let weak = json!({"answers": {"web_search": {"noul": 0.6}, "think": {"noul": 0.5}, "read": {"noul": 0.1}},
+                          "usage": {"input_tokens": 1, "output_tokens": 1}});
+        let (url, _) = answering(weak, Duration::ZERO).await;
+        let mut ev = earlier_turn();
+        ev.insert(
+            1,
+            prior_set(&[
+                "bash",
+                "browser_get_markdown",
+                "browser_get_tabs",
+                "browser_navigate",
+                "think",
+            ]),
+        );
+        let db = db_with(ev);
+        let ts = start(&cfg(&url, 2000), &db).await;
+        let tools = ts.tools.expect("a set");
+        assert!(!tools.contains(&"bash".to_string()), "{tools:?}");
+        assert!(tools.contains(&"web_search".to_string()), "{tools:?}");
+    }
+
+    #[tokio::test]
+    async fn switching_from_the_full_list_forces_the_history() {
+        // Warm earlier turns ran with every tool; the first set rewrites
+        // the cache, so the history is decided as for a tool change.
+        let (url, _) = answering(answer(), Duration::ZERO).await;
+        let db = db_with(graded_earlier_turn());
+        start(&cfg(&url, 2000), &db).await;
+        let p = logged(&db);
+        assert!(
+            p.iter().any(|e| matches!(e,
+            SessionEventPayload::ContextRebuild { reason, .. } if reason == "tool_change")),
+            "{p:?}"
+        );
+    }
+
+    #[test]
+    fn a_rerun_keeps_tools_loaded_mid_turn_and_tools_with_pairs() {
+        let ev: Vec<SessionEvent> = [
+            prior_set(&["browser_get_markdown", "browser_get_tabs", "browser_navigate", "web_search"]),
+            json!({"type": "turn/start", "turn": 1}),
+            json!({"type": "tools/select", "reason": "missed", "names": ["browser_get_markdown", "browser_get_tabs", "browser_navigate", "think", "web_search"], "added": ["think"], "removed": [], "elapsed_ms": 0}),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| SessionEvent { seq: i as i64 + 1, ts: 0, payload: serde_json::from_value(v).unwrap() })
+        .collect();
+        let history = vec![
+            Message::user("q"),
+            Message::assistant_with_tool_calls_and_reasoning(
+                String::new(),
+                vec![nevoflux_builtin_wasm::ToolCall {
+                    id: "t1".into(),
+                    call_id: None,
+                    name: "read".into(),
+                    arguments: json!({}),
+                    signature: None,
+                }],
+                None,
+            ),
+            Message::tool("t1".to_string(), "ok".to_string()),
+        ];
+        let set = rerun_set(&ev, &history).expect("a set");
+        assert!(
+            set.contains(&"think".to_string()) && set.contains(&"read".to_string()),
+            "{set:?}"
+        );
+        assert_eq!(rerun_set(&[], &history), None);
     }
 }

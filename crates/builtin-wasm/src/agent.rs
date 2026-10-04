@@ -498,6 +498,9 @@ pub struct Agent<H: HostFunctions> {
     jev_changed: Cell<bool>,
     /// The request driving this run, for `act`.
     jev_query: RefCell<String>,
+    /// Tools of the run the gates withhold at the moment: `act` does not
+    /// offer to load them.
+    jev_hidden: RefCell<Vec<String>>,
     /// Current keywords extracted from user message and LLM context, used for auto-snapshots.
     current_keywords: RefCell<Vec<String>>,
     /// Skills that have been loaded in this session (prevent redundant re-loading).
@@ -684,6 +687,7 @@ impl<H: HostFunctions> Agent<H> {
             jev_grown: Cell::new(false),
             jev_changed: Cell::new(false),
             jev_query: RefCell::new(String::new()),
+            jev_hidden: RefCell::new(Vec::new()),
             current_keywords: RefCell::new(Vec::new()),
             loaded_skills: RefCell::new(std::collections::HashSet::new()),
             local_index: RefCell::new(None),
@@ -713,6 +717,7 @@ impl<H: HostFunctions> Agent<H> {
             jev_grown: Cell::new(false),
             jev_changed: Cell::new(false),
             jev_query: RefCell::new(String::new()),
+            jev_hidden: RefCell::new(Vec::new()),
             current_keywords: RefCell::new(Vec::new()),
             loaded_skills: RefCell::new(std::collections::HashSet::new()),
             local_index: RefCell::new(None),
@@ -783,7 +788,9 @@ impl<H: HostFunctions> Agent<H> {
         // §4.3: the tier-1 index is in L0).
         let jev_all = match &input.jev_tools {
             Some(_) if input.local.is_none() && !self.config.is_subagent => {
+                // A run with no tools (`tools: none`) stays without tools.
                 Some(self.filter_tools(self.get_tools_for_mode(mode), &input.tools_config))
+                    .filter(|all| !all.is_empty())
             }
             _ => None,
         };
@@ -1926,6 +1933,22 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
             selector_unlocked,
         );
 
+        if let Some(all) = self.jev_all.borrow().as_ref() {
+            let visible = Self::gated(
+                all,
+                canvas_unlocked,
+                canvas_unlocked || speech_useful,
+                network_on,
+                console_named,
+                selector_unlocked,
+            );
+            *self.jev_hidden.borrow_mut() = all
+                .iter()
+                .filter(|t| !visible.iter().any(|v| v.name == t.name))
+                .map(|t| t.name.clone())
+                .collect();
+        }
+
         // On-device, tool-result budgets follow the context the engine was
         // started with; a cloud turn keeps the fixed budget it always had.
         let budget = match &input.local {
@@ -2533,19 +2556,34 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                 }
                 if self.jev_grown.replace(false) {
                     turn_tools = Self::with_jev_set(all, &self.jev_set.borrow());
-                    active_tools = Self::gate_selector_tools(
-                        &Self::gate_network_tools(
-                            &Self::gate_speech_tools(
-                                &Self::gate_canvas_tools(&turn_tools, canvas_unlocked),
-                                canvas_unlocked || speech_useful,
-                            ),
-                            network_on,
-                            console_named,
-                        ),
+                    let before: Vec<String> = active_tools.iter().map(|t| t.name.clone()).collect();
+                    active_tools = Self::gated(
+                        &turn_tools,
+                        canvas_unlocked,
+                        canvas_unlocked || speech_useful,
+                        network_on,
+                        console_named,
                         selector_unlocked,
                     );
-                    self.jev_changed.set(true);
+                    // A tool the gates still withhold changes nothing offered,
+                    // so the cache is not rewritten: no tool_change.
+                    if active_tools.iter().map(|t| &t.name).ne(before.iter()) {
+                        self.jev_changed.set(true);
+                    }
                 }
+                let visible = Self::gated(
+                    all,
+                    canvas_unlocked,
+                    canvas_unlocked || speech_useful,
+                    network_on,
+                    console_named,
+                    selector_unlocked,
+                );
+                *self.jev_hidden.borrow_mut() = all
+                    .iter()
+                    .filter(|t| !visible.iter().any(|v| v.name == t.name))
+                    .map(|t| t.name.clone())
+                    .collect();
             }
 
             // Move tool calls into the accumulator (avoids a second clone)
@@ -3938,6 +3976,7 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                     && t.name != "recall"
                     && t.name != "act"
                     && !set.contains(&t.name)
+                    && !self.jev_hidden.borrow().contains(&t.name)
             })
             .map(|t| (t.name.clone(), first_sentence(&t.description)))
             .collect();
@@ -3965,6 +4004,28 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
         self.host.record_tool_set("act", &names);
         self.jev_grown.set(true);
         format!("Loaded `{name}`: {short}. Call it in your next step.")
+    }
+
+    /// The four gates in the loop's order.
+    fn gated(
+        tools: &[ToolDefinition],
+        canvas_unlocked: bool,
+        speech_on: bool,
+        network_on: bool,
+        console_on: bool,
+        selector_unlocked: bool,
+    ) -> Vec<ToolDefinition> {
+        Self::gate_selector_tools(
+            &Self::gate_network_tools(
+                &Self::gate_speech_tools(
+                    &Self::gate_canvas_tools(tools, canvas_unlocked),
+                    speech_on,
+                ),
+                network_on,
+                console_on,
+            ),
+            selector_unlocked,
+        )
     }
 
     /// `all` narrowed to Jev's set and the core tools, in `all`'s order,
@@ -9621,6 +9682,75 @@ mod tests {
             agent.host.pre_allowed.borrow()[0],
             Some(vec!["think".to_string()])
         );
+    }
+
+    #[test]
+    fn a_soul_without_tools_gets_no_set() {
+        // `tools: none` must stay toolless even when a set arrives: no `act`,
+        // no index, and a tool call in the reply is not run.
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(LlmResponse {
+            text: "fine".into(),
+            tool_calls: vec![a_tool_call("think", serde_json::json!({"thought": "x"}))],
+            reasoning: None,
+        });
+        let agent = session_log_agent(mock);
+        let mut input = jev_input(&["web_search"]);
+        input.tools_config = Some(nevoflux_protocol::subagent::ToolsConfig::None);
+        agent.run(&input).unwrap();
+        assert!(agent.host.captured_tool_names.borrow()[0].is_empty());
+        assert_eq!(
+            agent.host.captured_requests.borrow().len(),
+            1,
+            "no tool step"
+        );
+        let sys = &agent.host.captured_requests.borrow()[0].messages[0].content;
+        assert!(!sys.contains("Tool index"));
+    }
+
+    #[test]
+    fn a_missed_tool_the_gates_hide_asks_no_rebuild() {
+        // browser_click is withheld until load_selector_tools: loading it
+        // into the set changes nothing offered, so no tool_change rebuild.
+        let mock = MockHostFunctions::new();
+        mock.signals.set(true);
+        mock.add_llm_response(LlmResponse {
+            text: "".into(),
+            tool_calls: vec![a_tool_call(
+                "browser_click",
+                serde_json::json!({"selector": "#a"}),
+            )],
+            reasoning: None,
+        });
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        let mut input = jev_input(&["web_search"]);
+        input.history = vec![Message::user("q1"), Message::assistant("a1")];
+        agent.run(&input).unwrap();
+        assert!(
+            agent.host.rebuild_asked.borrow().is_empty(),
+            "{:?}",
+            agent.host.rebuild_asked.borrow()
+        );
+        assert!(!agent.host.captured_tool_names.borrow()[1].contains(&"browser_click".to_string()));
+    }
+
+    #[test]
+    fn act_does_not_load_a_tool_the_gates_hide() {
+        let mock = MockHostFunctions::new();
+        *mock.choose_with.borrow_mut() = Some("browser_click".into());
+        mock.add_llm_response(acts("click the submit button"));
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        agent.run(&jev_input(&["web_search"])).unwrap();
+        let r = act_result(&agent);
+        assert!(!r.contains("`browser_click`"), "{r}");
+        assert!(agent
+            .host
+            .tool_sets
+            .borrow()
+            .iter()
+            .all(|(_, n)| !n.contains(&"browser_click".to_string())));
     }
 
     #[test]

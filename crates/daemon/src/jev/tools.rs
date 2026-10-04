@@ -77,6 +77,21 @@ pub fn probabilities(answers: &[JevResponse]) -> BTreeMap<String, f64> {
     out
 }
 
+/// Share of the candidates Jev must answer for its answer to count; less
+/// is treated as a fallback (spec §5.8), never as "no tool is likely".
+pub const MIN_ANSWERED: f64 = 0.9;
+
+/// `p` restricted to the candidates asked, or `None` when Jev answered
+/// fewer than [`MIN_ANSWERED`] of them.
+pub fn asked(
+    mut p: BTreeMap<String, f64>,
+    candidates: &[(String, String)],
+) -> Option<BTreeMap<String, f64>> {
+    p.retain(|name, _| candidates.iter().any(|(c, _)| c == name));
+    let need = (candidates.len() as f64 * MIN_ANSWERED).ceil() as usize;
+    (p.len() >= need).then_some(p)
+}
+
 /// The `k` most likely tools: probability descending, then name.
 pub fn top_k(p: &BTreeMap<String, f64>, k: usize) -> Vec<String> {
     let mut all: Vec<(&String, f64)> = p.iter().map(|(n, p)| (n, *p)).collect();
@@ -338,5 +353,22 @@ mod tests {
         let v = serde_json::to_value(&q).unwrap();
         assert_eq!(v["type"], "choice");
         assert_eq!(v["criteria"]["web_search"], "Search the web");
+    }
+
+    #[test]
+    fn only_asked_candidates_count_and_most_must_be_answered() {
+        let cands: Vec<(String, String)> = (0..10)
+            .map(|i| (format!("t{i}"), "d".to_string()))
+            .collect();
+        let full: BTreeMap<String, f64> = (0..10).map(|i| (format!("t{i}"), 0.5)).collect();
+        let mut extra = full.clone();
+        extra.insert("hallucinated".into(), 0.99);
+        let kept = asked(extra, &cands).expect("all answered");
+        assert!(!kept.contains_key("hallucinated"));
+        let mut part = full.clone();
+        part.remove("t0");
+        part.remove("t1");
+        assert_eq!(asked(part, &cands), None, "8 of 10 answered is a fallback");
+        assert_eq!(asked(BTreeMap::new(), &cands), None);
     }
 }
