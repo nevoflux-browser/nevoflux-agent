@@ -2345,10 +2345,56 @@ impl HostFunctions for DaemonHostFunctions {
         };
         let h = crate::jev::economics::remaining_requests(h);
         let current = crate::jev::rebuild::tokens(req.current);
+        let reason = if req.reason == "tool_change" {
+            "tool_change"
+        } else {
+            "polluted"
+        };
         let runtime = self.runtime.clone();
         tokio::task::block_in_place(|| {
-            runtime.block_on(crate::jev::rebuild::polluted_rebuild(&env, h, current))
+            runtime.block_on(crate::jev::rebuild::mid_turn_rebuild(
+                &env, h, current, reason,
+            ))
         })
+    }
+
+    fn choose_tool(&self, req: &nevoflux_builtin_wasm::ChooseToolRequest<'_>) -> Option<String> {
+        if req.candidates.is_empty() || !self.jev_point_on(self.config.jev.points.tools) {
+            return None;
+        }
+        let jev = &self.config.jev;
+        let oracle = crate::jev::oracle::JevOracle::new(
+            crate::jev::client::shared(jev).ok()?,
+            jev.sensitive_domains.clone(),
+            self.event_writer().map(Arc::new),
+            self.turn_stats.clone(),
+        );
+        // Names and one-line descriptions only: no page text (spec §5.8).
+        let ctx = crate::jev::oracle::OracleContext::no_page(
+            "tools",
+            std::time::Duration::from_millis(jev.timeout_ms),
+        );
+        let state = serde_json::json!({
+            "query": req.query.chars().take(1_000).collect::<String>(),
+            "intent": req.intent.chars().take(500).collect::<String>(),
+        });
+        let mut questions = std::collections::BTreeMap::new();
+        questions.insert(
+            "tool".to_string(),
+            crate::jev::tools::choice_question(req.candidates),
+        );
+        let runtime = self.runtime.clone();
+        let verdict = tokio::task::block_in_place(|| {
+            runtime.block_on(crate::jev::oracle::DecisionOracle::ask(
+                &oracle, &ctx, state, questions,
+            ))
+        });
+        match verdict {
+            crate::jev::oracle::Verdict::Answered(r) => {
+                crate::jev::tools::chosen(&r).map(|(name, _)| name)
+            }
+            crate::jev::oracle::Verdict::Fallback { .. } => None,
+        }
     }
 
     fn record_tool_set(&self, reason: &str, names: &[String]) {
@@ -2371,8 +2417,16 @@ impl HostFunctions for DaemonHostFunctions {
             nevoflux_protocol::session_event::SessionEventPayload::ToolsSelect {
                 reason: reason.to_string(),
                 names: names.to_vec(),
-                added: names.iter().filter(|n| !prev.contains(n)).cloned().collect(),
-                removed: prev.iter().filter(|n| !names.contains(n)).cloned().collect(),
+                added: names
+                    .iter()
+                    .filter(|n| !prev.contains(n))
+                    .cloned()
+                    .collect(),
+                removed: prev
+                    .iter()
+                    .filter(|n| !names.contains(n))
+                    .cloned()
+                    .collect(),
                 elapsed_ms: 0,
             },
         );

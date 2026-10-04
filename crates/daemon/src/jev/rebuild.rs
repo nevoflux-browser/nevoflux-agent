@@ -389,16 +389,20 @@ pub async fn history_for_turn(env: &RebuildEnv<'_>) -> Vec<Message> {
     }
 }
 
-/// Mid-turn, the earlier turns polluted (spec §5.7): re-grade them against
-/// the current query and rebuild when that costs at most ρ more than
-/// keeping. The cache is warm mid-turn; a rebuild also re-writes this turn's
-/// `current_tokens`, cached now. `env.events` must hold the earlier turns
-/// only. `None` keeps them (also on a Jev failure, §5.8).
-pub async fn polluted_rebuild(
+/// Mid-turn rebuild of the earlier turns (spec §5.7), re-graded against the
+/// current query. `polluted`: rebuild when that costs at most ρ more than
+/// keeping a warm cache; a rebuild also re-writes this turn's
+/// `current_tokens`. `tool_change`: the tools changed, so the cache is
+/// rewritten either way — both options pay to write (no current-turn term)
+/// and the plain cost formula decides. `env.events` must hold the earlier
+/// turns only. `None` keeps them (also on a Jev failure, §5.8).
+pub async fn mid_turn_rebuild(
     env: &RebuildEnv<'_>,
     h: u32,
     current_tokens: u64,
+    reason: &'static str,
 ) -> Option<Vec<Message>> {
+    let polluted = reason == "polluted";
     let old = grades(&env.events);
     let keep = derive_history(&env.events, u32::MAX, &old, &env.opts);
     if keep.is_empty() {
@@ -406,7 +410,8 @@ pub async fn polluted_rebuild(
     }
     let p = tokens(&keep);
     let rate = cache_rate(env.wire, &env.jev.cache);
-    let keep_c = keep_cost_cached(p as f64, p as f64, h, rate);
+    let cached = if polluted { p as f64 } else { 0.0 };
+    let keep_c = keep_cost_cached(p as f64, cached, h, rate);
     let todo = regradable(env, &old);
     if todo.is_empty() {
         return None;
@@ -414,7 +419,7 @@ pub async fn polluted_rebuild(
     let n = todo.len() as u32;
     match regrade(env, todo, env.query).await {
         Err(_) => {
-            log_rebuild(env, "polluted", "keep_fallback", keep_c, keep_c, h, p, p, 0);
+            log_rebuild(env, reason, "keep_fallback", keep_c, keep_c, h, p, p, 0);
             None
         }
         Ok(new) => {
@@ -422,16 +427,20 @@ pub async fn polluted_rebuild(
             merged.extend(new.grades.clone());
             let rebuilt = derive_history(&env.events, u32::MAX, &merged, &env.opts);
             let a = tokens(&rebuilt);
-            let rebuild_c = rebuild_cost(a as f64, h, rate, new.jev_tokens)
-                + current_tokens as f64 * (rate.write - rate.read).max(0.0);
-            match decide(keep_c, rebuild_c, true) {
+            let rewrite = if polluted {
+                current_tokens as f64 * (rate.write - rate.read).max(0.0)
+            } else {
+                0.0
+            };
+            let rebuild_c = rebuild_cost(a as f64, h, rate, new.jev_tokens) + rewrite;
+            match decide(keep_c, rebuild_c, polluted) {
                 Decision::Rebuild => {
                     persist(env, &new);
-                    log_rebuild(env, "polluted", "rebuild", keep_c, rebuild_c, h, p, a, n);
+                    log_rebuild(env, reason, "rebuild", keep_c, rebuild_c, h, p, a, n);
                     Some(rebuilt)
                 }
                 Decision::Keep => {
-                    log_rebuild(env, "polluted", "keep", keep_c, rebuild_c, h, p, p, n);
+                    log_rebuild(env, reason, "keep", keep_c, rebuild_c, h, p, p, n);
                     None
                 }
             }
@@ -794,7 +803,7 @@ mod tests {
             },
             now_ms: NOW,
         };
-        let out = polluted_rebuild(&env, 3, current_tokens).await;
+        let out = mid_turn_rebuild(&env, 3, current_tokens, "polluted").await;
         (out, logged(&db))
     }
 
@@ -988,5 +997,36 @@ mod tests {
         assert!(needs_reasoning_back(&cfg));
         cfg.llm.provider = Some("anthropic".into());
         assert!(!needs_reasoning_back(&cfg));
+    }
+
+    #[tokio::test]
+    async fn a_tool_change_rebuild_prices_the_cache_as_rewritten() {
+        // With "polluted", a 200k current turn makes hiding not worth it
+        // (a_polluted_rebuild_counts_the_current_turn_it_rewrites); with
+        // "tool_change" the cache is rewritten anyway, so it is.
+        let (url, _) = answering(answer("hide", "1"), Duration::ZERO).await;
+        let (w, db) = writer();
+        let j = jev_cfg(&url, 2000);
+        let env = RebuildEnv {
+            jev: &j,
+            wire: ProviderType::Anthropic,
+            events: one_turn(NOW - 30_000, "jev", &hundred_lines("a")),
+            query: "only the summary matters now",
+            writer: Some(w),
+            stats: None,
+            opts: HistoryOpts {
+                max_messages: 50,
+                max_bytes: 32_000,
+                ..HistoryOpts::default()
+            },
+            now_ms: NOW,
+            forced: None,
+        };
+        assert!(mid_turn_rebuild(&env, 3, 200_000, "tool_change")
+            .await
+            .is_some());
+        assert!(logged(&db).iter().any(|e| matches!(e,
+            SessionEventPayload::ContextRebuild { reason, decision, .. }
+                if reason == "tool_change" && decision == "rebuild")));
     }
 }

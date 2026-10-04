@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use nevoflux_builtin_wasm::{Message, ToolDefinition};
 
-use super::wire::{JevResponse, Question};
+use super::wire::{Answer, JevResponse, Question};
 
 /// Always offered when Jev picks the tools (spec §5.5).
 pub const CORE_TOOLS: &[&str] = &[
@@ -143,6 +143,31 @@ pub fn decide_set(
         added,
         removed,
     }
+}
+
+/// `act` takes Jev's choice only this confident (spec §5.5 fallback).
+pub const CHOOSE_P: f64 = 0.5;
+
+/// `act(intent)`'s question: which candidate fits the intent.
+pub fn choice_question(candidates: &[(String, String)]) -> Question {
+    Question::Choice {
+        instructions: "Which tool fits the intent in the state, given the user's request?".into(),
+        options: candidates.iter().cloned().collect(),
+    }
+}
+
+/// The chosen tool and its probability, when at least [`CHOOSE_P`].
+pub fn chosen(r: &JevResponse) -> Option<(String, f64)> {
+    r.answers.values().find_map(|a| match a {
+        Answer::Choice {
+            choice,
+            probabilities,
+        } => {
+            let p = probabilities.get(choice).copied().unwrap_or(0.0);
+            (p >= CHOOSE_P).then(|| (choice.clone(), p))
+        }
+        _ => None,
+    })
 }
 
 /// Tools with a native call in `history`: they cannot be unloaded while the
@@ -295,5 +320,23 @@ mod tests {
         let a: JevResponse = serde_json::from_value(json!({"answers": {"x": {"noul": 0.4}}, "usage": {"input_tokens": 1, "output_tokens": 1}})).unwrap();
         let b: JevResponse = serde_json::from_value(json!({"answers": {"y": {"noul": 0.8}}, "usage": {"input_tokens": 1, "output_tokens": 1}})).unwrap();
         assert_eq!(probabilities(&[a, b]), probs(&[("x", 0.4), ("y", 0.8)]));
+    }
+
+    #[test]
+    fn chosen_takes_a_confident_choice_only() {
+        let r = |p: f64| -> JevResponse {
+            serde_json::from_value(json!({"answers": {"tool": {"choice": "think", "probabilities": {"think": p, "read": 1.0 - p}}},
+                "usage": {"input_tokens": 1, "output_tokens": 1}})).unwrap()
+        };
+        assert_eq!(chosen(&r(0.6)).map(|(n, _)| n), Some("think".to_string()));
+        assert_eq!(chosen(&r(0.4)), None);
+    }
+
+    #[test]
+    fn the_choice_question_offers_each_candidate() {
+        let q = choice_question(&[("web_search".into(), "Search the web".into())]);
+        let v = serde_json::to_value(&q).unwrap();
+        assert_eq!(v["type"], "choice");
+        assert_eq!(v["criteria"]["web_search"], "Search the web");
     }
 }

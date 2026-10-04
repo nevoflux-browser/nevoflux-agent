@@ -79,6 +79,16 @@ pub struct RebuildRequest<'a> {
     pub current: &'a [Message],
 }
 
+/// `act(intent)` asks the host which tool fits (spec §5.5 fallback).
+pub struct ChooseToolRequest<'a> {
+    /// What the model said it wants to do.
+    pub intent: &'a str,
+    /// The user's request driving this run.
+    pub query: &'a str,
+    /// The tools that may be loaded: (name, one-line description).
+    pub candidates: &'a [(String, String)],
+}
+
 /// What the host made of a tool result: the text the model sees and, when
 /// the full text was stored, the chunk `recall` takes.
 #[derive(Debug, Clone, PartialEq)]
@@ -1085,6 +1095,12 @@ pub trait HostFunctions {
         None
     }
 
+    /// The candidate that fits `req.intent`, or `None` (no confident
+    /// answer; the agent then matches keywords itself).
+    fn choose_tool(&self, _req: &ChooseToolRequest<'_>) -> Option<String> {
+        None
+    }
+
     /// The tools offered changed mid-turn (spec §5.5): `reason` is `missed`
     /// (the model called a tool it was not offered) or `act`; `names` is the
     /// whole set now, sorted.
@@ -1291,6 +1307,8 @@ pub struct MockHostFunctions {
     pub rebuild_current: std::cell::RefCell<Vec<usize>>,
     /// Every tool-set change the loop reported: (reason, names).
     pub tool_sets: std::cell::RefCell<Vec<(String, Vec<String>)>>,
+    /// What `choose_tool` answers.
+    pub choose_with: std::cell::RefCell<Option<String>>,
 }
 
 #[cfg(test)]
@@ -1339,6 +1357,7 @@ impl MockHostFunctions {
             rebuild_asked: std::cell::RefCell::new(vec![]),
             rebuild_current: std::cell::RefCell::new(vec![]),
             tool_sets: std::cell::RefCell::new(vec![]),
+            choose_with: std::cell::RefCell::new(None),
         }
     }
 
@@ -1471,6 +1490,10 @@ impl HostFunctions for MockHostFunctions {
 
     fn settle_signals(&self) {
         self.settled.set(self.settled.get() + 1);
+    }
+
+    fn choose_tool(&self, _req: &ChooseToolRequest<'_>) -> Option<String> {
+        self.choose_with.borrow().clone()
     }
 
     fn record_tool_set(&self, reason: &str, names: &[String]) {

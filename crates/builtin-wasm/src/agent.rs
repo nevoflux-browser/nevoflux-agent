@@ -496,6 +496,8 @@ pub struct Agent<H: HostFunctions> {
     jev_grown: Cell<bool>,
     /// The set changed this turn and the earlier turns were not yet rebuilt.
     jev_changed: Cell<bool>,
+    /// The request driving this run, for `act`.
+    jev_query: RefCell<String>,
     /// Current keywords extracted from user message and LLM context, used for auto-snapshots.
     current_keywords: RefCell<Vec<String>>,
     /// Skills that have been loaded in this session (prevent redundant re-loading).
@@ -681,6 +683,7 @@ impl<H: HostFunctions> Agent<H> {
             jev_set: RefCell::new(Vec::new()),
             jev_grown: Cell::new(false),
             jev_changed: Cell::new(false),
+            jev_query: RefCell::new(String::new()),
             current_keywords: RefCell::new(Vec::new()),
             loaded_skills: RefCell::new(std::collections::HashSet::new()),
             local_index: RefCell::new(None),
@@ -709,6 +712,7 @@ impl<H: HostFunctions> Agent<H> {
             jev_set: RefCell::new(Vec::new()),
             jev_grown: Cell::new(false),
             jev_changed: Cell::new(false),
+            jev_query: RefCell::new(String::new()),
             current_keywords: RefCell::new(Vec::new()),
             loaded_skills: RefCell::new(std::collections::HashSet::new()),
             local_index: RefCell::new(None),
@@ -864,6 +868,7 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
         *self.jev_set.borrow_mut() = input.jev_tools.clone().unwrap_or_default();
         self.jev_grown.set(false);
         self.jev_changed.set(false);
+        *self.jev_query.borrow_mut() = input.user_message.clone();
         if let Some(all) = &jev_all {
             tools = Self::with_jev_set(all, &self.jev_set.borrow());
         }
@@ -2833,6 +2838,9 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
         }
 
         let content = match normalized_name {
+            "act" if self.act_on.get() => {
+                self.execute_act(tool_call.arguments["intent"].as_str().unwrap_or(""))
+            }
             "recall" if self.visibility_on.get() => {
                 let id = tool_call.arguments["chunk_id"].as_str().unwrap_or("");
                 let offset = tool_call.arguments["offset"].as_u64().unwrap_or(0);
@@ -3902,6 +3910,51 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
     /// Check if a tool name is handled by execute_tool (not an MCP tool).
     /// `tools` plus `recall` (Jev visibility). An empty list stays empty:
     /// it means tools are disabled for this run.
+    /// `act(intent)`: load the tool that fits `intent` — Jev's choice when it
+    /// is confident and among the candidates, else a keyword match — for the
+    /// next request (spec §5.5). Only tools in the run's list can be loaded,
+    /// so a soul's allowlist bounds it.
+    fn execute_act(&self, intent: &str) -> String {
+        let Some(all) = self.jev_all.borrow().clone() else {
+            return "act: no tool set is active".to_string();
+        };
+        let set = self.jev_set.borrow().clone();
+        let candidates: Vec<(String, String)> = all
+            .iter()
+            .filter(|t| {
+                !JEV_CORE_TOOLS.contains(&t.name.as_str())
+                    && t.name != "recall"
+                    && t.name != "act"
+                    && !set.contains(&t.name)
+            })
+            .map(|t| (t.name.clone(), first_sentence(&t.description)))
+            .collect();
+        let query = self.jev_query.borrow().clone();
+        let picked = self
+            .host
+            .choose_tool(&crate::host::ChooseToolRequest {
+                intent,
+                query: &query,
+                candidates: &candidates,
+            })
+            .filter(|n| candidates.iter().any(|(c, _)| c == n))
+            .or_else(|| keyword_pick(intent, &candidates));
+        let Some(name) = picked else {
+            return "No tool fits that; the tool index in the system prompt lists what exists."
+                .to_string();
+        };
+        let short = candidates
+            .iter()
+            .find(|(c, _)| *c == name)
+            .map(|(_, s)| s.clone())
+            .unwrap_or_default();
+        self.jev_set.borrow_mut().push(name.clone());
+        let names = Self::jev_names(&self.jev_set.borrow());
+        self.host.record_tool_set("act", &names);
+        self.jev_grown.set(true);
+        format!("Loaded `{name}`: {short}. Call it in your next step.")
+    }
+
     /// `all` narrowed to Jev's set and the core tools, in `all`'s order,
     /// with `act` last (spec §5.5).
     fn with_jev_set(all: &[ToolDefinition], set: &[String]) -> Vec<ToolDefinition> {
@@ -7236,6 +7289,45 @@ const JEV_CORE_TOOLS: &[&str] = &[
     "browser_get_tabs",
 ];
 
+/// `act`'s fallback when Jev gives no confident choice: the candidate whose
+/// name (2 points a word) and description (1) share the most words with the
+/// intent; `None` when nothing is shared.
+fn keyword_pick(intent: &str, candidates: &[(String, String)]) -> Option<String> {
+    const STOP: &[&str] = &[
+        "the", "and", "for", "with", "from", "into", "that", "this", "what", "want", "some",
+    ];
+    let words = |text: &str| -> Vec<String> {
+        text.to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.len() >= 3 && !STOP.contains(w))
+            .map(str::to_string)
+            .collect()
+    };
+    let wanted = words(intent);
+    candidates
+        .iter()
+        .map(|(name, desc)| {
+            let in_name = words(&name.replace('_', " "));
+            let in_desc = words(desc);
+            let score: usize = wanted
+                .iter()
+                .map(|w| {
+                    if in_name.contains(w) {
+                        2
+                    } else if in_desc.contains(w) {
+                        1
+                    } else {
+                        0
+                    }
+                })
+                .sum();
+            (score, name)
+        })
+        .filter(|(score, _)| *score > 0)
+        .max_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(a.1)))
+        .map(|(_, n)| n.clone())
+}
+
 /// A tool description's first sentence, at most 160 characters.
 fn first_sentence(description: &str) -> String {
     description
@@ -9398,6 +9490,81 @@ mod tests {
             agent.host.tool_sets.borrow().len(),
             2,
             "each missed tool is logged"
+        );
+    }
+
+    fn acts(intent: &str) -> LlmResponse {
+        LlmResponse {
+            text: "".into(),
+            tool_calls: vec![a_tool_call("act", serde_json::json!({"intent": intent}))],
+            reasoning: None,
+        }
+    }
+
+    fn act_result(agent: &Agent<MockHostFunctions>) -> String {
+        let req = agent.host.captured_requests.borrow()[1].clone();
+        req.messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, MessageRole::Tool))
+            .unwrap()
+            .content
+            .clone()
+    }
+
+    #[test]
+    fn act_loads_the_chosen_tool() {
+        let mock = MockHostFunctions::new();
+        *mock.choose_with.borrow_mut() = Some("think".into());
+        mock.add_llm_response(acts("reason about it"));
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        agent.run(&jev_input(&["web_search"])).unwrap();
+        assert!(agent.host.captured_tool_names.borrow()[1].contains(&"think".to_string()));
+        assert_eq!(agent.host.tool_sets.borrow()[0].0, "act");
+        assert!(
+            act_result(&agent).contains("think"),
+            "{}",
+            act_result(&agent)
+        );
+    }
+
+    #[test]
+    fn act_falls_back_to_keywords_when_jev_has_no_answer() {
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(acts("search the web for news"));
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        agent.run(&jev_input(&["think"])).unwrap();
+        assert!(agent.host.captured_tool_names.borrow()[1].contains(&"web_search".to_string()));
+    }
+
+    #[test]
+    fn act_never_loads_a_tool_outside_the_allowlist() {
+        let mock = MockHostFunctions::new();
+        *mock.choose_with.borrow_mut() = Some("bash".into()); // even if the host says so
+        mock.add_llm_response(acts("run a shell command"));
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        let mut input = jev_input(&["think"]);
+        input.tools_config = Some(nevoflux_protocol::subagent::ToolsConfig::Allow(vec![
+            "think".into(),
+            "browser_navigate".into(),
+            "browser_get_markdown".into(),
+            "browser_get_tabs".into(),
+            "web_search".into(),
+        ]));
+        agent.run(&input).unwrap();
+        assert!(agent
+            .host
+            .captured_tool_names
+            .borrow()
+            .iter()
+            .all(|r| !r.contains(&"bash".to_string())));
+        assert!(
+            act_result(&agent).contains("No tool fits"),
+            "{}",
+            act_result(&agent)
         );
     }
 
