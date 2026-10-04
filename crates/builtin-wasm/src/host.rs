@@ -44,6 +44,49 @@ pub struct RenderRequest<'a> {
     pub max_bytes: usize,
 }
 
+/// The step whose signals are being asked (Jev request ①, spec §5.4).
+pub struct StepSignalsRequest<'a> {
+    /// 0-based step.
+    pub step: u32,
+    pub query: &'a str,
+    /// The tool calls this step is about to run.
+    pub calls: &'a [ToolCall],
+    /// Names of the tools offered on this step.
+    pub loaded_tools: Vec<String>,
+    /// One stub line per stored (compressed) chunk.
+    pub chunk_stubs: Vec<String>,
+    pub tab_url: Option<&'a str>,
+    pub tab_title: Option<&'a str>,
+}
+
+/// What the loop needs of the latest signals that landed.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StepSignalsView {
+    pub step: u32,
+    pub drift: Option<f64>,
+    pub irrelevant_bulk: Option<f64>,
+}
+
+/// A polluted run asks the host to rebuild its earlier turns (Jev P2-3b).
+pub struct RebuildRequest<'a> {
+    /// The query driving this run.
+    pub query: &'a str,
+    /// `polluted`.
+    pub reason: &'a str,
+    /// Messages after the system prompt that are earlier turns.
+    pub history_len: usize,
+    /// This turn's messages so far: a rebuild writes them to the cache again.
+    pub current: &'a [Message],
+}
+
+/// What the host made of a tool result: the text the model sees and, when
+/// the full text was stored, the chunk `recall` takes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rendered {
+    pub content: String,
+    pub chunk_id: Option<String>,
+}
+
 /// Host function interface.
 ///
 /// This trait defines all host functions available to the Wasm guest.
@@ -1012,7 +1055,33 @@ pub trait HostFunctions {
 
     /// The text to show the model instead of `req.content`, or `None` to
     /// keep it. Called after the result was recorded in full.
-    fn render_tool_result(&self, _req: &RenderRequest<'_>) -> Option<String> {
+    fn render_tool_result(&self, _req: &RenderRequest<'_>) -> Option<Rendered> {
+        None
+    }
+
+    /// Whether per-step Jev signals are asked this run. Asked once per run.
+    fn signals_active(&self) -> bool {
+        false
+    }
+
+    /// Ask this step's signals without waiting for them.
+    fn step_signals(&self, _req: &StepSignalsRequest<'_>) {}
+
+    /// The latest signals that have landed, if any.
+    fn latest_signals(&self) -> Option<StepSignalsView> {
+        None
+    }
+
+    /// Wait (at most the Jev timeout) for signals still in flight, so their
+    /// cost is counted in this turn.
+    fn settle_signals(&self) {}
+
+    /// A correction note was appended before `step` (spec §5.7).
+    fn record_correction(&self, _step: u32, _triggers: &[&str], _entries: u32) {}
+
+    /// The earlier turns rebuilt for this run's query, when the economics
+    /// favour it; `None` keeps them (spec §5.7: polluted earlier turns).
+    fn rebuild_history(&self, _req: &RebuildRequest<'_>) -> Option<Vec<Message>> {
         None
     }
 
@@ -1191,6 +1260,30 @@ pub struct MockHostFunctions {
     pub render_with: std::cell::RefCell<Option<String>>,
     /// `tool_recall` calls, as (chunk id, offset).
     pub recalls: std::cell::RefCell<Vec<(String, u64)>>,
+    /// Chunk ids handed out by `render_tool_result`: `c0`, `c1`, …
+    pub render_ids: std::cell::Cell<u32>,
+    /// What `tool_recall` returns.
+    pub recall_text: std::cell::RefCell<String>,
+    /// What `signals_active` answers.
+    pub signals: std::cell::Cell<bool>,
+    /// Steps `step_signals` was called for.
+    pub asked: std::cell::RefCell<Vec<u32>>,
+    /// What `latest_signals` returns.
+    pub latest: std::cell::RefCell<Option<StepSignalsView>>,
+    /// Triggers of each recorded correction.
+    pub corrections: std::cell::RefCell<Vec<Vec<String>>>,
+    /// `settle_signals` calls.
+    pub settled: std::cell::Cell<u32>,
+    /// When set, `tool_read` fails with this message.
+    pub tool_read_error: std::cell::RefCell<Option<String>>,
+    /// What `rebuild_history` returns.
+    pub rebuild_with: std::cell::RefCell<Option<Vec<Message>>>,
+    /// When set, what `tool_read` returns as the file content.
+    pub read_text: std::cell::RefCell<Option<String>>,
+    /// Reasons `rebuild_history` was asked with.
+    pub rebuild_asked: std::cell::RefCell<Vec<String>>,
+    /// The current-turn length each rebuild request carried.
+    pub rebuild_current: std::cell::RefCell<Vec<usize>>,
 }
 
 #[cfg(test)]
@@ -1226,6 +1319,18 @@ impl MockHostFunctions {
             rendered: std::cell::RefCell::new(vec![]),
             render_with: std::cell::RefCell::new(None),
             recalls: std::cell::RefCell::new(vec![]),
+            render_ids: std::cell::Cell::new(0),
+            recall_text: std::cell::RefCell::new("FULL TEXT".into()),
+            signals: std::cell::Cell::new(false),
+            asked: std::cell::RefCell::new(vec![]),
+            latest: std::cell::RefCell::new(None),
+            corrections: std::cell::RefCell::new(vec![]),
+            settled: std::cell::Cell::new(0),
+            tool_read_error: std::cell::RefCell::new(None),
+            rebuild_with: std::cell::RefCell::new(None),
+            read_text: std::cell::RefCell::new(None),
+            rebuild_asked: std::cell::RefCell::new(vec![]),
+            rebuild_current: std::cell::RefCell::new(vec![]),
         }
     }
 
@@ -1331,18 +1436,52 @@ impl HostFunctions for MockHostFunctions {
         self.visibility.get()
     }
 
-    fn render_tool_result(&self, req: &RenderRequest<'_>) -> Option<String> {
+    fn render_tool_result(&self, req: &RenderRequest<'_>) -> Option<Rendered> {
         self.rendered
             .borrow_mut()
             .push((req.call.name.clone(), req.content.len()));
-        self.render_with.borrow().clone()
+        let content = self.render_with.borrow().clone()?;
+        let n = self.render_ids.get();
+        self.render_ids.set(n + 1);
+        Some(Rendered {
+            content,
+            chunk_id: Some(format!("c{n}")),
+        })
+    }
+
+    fn signals_active(&self) -> bool {
+        self.signals.get()
+    }
+
+    fn step_signals(&self, req: &StepSignalsRequest<'_>) {
+        self.asked.borrow_mut().push(req.step);
+    }
+
+    fn latest_signals(&self) -> Option<StepSignalsView> {
+        self.latest.borrow().clone()
+    }
+
+    fn settle_signals(&self) {
+        self.settled.set(self.settled.get() + 1);
+    }
+
+    fn rebuild_history(&self, req: &RebuildRequest<'_>) -> Option<Vec<Message>> {
+        self.rebuild_asked.borrow_mut().push(req.reason.to_string());
+        self.rebuild_current.borrow_mut().push(req.current.len());
+        self.rebuild_with.borrow().clone()
+    }
+
+    fn record_correction(&self, _step: u32, triggers: &[&str], _entries: u32) {
+        self.corrections
+            .borrow_mut()
+            .push(triggers.iter().map(|t| t.to_string()).collect());
     }
 
     fn tool_recall(&self, chunk_id: &str, offset: u64) -> HostResult<String> {
         self.recalls
             .borrow_mut()
             .push((chunk_id.to_string(), offset));
-        Ok("FULL TEXT".into())
+        Ok(self.recall_text.borrow().clone())
     }
 
     fn record_turn_boundary(&self, turn: u32, start: bool) {
@@ -1452,6 +1591,12 @@ impl HostFunctions for MockHostFunctions {
         _limit: Option<u64>,
     ) -> HostResult<ReadResult> {
         self.tool_read_calls.set(self.tool_read_calls.get() + 1);
+        if let Some(msg) = self.tool_read_error.borrow().clone() {
+            return Err(HostError {
+                code: 1,
+                message: msg,
+            });
+        }
         // Lets a test produce a measurable tool duration without depending on
         // how fast the machine is.
         let delay = self.tool_read_delay_ms.get();
@@ -1463,7 +1608,11 @@ impl HostFunctions for MockHostFunctions {
             total_bytes: 12,
             returned_lines: 1,
             offset: 0,
-            content: "File content".into(),
+            content: self
+                .read_text
+                .borrow()
+                .clone()
+                .unwrap_or_else(|| "File content".into()),
             truncated: false,
         })
     }
@@ -2118,6 +2267,7 @@ mod tests {
             messages: vec![Message::user("Hello")],
             tools: vec![],
             stream: false,
+            history_len: None,
         };
         let response = mock.llm_chat(&request).unwrap();
         assert_eq!(response.text, "Mock response");
@@ -2136,6 +2286,7 @@ mod tests {
             messages: vec![Message::user("Hello")],
             tools: vec![],
             stream: false,
+            history_len: None,
         };
         let response = mock.llm_chat(&request).unwrap();
         assert_eq!(response.text, "Custom response");
@@ -2148,6 +2299,7 @@ mod tests {
             messages: vec![Message::user("Hello")],
             tools: vec![],
             stream: true,
+            history_len: None,
         };
 
         let stream_id = mock.llm_stream_start(&request).unwrap();

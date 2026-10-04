@@ -723,6 +723,7 @@ impl ToolCallTracker {
         let mut messages = Vec::new();
         if let Some(sys) = system {
             messages.push(LlmMessage {
+                cache_anchor: false,
                 role: "system".into(),
                 content: sys.into(),
                 tool_calls: None,
@@ -1015,6 +1016,7 @@ async fn test_openai_image_attachment_streaming() {
     let request = LlmChatRequest {
         messages: vec![
             LlmMessage {
+                cache_anchor: false,
                 role: "system".into(),
                 content: "You are a powerful AI agent with full system access.".into(),
                 tool_calls: None,
@@ -1140,6 +1142,7 @@ Ask for permission before destructive operations."#;
     let request = LlmChatRequest {
         messages: vec![
             LlmMessage {
+                cache_anchor: false,
                 role: "system".into(),
                 content: agent_system_prompt.into(),
                 tool_calls: None,
@@ -1328,6 +1331,7 @@ async fn test_openai_large_screenshot_image() {
     let request = LlmChatRequest {
         messages: vec![
             LlmMessage {
+                cache_anchor: false,
                 role: "system".into(),
                 content: "You are a helpful assistant.".into(),
                 tool_calls: None,
@@ -1401,6 +1405,7 @@ async fn test_openai_large_screenshot_image() {
         let request_gpt4o = LlmChatRequest {
             messages: vec![
                 LlmMessage {
+                    cache_anchor: false,
                     role: "system".into(),
                     content: "You are a helpful assistant.".into(),
                     tool_calls: None,

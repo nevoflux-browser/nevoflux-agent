@@ -21,6 +21,10 @@ class TrialConfig:
     overrides: dict
     work_root: pathlib.Path
     keep_dirs: bool = False
+    # Host the task URLs use. Jev runs use a public name that resolves to
+    # 127.0.0.1 (localtest.me): the daemon treats 127.0.0.1 as intranet and
+    # never sends its pages to Jev.
+    site_host: str = "127.0.0.1"
 
 
 # rig's providers say "ProviderError"; the daemon's raw HTTP paths (all
@@ -66,6 +70,10 @@ def build_task_body(spec) -> dict:
     }
 
 
+def site_base(host: str, port: int, site: str) -> str:
+    return f"http://{host}:{port}/{site}"
+
+
 def run_trial(spec, site, cfg: TrialConfig, trial_id: str) -> dict:
     cfg.work_root.mkdir(parents=True, exist_ok=True)
     tdir = pathlib.Path(tempfile.mkdtemp(prefix=f"{trial_id}-", dir=cfg.work_root))
@@ -75,7 +83,7 @@ def run_trial(spec, site, cfg: TrialConfig, trial_id: str) -> dict:
     (tdir / "config.toml").write_text(text, encoding="utf-8")
 
     site.set_trial(trial_id)
-    rendered = render(spec, f"http://127.0.0.1:{site.port}/{spec.site}")
+    rendered = render(spec, site_base(cfg.site_host, site.port, spec.site))
     d = dmod.Daemon(cfg.agent_exe, tdir, cfg.browser_bin, dmod.free_port())
     keep = cfg.keep_dirs
     t0 = time.monotonic()

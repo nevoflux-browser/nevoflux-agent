@@ -281,12 +281,67 @@ pub enum SessionEventPayload {
         bytes: u64,
         /// `hide`, `short`, `long` or `full`.
         level: String,
-        /// `jev`, `fallback` (Jev failed) or `sensitive` (never sent, §5.8).
+        /// `jev`, `fallback` (Jev failed), `sensitive` (never sent, §5.8) or
+        /// `rebuild` (re-graded against a later query).
         graded_by: String,
         /// Lines kept by a long grade, 0 otherwise.
         kept_lines: u64,
         /// Time spent grading.
         elapsed_ms: u64,
+        /// The tool call the chunk belongs to (absent in logs before P2-3b).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
+        /// Kept line ranges `[start, end)` of a long grade, in pseudo-lines,
+        /// so the rendition can be rebuilt from the stored text.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        kept: Vec<[u64; 2]>,
+        /// URLs of the pages the chunk may come from (empty: no page), so a
+        /// re-grade can re-check them against the current sensitive list.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pages: Vec<String>,
+    },
+    /// Jev's per-step signals (request ①, spec §5.4), logged when they land.
+    #[serde(rename = "jev/signals")]
+    JevSignals {
+        /// 0-based step the signals were asked for.
+        step: u32,
+        /// H: P25 of the remaining-steps distribution, in steps.
+        h: Option<u32>,
+        drift: Option<f64>,
+        irrelevant_bulk: Option<f64>,
+        needs_action: Option<f64>,
+        /// Time from asking to the answer.
+        elapsed_ms: u64,
+    },
+    /// An in-turn correction note was appended at the tail (spec §5.7).
+    #[serde(rename = "context/correction")]
+    ContextCorrection {
+        /// Step before which it was appended.
+        step: u32,
+        /// `repeat_call`, `error_streak`, `bad_args`, `drift`, `irrelevant_bulk`.
+        triggers: Vec<String>,
+        /// Failed attempts listed in the note.
+        entries: u32,
+    },
+    /// Earlier turns were kept or rebuilt (spec §5.7 rebuild economics).
+    #[serde(rename = "context/rebuild")]
+    ContextRebuild {
+        /// `ttl_expired`, `cost_formula` or `polluted`.
+        reason: String,
+        /// `rebuild`, `keep` or `keep_fallback` (Jev failed: kept, §5.8).
+        decision: String,
+        /// Cost of keeping, in uncached-input-token units.
+        keep_cost: f64,
+        /// Cost of rebuilding, same units, Jev tokens included.
+        rebuild_cost: f64,
+        /// Remaining requests that read the prefix (Jev's steps + 1).
+        h: u32,
+        /// Estimated tokens of the history kept.
+        before_tokens: u64,
+        /// Estimated tokens of the history rebuilt (= before when kept).
+        after_tokens: u64,
+        /// Chunks re-graded by Jev.
+        regraded: u32,
     },
 }
 
@@ -315,6 +370,9 @@ impl SessionEventPayload {
             Self::ToolSpill { .. } => "tool/spill",
             Self::JevFallback { .. } => "jev/fallback",
             Self::JevVisibility { .. } => "jev/visibility",
+            Self::JevSignals { .. } => "jev/signals",
+            Self::ContextCorrection { .. } => "context/correction",
+            Self::ContextRebuild { .. } => "context/rebuild",
         }
     }
 }
@@ -364,6 +422,91 @@ mod tests {
     use super::*;
 
     #[test]
+    fn context_rebuild_event_wire_shape() {
+        let p = SessionEventPayload::ContextRebuild {
+            reason: "ttl_expired".into(),
+            decision: "rebuild".into(),
+            keep_cost: 153_000.0,
+            rebuild_cost: 59_500.0,
+            h: 10,
+            before_tokens: 90_000,
+            after_tokens: 35_000,
+            regraded: 12,
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["type"], "context/rebuild");
+        assert_eq!(v["decision"], "rebuild");
+        assert_eq!(p.type_str(), "context/rebuild");
+        let back: SessionEventPayload = serde_json::from_value(v).unwrap();
+        assert_eq!(back, p);
+    }
+
+    #[test]
+    fn jev_visibility_carries_its_call_and_kept_ranges() {
+        let p = SessionEventPayload::JevVisibility {
+            id: "c1".into(),
+            tool: "read".into(),
+            bytes: 9000,
+            level: "long".into(),
+            graded_by: "jev".into(),
+            kept_lines: 25,
+            elapsed_ms: 400,
+            call_id: Some("toolu_1".into()),
+            kept: vec![[25, 50]],
+            pages: vec!["https://example.com/a".into()],
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["call_id"], "toolu_1");
+        assert_eq!(v["kept"][0][1], 50);
+        assert_eq!(v["pages"][0], "https://example.com/a");
+        let back: SessionEventPayload = serde_json::from_value(v).unwrap();
+        assert_eq!(back, p);
+    }
+
+    #[test]
+    fn an_old_jev_visibility_event_still_parses() {
+        let v = serde_json::json!({"type": "jev/visibility", "id": "c1", "tool": "read", "bytes": 9000,
+            "level": "short", "graded_by": "jev", "kept_lines": 0, "elapsed_ms": 1});
+        let p: SessionEventPayload = serde_json::from_value(v).unwrap();
+        assert!(
+            matches!(p, SessionEventPayload::JevVisibility { call_id: None, ref kept, .. } if kept.is_empty())
+        );
+    }
+
+    #[test]
+    fn jev_signals_event_wire_shape() {
+        let p = SessionEventPayload::JevSignals {
+            step: 3,
+            h: Some(4),
+            drift: Some(0.12),
+            irrelevant_bulk: None,
+            needs_action: Some(0.9),
+            elapsed_ms: 310,
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["type"], "jev/signals");
+        assert_eq!(v["h"], 4);
+        assert_eq!(p.type_str(), "jev/signals");
+        let back: SessionEventPayload = serde_json::from_value(v).unwrap();
+        assert_eq!(back, p);
+    }
+
+    #[test]
+    fn context_correction_event_wire_shape() {
+        let p = SessionEventPayload::ContextCorrection {
+            step: 5,
+            triggers: vec!["repeat_call".into(), "drift".into()],
+            entries: 2,
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["type"], "context/correction");
+        assert_eq!(v["triggers"][1], "drift");
+        assert_eq!(p.type_str(), "context/correction");
+        let back: SessionEventPayload = serde_json::from_value(v).unwrap();
+        assert_eq!(back, p);
+    }
+
+    #[test]
     fn jev_visibility_event_wire_shape() {
         let p = SessionEventPayload::JevVisibility {
             id: "call_1".into(),
@@ -373,6 +516,9 @@ mod tests {
             graded_by: "jev".into(),
             kept_lines: 25,
             elapsed_ms: 412,
+            call_id: None,
+            kept: vec![],
+            pages: vec![],
         };
         let v = serde_json::to_value(&p).unwrap();
         assert_eq!(v["type"], "jev/visibility");

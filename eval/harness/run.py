@@ -76,6 +76,35 @@ def _summary(rows, specs, k):
             "provider_errors": sum(r["status"] == "provider_error" for r in rows)}
 
 
+def check_agent_fresh(exe, repo, commit_time=None) -> None:
+    """Exit unless the agent binary is newer than the last commit under
+    crates/ — a failed rebuild must not run the old binary silently."""
+    import subprocess
+    exe = pathlib.Path(exe)
+    if commit_time is None:
+        out = subprocess.run(["git", "log", "-1", "--format=%ct", "--", "crates"], cwd=str(repo),
+                             capture_output=True, text=True)
+        commit_time = int(out.stdout.strip() or 0)
+    if not exe.exists():
+        sys.exit(f"--agent-exe {exe}: missing; build it (cargo build --release)")
+    if exe.stat().st_mtime < commit_time:
+        sys.exit(f"--agent-exe {exe}: older than the last commit under crates/; rebuild it "
+                 f"(or pass --allow-stale-agent)")
+
+
+def check_site_host(host: str) -> None:
+    """Exit unless every address `host` resolves to is loopback."""
+    import ipaddress
+    import socket
+    try:
+        addrs = {a[4][0] for a in socket.getaddrinfo(host, None)}
+    except OSError as e:
+        sys.exit(f"--site-host {host}: does not resolve ({e}); check DNS")
+    bad = sorted(a for a in addrs if not ipaddress.ip_address(a).is_loopback)
+    if not addrs or bad:
+        sys.exit(f"--site-host {host}: must resolve to 127.0.0.1 only (got {sorted(addrs)})")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--tasks", required=True)
@@ -87,8 +116,15 @@ def main(argv=None):
     ap.add_argument("--browser-bin", default=os.environ.get("NEVOFLUX_BROWSER_BIN", DEFAULT_BROWSER))
     ap.add_argument("--base-config", default=str(pathlib.Path(os.environ["APPDATA"]) / "nevoflux" / "config.toml"))
     ap.add_argument("--keep-dirs", action="store_true")
+    ap.add_argument("--allow-stale-agent", action="store_true",
+                    help="run even when the agent binary is older than the last commit under crates/")
+    ap.add_argument("--site-host", default="127.0.0.1",
+                    help="host in task URLs; Jev runs use localtest.me (127.0.0.1 is never sent to Jev)")
     a = ap.parse_args(argv)
 
+    check_site_host(a.site_host)
+    if not a.allow_stale_agent:
+        check_agent_fresh(a.agent_exe, HERE.parents[1])
     specs = load_dir(a.tasks)
     if a.only:
         wanted = set(a.only.split(","))
@@ -101,7 +137,7 @@ def main(argv=None):
     todo = plan_trials(specs, a.k, done)
     cfg = TrialConfig(agent_exe=pathlib.Path(a.agent_exe), browser_bin=pathlib.Path(a.browser_bin),
                       base_config=pathlib.Path(a.base_config), overrides=_parse_set(a.set),
-                      work_root=out / "trials", keep_dirs=a.keep_dirs)
+                      work_root=out / "trials", keep_dirs=a.keep_dirs, site_host=a.site_host)
     with (out / "run.json").open("a", encoding="utf-8") as f:
         f.write(json.dumps({
             "started": datetime.datetime.now().isoformat(), "tasks": a.tasks, "k": a.k,

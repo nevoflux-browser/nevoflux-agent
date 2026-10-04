@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use nevoflux_builtin_wasm::RenderRequest;
+use nevoflux_builtin_wasm::{RenderRequest, Rendered};
 use nevoflux_protocol::session_event::SessionEventPayload;
 
 use super::client;
@@ -34,7 +34,7 @@ pub struct RenderEnv<'a> {
 }
 
 /// Grade and render one tool result, or `None` to leave it as it is.
-pub async fn render(env: &RenderEnv<'_>, req: &RenderRequest<'_>) -> Option<String> {
+pub async fn render(env: &RenderEnv<'_>, req: &RenderRequest<'_>) -> Option<Rendered> {
     let content = req.content;
     if content.len() <= SMALL {
         return None;
@@ -67,27 +67,33 @@ pub async fn render(env: &RenderEnv<'_>, req: &RenderRequest<'_>) -> Option<Stri
     };
     // Sensitive or unknown pages are never sent (§5.8): the local rule.
     if ctx.scope(&env.jev.sensitive_domains) == Scope::MetadataOnly {
-        return Some(finish(
-            env,
-            req,
+        return Some(named(
             &chunk,
-            Level::Short,
-            &lines,
-            &[],
-            "sensitive",
-            started,
+            finish(
+                env,
+                req,
+                &chunk,
+                Level::Short,
+                &lines,
+                &[],
+                "sensitive",
+                started,
+            ),
         ));
     }
     let Ok(jev_client) = client::shared(env.jev) else {
-        return Some(finish(
-            env,
-            req,
+        return Some(named(
             &chunk,
-            Level::Short,
-            &lines,
-            &[],
-            "fallback",
-            started,
+            finish(
+                env,
+                req,
+                &chunk,
+                Level::Short,
+                &lines,
+                &[],
+                "fallback",
+                started,
+            ),
         ));
     };
     let oracle = JevOracle::new(
@@ -109,34 +115,47 @@ pub async fn render(env: &RenderEnv<'_>, req: &RenderRequest<'_>) -> Option<Stri
             Verdict::Answered(r) => answers.push(r),
             // Each failing part was logged as jev/fallback by the oracle.
             Verdict::Fallback { .. } => {
-                return Some(finish(
-                    env,
-                    req,
+                return Some(named(
                     &chunk,
-                    Level::Short,
-                    &lines,
-                    &[],
-                    "fallback",
-                    started,
+                    finish(
+                        env,
+                        req,
+                        &chunk,
+                        Level::Short,
+                        &lines,
+                        &[],
+                        "fallback",
+                        started,
+                    ),
                 ));
             }
         }
     }
     let grade = combine(&ps, &answers);
     if grade.level == Level::Full && content.len() <= req.max_bytes {
-        log(env, req, &chunk, Level::Full, 0, "jev", started);
-        return None;
+        log(env, req, &chunk, Level::Full, &[], "jev", started);
+        return Some(named(&chunk, req.content.to_string()));
     }
-    Some(finish(
-        env,
-        req,
+    Some(named(
         &chunk,
-        grade.level,
-        &lines,
-        &grade.kept,
-        "jev",
-        started,
+        finish(
+            env,
+            req,
+            &chunk,
+            grade.level,
+            &lines,
+            &grade.kept,
+            "jev",
+            started,
+        ),
     ))
+}
+
+fn named(chunk: &str, content: String) -> Rendered {
+    Rendered {
+        content,
+        chunk_id: Some(chunk.to_string()),
+    }
 }
 
 fn finish(
@@ -155,20 +174,8 @@ fn finish(
         bytes: req.content.len(),
         graded_by,
     };
-    let kept_lines = if level == Level::Long {
-        kept.iter().map(|r| r.len()).sum()
-    } else {
-        0
-    };
-    log(
-        env,
-        req,
-        chunk,
-        level,
-        kept_lines as u64,
-        graded_by,
-        started,
-    );
+    let kept: &[std::ops::Range<usize>] = if level == Level::Long { kept } else { &[] };
+    log(env, req, chunk, level, kept, graded_by, started);
     render_level(level, req.content, lines, kept, &meta, req.max_bytes)
 }
 
@@ -177,19 +184,31 @@ fn log(
     req: &RenderRequest<'_>,
     chunk: &str,
     level: Level,
-    kept_lines: u64,
+    kept: &[std::ops::Range<usize>],
     graded_by: &str,
     started: Instant,
 ) {
     if let Some(w) = &env.events {
+        // Where the text may come from, so a later re-grade can re-check it.
+        let pages = match page_kind(&req.call.name, &req.call.arguments) {
+            PageKind::Browser => env.page_urls.clone().unwrap_or_default(),
+            PageKind::Url(u) => vec![u],
+            PageKind::Unknown | PageKind::None => Vec::new(),
+        };
         w.append(SessionEventPayload::JevVisibility {
             id: chunk.to_string(),
             tool: req.call.name.clone(),
             bytes: req.content.len() as u64,
             level: level.as_str().to_string(),
             graded_by: graded_by.to_string(),
-            kept_lines,
+            kept_lines: kept.iter().map(|r| r.len() as u64).sum(),
             elapsed_ms: started.elapsed().as_millis() as u64,
+            call_id: Some(req.tool_call_id.to_string()),
+            kept: kept
+                .iter()
+                .map(|r| [r.start as u64, r.end as u64])
+                .collect(),
+            pages,
         });
     }
 }
@@ -276,6 +295,7 @@ mod tests {
 
     struct Run {
         out: Option<String>,
+        chunk: Option<String>,
         stored: HashMap<String, String>,
     }
 
@@ -313,9 +333,10 @@ mod tests {
             content,
             max_bytes: 32_000,
         };
-        let out = render(&env, &req).await;
+        let rendered = render(&env, &req).await;
         Run {
-            out,
+            out: rendered.as_ref().map(|r| r.content.clone()),
+            chunk: rendered.and_then(|r| r.chunk_id),
             stored: stored.into_inner(),
         }
     }
@@ -375,6 +396,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_long_grade_logs_its_call_and_kept_lines() {
+        let (url, _) = answering(answer("long", &["b001"]), Duration::ZERO).await;
+        let db = Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        let w = Arc::new(SessionEventWriter::new(db.clone(), "s1".into()));
+        run(
+            &jev(&url, 2000),
+            "read",
+            serde_json::json!({}),
+            None,
+            &hundred_lines(),
+            true,
+            Some(w),
+        )
+        .await;
+        let events = nevoflux_storage::repositories::SessionEventRepository::new(&db)
+            .list("s1")
+            .unwrap();
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.payload,
+                SessionEventPayload::JevVisibility { call_id: Some(c), kept, .. }
+                    if c == "call_1" && kept == &vec![[25u64, 50u64]]
+            )),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_grade_logs_the_pages_its_text_may_come_from() {
+        let (url, _) = answering(answer("long", &["b001"]), Duration::ZERO).await;
+        let db = Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        let w = Arc::new(SessionEventWriter::new(db.clone(), "s1".into()));
+        run(
+            &jev(&url, 2000),
+            "browser_get_markdown",
+            serde_json::json!({}),
+            Some("https://shop.example/cart"),
+            &hundred_lines(),
+            true,
+            Some(w),
+        )
+        .await;
+        let events = nevoflux_storage::repositories::SessionEventRepository::new(&db)
+            .list("s1")
+            .unwrap();
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.payload,
+                SessionEventPayload::JevVisibility { pages, .. }
+                    if pages == &vec!["https://shop.example/cart".to_string()]
+            )),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_hidden_result_keeps_only_the_stub() {
         let (url, _) = answering(answer("hide", &[]), Duration::ZERO).await;
         let r = run(
@@ -393,19 +470,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_full_grade_that_fits_is_left_alone() {
+    async fn a_full_grade_that_fits_keeps_the_text_and_names_the_chunk() {
         let (url, _) = answering(answer("full", &[]), Duration::ZERO).await;
+        let content = hundred_lines();
         let r = run(
             &jev(&url, 2000),
             "read",
             serde_json::json!({}),
             None,
-            &hundred_lines(),
+            &content,
             true,
             None,
         )
         .await;
-        assert!(r.out.is_none());
+        assert_eq!(r.out.as_deref(), Some(content.as_str()));
+        let chunk = r.chunk.expect("chunk id");
+        assert_eq!(r.stored.get(&chunk), Some(&content));
     }
 
     #[tokio::test]

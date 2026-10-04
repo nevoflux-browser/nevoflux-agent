@@ -259,6 +259,32 @@ pub async fn run_agent_once(
     // Reset interrupt flag so a stray prior cancel doesn't poison this run.
     services_for_run.reset_interrupt();
 
+    // Jev on: a task's earlier turns come from the session log with their
+    // tool results, graded (spec §5.2); a caller-supplied history the log
+    // never saw (A2A) stays as given.
+    let text_history = history_to_messages(req.history);
+    let history = if !text_history.is_empty()
+        && !req.session_id.is_empty()
+        && crate::jev::rebuild::rebuild_point_on(&agent_config)
+    {
+        let max = agent_config.daemon.context.max_history_messages as usize;
+        let table = crate::jev::rebuild::table_from_text(&text_history);
+        crate::jev::rebuild::prefer_log(
+            crate::jev::rebuild::history_from_log(
+                &agent_config,
+                &services_for_run.database,
+                &req.session_id,
+                &req.user_message,
+                max,
+                table,
+            )
+            .await,
+            text_history,
+        )
+    } else {
+        text_history
+    };
+
     let turn_stats = crate::turn_stats::TurnStats::new();
     let mut host = crate::agent_host::DaemonHostFunctions::new(agent_config, runtime_handle)
         .with_services(services_for_run)
@@ -289,7 +315,7 @@ pub async fn run_agent_once(
         session_id: req.session_id.clone(),
         mode: req.mode,
         user_message: req.user_message,
-        history: history_to_messages(req.history),
+        history,
         attachments: vec![],
         local_files: vec![],
         custom_system_prompt: None,

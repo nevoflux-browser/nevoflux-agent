@@ -292,6 +292,45 @@ async fn run_one_turn(
     // and the template's copy is shared by the whole process.
     // Per-turn accounting (M3): the same TurnStats the sidebar uses, so a
     // headless trial reports usage the way a chat reply does.
+    let text_history: Vec<nevoflux_builtin_wasm::Message> = history
+        .iter()
+        .map(|h| nevoflux_builtin_wasm::Message {
+            role: if h.role == "assistant" {
+                nevoflux_builtin_wasm::MessageRole::Assistant
+            } else {
+                nevoflux_builtin_wasm::MessageRole::User
+            },
+            content: h.content.clone(),
+            tool_call_id: None,
+            tool_calls: vec![],
+            attachments: vec![],
+            reasoning: None,
+        })
+        .collect();
+    // Jev on: a follow-up's earlier turns come from the session log with their
+    // tool results, graded (spec §5.2); history the log never saw stays.
+    let history = if !text_history.is_empty()
+        && !session_id.is_empty()
+        && crate::jev::rebuild::rebuild_point_on(&agent_config)
+    {
+        let max = agent_config.daemon.context.max_history_messages as usize;
+        let table = crate::jev::rebuild::table_from_text(&text_history);
+        crate::jev::rebuild::prefer_log(
+            crate::jev::rebuild::history_from_log(
+                &agent_config,
+                &services.database,
+                &session_id,
+                &user_message,
+                max,
+                table,
+            )
+            .await,
+            text_history,
+        )
+    } else {
+        text_history
+    };
+
     let turn_stats = crate::turn_stats::TurnStats::new();
     let host = DaemonHostFunctions::new(agent_config, runtime_handle)
         .with_services(services.with_own_session_state())
@@ -312,21 +351,7 @@ async fn run_one_turn(
         session_id,
         mode,
         user_message,
-        history: history
-            .iter()
-            .map(|h| nevoflux_builtin_wasm::Message {
-                role: if h.role == "assistant" {
-                    nevoflux_builtin_wasm::MessageRole::Assistant
-                } else {
-                    nevoflux_builtin_wasm::MessageRole::User
-                },
-                content: h.content.clone(),
-                tool_call_id: None,
-                tool_calls: vec![],
-                attachments: vec![],
-                reasoning: None,
-            })
-            .collect(),
+        history,
         attachments: vec![],
         local_files: vec![],
         custom_system_prompt: None,

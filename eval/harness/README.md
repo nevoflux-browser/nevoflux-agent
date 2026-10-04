@@ -269,6 +269,15 @@ cache hit 98.0%, `browser_eval_js` 26 (same count method as above).
 Rule: if a rerun regresses with no code cause, compare the snapshot's
 `viewport:` line and `stats.occluded` against the passing run first.
 
+## Jev runs: `--site-host localtest.me`
+
+The daemon treats 127.0.0.1 as intranet (§5.8), so pages from the eval sites
+are never sent to Jev and every grade falls back to the local rule. Jev runs
+therefore serve the sites under `localtest.me`, a public DNS name that
+resolves to 127.0.0.1: `--site-host localtest.me`. The harness checks before
+any trial that the name resolves to loopback only, and stops otherwise. The
+default stays 127.0.0.1, which needs no DNS.
+
 ## Jev P2-2 (visibility), 2026-10-02
 
 Agent `feat/jev-p2-2`: tool results over 4 KB in the native loop are graded
@@ -292,6 +301,72 @@ Consequence: neither J20 nor the `jev` task set can measure Jev grading (or
 G2) while the sites are on loopback; that needs a decision (a public host for
 the eval sites, or an eval-only exception to the loopback rule).
 
+
+## Jev P2-3a (per-step signals, recall stubs, corrections), 2026-10-02
+
+Agent `feat/jev-p2-3a`:
+- with visibility on, aged results become `recall` stubs instead of staying
+  whole;
+- every tool step asks Jev request ① (remaining steps → H = P25, drift,
+  irrelevant bulk, needs action) without waiting;
+- the loop appends one correction note when code signals (failed repeats,
+  error streaks, bad arguments) or fresh Jev signals (> 0.8) say the turn is
+  going in circles.
+
+**Real-model measurement deferred** (the user, 2026-10-02): Kimi's weekly
+quota ran out after one Jev-on trial, and that trial ran an older release
+binary (the measurement script did not stop when its rebuild failed), so it
+showed no Jev activity.
+
+**End to end with a fake model** (`fake_anthropic.py`: navigate, read, two
+identical `think` calls, answer), `jev-flights-cheapest` on `localtest.me`:
+
+```bash
+python -m eval.harness.fake_anthropic 58740 &
+NEVOFLUX_API_KEY_TYPESAFE=… python -m eval.harness.run --tasks eval/harness/tasks/jev   --only jev-flights-cheapest --k 1 --set llm.provider=anthropic   --set llm.anthropic.base_url=http://127.0.0.1:58740 --set jev.enabled=true   --site-host localtest.me --out eval/results/jev-e2e-real
+```
+
+Against the real TypeSafe endpoint (public synthetic page only):
+- 4 `jev/signals` with H = 6, 4, 4, 4, drift 0.13–0.21 and irrelevant bulk
+  0.41–0.59;
+- latency 804 ms (first, cold) and then 303–338 ms;
+- one `context/correction` (`repeat_call`, for the identical `think` pair);
+- the turn's `jev` usage bucket: 4 418 input / 284 output tokens over 4 calls.
+
+The fake model needs no quota, so it is the way to check Jev wiring after a
+change; it says nothing about quality (G2).
+
+## Jev P2-3b (rebuild), 2026-10-02
+
+Agent `feat/jev-p2-3b`: with Jev on, earlier turns come from the session log,
+with their tool calls and results kept and each result shown at its grade:
+- hidden and short results fold into the step's text;
+- the 60 newest graded chunks keep their grade, older ones are hidden;
+- a cache breakpoint marks the end of the history.
+
+At turn start the economics decide keep or rebuild:
+- the cache rates and TTL are per wire;
+- H = Jev's remaining steps + 1;
+- re-grading uses the new query.
+
+Mid-turn, polluted earlier turns are rebuilt within ρ, and stale or failed
+output over 30% of the context adds a correction note. Chat, `/tasks`
+follow-ups and agent_exec runs all take this path. `run` refuses an agent
+binary older than the last commit under `crates/` (`--allow-stale-agent`
+skips the check).
+
+**End to end with the fake model** (`jev-flights-followup`: turn 2 starts
+360 s after turn 1, so the 5-minute cache has expired; real TypeSafe):
+- turn 2 logged `context/rebuild{reason:"ttl_expired", decision:"keep",
+  h:2, before_tokens:299, regraded:0}`. Turn 1's results were all ≤ 4 KB, so
+  there was nothing to re-grade, and with equal costs keeping wins.
+- turn 2's `jev` usage: 1 063 input / 71 output tokens in 1 call.
+
+The two failing checks are the fake model's turn-1 text, which is not part
+of what is being checked. Re-grading itself is covered by unit tests against
+a fake Jev (`jev::rebuild`).
+
+## Known gaps
 
 - Agent-loop tasks have no deadline on the daemon side: `wall_clock_secs`
   bounds only the script backend, and `DELETE /tasks/:id` only marks the task

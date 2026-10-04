@@ -484,6 +484,9 @@ pub struct Agent<H: HostFunctions> {
     selector_tools_loaded: Cell<bool>,
     /// Jev visibility is on for the current run (`recall` is a builtin only then).
     visibility_on: Cell<bool>,
+    /// `[0, n)` of this run's messages are the system prompt and the earlier
+    /// turns (Jev path only), for the host's history cache breakpoint.
+    history_anchor: Cell<Option<usize>>,
     /// Current keywords extracted from user message and LLM context, used for auto-snapshots.
     current_keywords: RefCell<Vec<String>>,
     /// Skills that have been loaded in this session (prevent redundant re-loading).
@@ -663,6 +666,7 @@ impl<H: HostFunctions> Agent<H> {
             computer_use_triggered: Cell::new(false),
             selector_tools_loaded: Cell::new(false),
             visibility_on: Cell::new(false),
+            history_anchor: Cell::new(None),
             current_keywords: RefCell::new(Vec::new()),
             loaded_skills: RefCell::new(std::collections::HashSet::new()),
             local_index: RefCell::new(None),
@@ -685,6 +689,7 @@ impl<H: HostFunctions> Agent<H> {
             computer_use_triggered: Cell::new(false),
             selector_tools_loaded: Cell::new(false),
             visibility_on: Cell::new(false),
+            history_anchor: Cell::new(None),
             current_keywords: RefCell::new(Vec::new()),
             loaded_skills: RefCell::new(std::collections::HashSet::new()),
             local_index: RefCell::new(None),
@@ -1867,6 +1872,30 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
         // Jev visibility (spec §5.6): cloud turns only (§3.2), asked once.
         let visibility = input.local.is_none() && self.host.visibility_active();
         self.visibility_on.set(visibility);
+        // message index → (chunk id, offset): what an aged result's stub points
+        // at. Keyed by position, not tool_call_id: Gemini reuses the function
+        // name as the call id, and `messages` only grows within a run.
+        let mut chunks: std::collections::HashMap<usize, (String, u64)> =
+            std::collections::HashMap::new();
+        // Jev per-step signals (request ①) and the in-turn correction (§5.7).
+        let signals = input.local.is_none() && self.host.signals_active();
+        // The Jev path takes earlier turns from the log (P2-3b): anchor their end.
+        self.history_anchor
+            .set((signals && !input.history.is_empty()).then(|| 1 + input.history.len()));
+        let _settle = SettleSignals {
+            host: &self.host,
+            active: signals,
+        };
+        let mut action_log: Vec<crate::pollution::ActionRecord> = Vec::new();
+        let mut last_correction: Option<u32> = None;
+        let mut correction_kinds: Vec<&'static str> = Vec::new();
+        // Entries already listed in a note: a new trigger kind over the same
+        // attempts is the same episode, not a reason for another note.
+        let mut noted: Vec<String> = Vec::new();
+        // Earlier-turn messages after the system prompt, and whether this run
+        // already asked for a polluted rebuild (at most once per turn).
+        let mut history_count = input.history.len();
+        let mut rebuilt = false;
 
         let mut iterations = 0;
         let mut final_text = String::new();
@@ -1913,8 +1942,89 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
             // With Jev visibility on, large results are already graded at
             // insertion and reachable with `recall`; aged-shrink is off
             // (spec §5.6.7).
-            if !visibility {
+            if visibility {
+                // Same selection as aged-shrink, but a stored result becomes a
+                // recall stub (lossless) instead of a cut head.
+                // Earlier turns' results are graded already: this turn's only.
+                stub_aged_tool_results_with(&mut messages, budget, &chunks, 1 + history_count);
+            } else {
                 shrink_aged_tool_results_with(&mut messages, budget);
+            }
+
+            // Polluted earlier turns (Jev's irrelevant bulk over θ, fresh):
+            // ask once per turn for a rebuild of them; this turn's messages
+            // stay as they are (spec §5.6.3, §5.7).
+            if signals && !rebuilt && step >= 1 && history_count > 1 {
+                let fresh_bulk = self.host.latest_signals().is_some_and(|s| {
+                    step <= s.step + 2 && s.irrelevant_bulk.is_some_and(|p| p > POLLUTION_THETA)
+                });
+                if fresh_bulk {
+                    rebuilt = true;
+                    let rebuilt_history = self.host.rebuild_history(&crate::host::RebuildRequest {
+                        query: &input.user_message,
+                        reason: "polluted",
+                        history_len: history_count,
+                        current: &messages[1 + history_count..],
+                    });
+                    if let Some(new) = rebuilt_history {
+                        let old_end = 1 + history_count;
+                        let delta = new.len() as isize - history_count as isize;
+                        messages.splice(1..old_end, new.iter().cloned());
+                        chunks = chunks
+                            .into_iter()
+                            .map(|(k, v)| {
+                                if k >= old_end {
+                                    ((k as isize + delta) as usize, v)
+                                } else {
+                                    (k, v)
+                                }
+                            })
+                            .collect();
+                        history_count = new.len();
+                        self.history_anchor
+                            .set((history_count > 0).then(|| 1 + history_count));
+                    }
+                }
+            }
+
+            // A polluted turn gets one correction note at the tail: at most
+            // once per 3 steps, unless a kind of trigger not seen yet appears.
+            if signals {
+                if let Some(p) = crate::pollution::detect(
+                    &action_log,
+                    self.host.latest_signals().as_ref(),
+                    POLLUTION_THETA,
+                    step,
+                    messages.iter().map(|m| m.content.len()).sum(),
+                ) {
+                    let new_kind = p.triggers.iter().any(|t| !correction_kinds.contains(t));
+                    let new_entries =
+                        p.entries.is_empty() || p.entries.iter().any(|e| !noted.contains(e));
+                    let fresh = new_kind && new_entries;
+                    let due = last_correction.map_or(true, |s| step >= s + 3);
+                    let tail = messages
+                        .iter_mut()
+                        .rev()
+                        .find(|m| matches!(m.role, MessageRole::Tool));
+                    if let (true, Some(tail)) = (fresh || due, tail) {
+                        tail.content.push_str("\n\n");
+                        tail.content
+                            .push_str(&crate::pollution::correction_text(&input.user_message, &p));
+                        self.host
+                            .record_correction(step, &p.triggers, p.entries.len() as u32);
+                        last_correction = Some(step);
+                        for e in &p.entries {
+                            if !noted.contains(e) {
+                                noted.push(e.clone());
+                            }
+                        }
+                        for t in &p.triggers {
+                            if !correction_kinds.contains(t) {
+                                correction_kinds.push(t);
+                            }
+                        }
+                    }
+                }
             }
 
             // `recall` rides on every request while visibility is on; the
@@ -1934,6 +2044,7 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                     messages: messages.clone(),
                     tools: offered.clone(),
                     stream: false,
+                    history_len: self.history_anchor.get(),
                 };
                 self.host.llm_chat(&request)?
             };
@@ -1961,6 +2072,29 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
 
             // Extract keywords from LLM reasoning text once (invariant across tool calls)
             let llm_kws = Self::extract_keywords_from_text(&response.text);
+
+            // Jev request ①: asked now, in parallel with the tools; never waited for.
+            if signals {
+                let stubs: Vec<String> = chunks
+                    .values()
+                    .map(|(c, o)| format!("[{c} · offset {o}]"))
+                    .collect();
+                self.host.step_signals(&crate::host::StepSignalsRequest {
+                    step,
+                    query: &input.user_message,
+                    calls: &tool_calls,
+                    loaded_tools: offered.iter().map(|t| t.name.clone()).collect(),
+                    chunk_stubs: stubs,
+                    tab_url: active_tab_info
+                        .as_ref()
+                        .map(|t| t.url.as_str())
+                        .filter(|u| !u.is_empty()),
+                    tab_title: active_tab_info
+                        .as_ref()
+                        .map(|t| t.tab_title.as_str())
+                        .filter(|t| !t.is_empty()),
+                });
+            }
 
             for tool_call in &tool_calls {
                 // Stop before starting anything new.
@@ -2115,13 +2249,31 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                 } else {
                     None
                 };
-                let source = rendered.as_deref().unwrap_or(&result.content);
+                let chunk = rendered.as_ref().and_then(|r| r.chunk_id.clone());
+                // Recorded against this result's message once it is pushed.
+                let mut chunk_entry = chunk.clone().map(|c| (c, 0));
+                if visibility && tool_call.name == "recall" {
+                    if let Some(id) = tool_call.arguments["chunk_id"].as_str() {
+                        let offset = tool_call.arguments["offset"].as_u64().unwrap_or(0);
+                        chunk_entry = Some((id.to_string(), offset));
+                    }
+                }
+                let source = rendered
+                    .as_ref()
+                    .map(|r| r.content.as_str())
+                    .unwrap_or(&result.content);
 
                 let trimmed = truncate_tool_result_with(&messages, source, budget);
                 let content = if trimmed.len() < source.len() && rendered.is_some() {
-                    // A rendition already points at its stored original
-                    // (its first line); spilling it would overwrite that.
-                    trimmed
+                    // The original is stored already; spilling this text would
+                    // overwrite it. A rendition names its chunk on its first
+                    // line; a full text kept as it was does not, so say where.
+                    match &chunk {
+                        Some(c) if !trimmed.contains("recall(") => format!(
+                            "{trimmed}\n\n[shortened — recall(\"{c}\") returns the full text]"
+                        ),
+                        _ => trimmed,
+                    }
                 } else if trimmed.len() < source.len() {
                     match self.host.spill_tool_result(&result.tool_call_id, source) {
                         Some(path) => format!(
@@ -2136,6 +2288,32 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                 } else {
                     trimmed
                 };
+
+                if signals {
+                    let class = crate::pollution::error_class(
+                        &tool_call.name,
+                        result.success,
+                        &result.content,
+                    );
+                    let result_key = {
+                        use std::hash::{Hash, Hasher};
+                        let mut h = std::collections::hash_map::DefaultHasher::new();
+                        result.content.hash(&mut h);
+                        h.finish()
+                    };
+                    let target = crate::pollution::action_target(&tool_call.arguments);
+                    action_log.push(crate::pollution::ActionRecord {
+                        step,
+                        tool: tool_call.name.clone(),
+                        args_key: serde_json::to_string(&tool_call.arguments).unwrap_or_default(),
+                        ok: result.success && class.is_none(),
+                        error_class: class,
+                        result_key,
+                        target,
+                        // What the model sees, not what the tool returned.
+                        bytes: content.len(),
+                    });
+                }
 
                 // Check if there's a cached screenshot to attach (base64 stays out of content)
                 let attachments = if tool_call.name == "browser_screenshot" {
@@ -2171,6 +2349,9 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                     attachments,
                     reasoning: None,
                 });
+                if let Some(entry) = chunk_entry {
+                    chunks.insert(messages.len() - 1, entry);
+                }
 
                 // Check interrupt after each tool execution
                 if self.host.is_interrupted()? {
@@ -2315,6 +2496,7 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
             messages: messages.to_vec(),
             tools: tools.to_vec(),
             stream: true,
+            history_len: self.history_anchor.get(),
         };
 
         // Start the stream
@@ -6834,15 +7016,44 @@ fn shrink_aged_tool_results(messages: &mut [Message]) {
 ///
 /// Idempotent: a result already under budget is left alone, so repeated calls
 /// across loop iterations converge instead of eating into it each time.
+/// Jev's drift / irrelevant-bulk count as pollution above this (spec §5.7, θ).
+const POLLUTION_THETA: f64 = 0.8;
+
+/// Waits (bounded) for in-flight Jev signals when a run ends, on every exit
+/// path, so their cost lands in this turn's usage.
+struct SettleSignals<'a, H: HostFunctions> {
+    host: &'a H,
+    active: bool,
+}
+
+impl<H: HostFunctions> Drop for SettleSignals<'_, H> {
+    fn drop(&mut self) {
+        if self.active {
+            self.host.settle_signals();
+        }
+    }
+}
+
 fn shrink_aged_tool_results_with(messages: &mut [Message], budget: ResultBudget) {
+    for i in aged_selection(messages, budget, 0) {
+        messages[i].content = shrunk(&messages[i].content, budget);
+    }
+}
+
+/// Indices of the aged tool results to replace this time: the results older
+/// than the [`RECENT_TOOL_RESULTS_KEPT_WHOLE`] newest that are over
+/// `budget.aged`, and only once those add up to more than
+/// `budget.aged_watermark` (batched, so the cached prefix changes rarely).
+fn aged_selection(messages: &[Message], budget: ResultBudget, from: usize) -> Vec<usize> {
     let results: Vec<usize> = messages
         .iter()
         .enumerate()
+        .skip(from)
         .filter(|(_, m)| matches!(m.role, MessageRole::Tool))
         .map(|(i, _)| i)
         .collect();
     if results.len() <= RECENT_TOOL_RESULTS_KEPT_WHOLE {
-        return;
+        return Vec::new();
     }
     let aged = &results[..results.len() - RECENT_TOOL_RESULTS_KEPT_WHOLE];
     let pending: usize = aged
@@ -6851,24 +7062,55 @@ fn shrink_aged_tool_results_with(messages: &mut [Message], budget: ResultBudget)
         .filter(|&len| len > budget.aged)
         .sum();
     if pending <= budget.aged_watermark {
-        return;
+        return Vec::new();
     }
-    for &i in aged {
-        let full = messages[i].content.len();
-        if full <= budget.aged {
-            continue;
-        }
-        // The note counts against the budget, so that what comes out is *under*
-        // it and the `<=` above skips this result next time. Idempotence by
-        // construction rather than by recognising our own note — a tool result
-        // is free to contain any text, including that note.
-        let note = format!(
-            "...\n\n[Earlier tool result: {full} bytes, shortened. Ask again if \
-             this turn still needs it.]"
-        );
-        let head_budget = budget.aged.saturating_sub(note.len());
-        let head = truncate_string_safe(&messages[i].content, head_budget).to_string();
-        messages[i].content = head + &note;
+    aged.iter()
+        .copied()
+        .filter(|&i| messages[i].content.len() > budget.aged)
+        .collect()
+}
+
+/// The aged-shrink text: the head, then a note.
+fn shrunk(content: &str, budget: ResultBudget) -> String {
+    let full = content.len();
+    // The note counts against the budget, so that what comes out is *under*
+    // it and the selection skips this result next time. Idempotence by
+    // construction rather than by recognising our own note — a tool result
+    // is free to contain any text, including that note.
+    let note = format!(
+        "...\n\n[Earlier tool result: {full} bytes, shortened. Ask again if \
+         this turn still needs it.]"
+    );
+    let head_budget = budget.aged.saturating_sub(note.len());
+    truncate_string_safe(content, head_budget).to_string() + &note
+}
+
+/// Jev visibility's aged pass: the same selection as
+/// [`shrink_aged_tool_results_with`], but a result whose full text is stored
+/// (`chunks`: tool_call_id → (chunk id, offset)) becomes a one-line `recall`
+/// stub — nothing is lost. Results with no stored text are shrunk as usual.
+fn stub_aged_tool_results_with(
+    messages: &mut [Message],
+    budget: ResultBudget,
+    chunks: &std::collections::HashMap<usize, (String, u64)>,
+    from: usize,
+) {
+    for i in aged_selection(messages, budget, from) {
+        let known = chunks.get(&i);
+        messages[i].content = match known {
+            Some((chunk, offset)) => {
+                let at = if *offset > 0 {
+                    format!(", offset={offset}")
+                } else {
+                    String::new()
+                };
+                format!(
+                    "[{chunk} · aged · {} bytes] — recall(\"{chunk}\"{at}) returns it",
+                    messages[i].content.len()
+                )
+            }
+            None => shrunk(&messages[i].content, budget),
+        };
     }
 }
 
@@ -8426,10 +8668,10 @@ mod tests {
     }
 
     #[test]
-    fn aged_results_are_not_shrunk_while_visibility_is_on() {
-        // 18 results of 13 KB in one step: with aged-shrink, the 6 oldest
-        // (78 KB, over the 64 KB watermark) would be cut to 4 KB before the
-        // next call. With visibility on they must reach it whole.
+    fn aged_results_become_recall_stubs_while_visibility_is_on() {
+        // 18 results of 13 KB in one step: the 6 oldest (78 KB, over the
+        // 64 KB watermark) are replaced by stubs naming their chunks; the 12
+        // newest stay whole.
         let big = "z".repeat(13_000);
         let mock = MockHostFunctions::new();
         mock.visibility.set(true);
@@ -8443,15 +8685,75 @@ mod tests {
         let agent = session_log_agent(mock);
         agent.run(&session_log_input("go")).unwrap();
         let req = agent.host.captured_requests.borrow()[1].clone();
-        let first = req
+        let results: Vec<&Message> = req
             .messages
             .iter()
-            .find(|m| matches!(m.role, MessageRole::Tool))
-            .unwrap();
-        assert_eq!(
-            first.content.len(),
-            big.len(),
-            "the oldest result was shrunk"
+            .filter(|m| matches!(m.role, MessageRole::Tool))
+            .collect();
+        assert_eq!(results.len(), 18);
+        for (i, m) in results.iter().enumerate().take(6) {
+            assert!(m.content.len() < 300, "{}", m.content.len());
+            assert!(
+                m.content.contains(&format!("recall(\"c{i}\")")),
+                "{}",
+                m.content
+            );
+        }
+        for m in &results[6..] {
+            // Whole, or (once the context budget is used up) trimmed with a
+            // pointer to its stored original — never a stub.
+            assert!(m.content.len() > 10_000, "{}", m.content.len());
+            if m.content.len() < big.len() {
+                assert!(
+                    m.content.contains("recall(\"c"),
+                    "trimmed without a pointer"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_aged_recall_becomes_a_stub_for_its_source() {
+        let mock = MockHostFunctions::new();
+        mock.visibility.set(true);
+        *mock.recall_text.borrow_mut() = "R".repeat(30_000);
+        let recalls: Vec<ToolCall> = (0..16)
+            .map(|i| ToolCall {
+                id: format!("r{i}"),
+                call_id: None,
+                name: "recall".into(),
+                arguments: serde_json::json!({"chunk_id": "cA", "offset": i * 32_000}),
+                signature: None,
+            })
+            .collect();
+        mock.add_llm_response(LlmResponse {
+            text: "".into(),
+            tool_calls: recalls,
+            reasoning: None,
+        });
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        agent.run(&session_log_input("go")).unwrap();
+        let req = agent.host.captured_requests.borrow()[1].clone();
+        let results: Vec<&Message> = req
+            .messages
+            .iter()
+            .filter(|m| matches!(m.role, MessageRole::Tool))
+            .collect();
+        assert!(
+            results[0].content.contains("recall(\"cA\")"),
+            "{}",
+            results[0].content
+        );
+        assert!(
+            !results[0].content.contains("offset="),
+            "{}",
+            results[0].content
+        );
+        assert!(
+            results[1].content.contains("recall(\"cA\", offset=32000)"),
+            "{}",
+            results[1].content
         );
     }
 
@@ -8510,6 +8812,376 @@ mod tests {
         let agent = session_log_agent(mock);
         agent.run(&session_log_input("go")).unwrap();
         assert!(agent.host.recalls.borrow().is_empty());
+    }
+
+    fn thinks(thought: &str) -> LlmResponse {
+        LlmResponse {
+            text: "".into(),
+            tool_calls: vec![a_tool_call(
+                "think",
+                serde_json::json!({ "thought": thought }),
+            )],
+            reasoning: None,
+        }
+    }
+
+    fn tool_texts(req: &LlmRequest) -> Vec<String> {
+        req.messages
+            .iter()
+            .filter(|m| matches!(m.role, MessageRole::Tool))
+            .map(|m| m.content.clone())
+            .collect()
+    }
+
+    #[test]
+    fn signals_are_asked_once_per_tool_step_and_never_for_the_final_answer() {
+        let mock = MockHostFunctions::new();
+        mock.signals.set(true);
+        mock.add_llm_response(thinks("a"));
+        mock.add_llm_response(thinks("b"));
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        agent.run(&session_log_input("go")).unwrap();
+        assert_eq!(*agent.host.asked.borrow(), vec![0, 1]);
+        assert_eq!(agent.host.settled.get(), 1);
+    }
+
+    #[test]
+    fn a_repeated_call_gets_one_correction() {
+        let mock = MockHostFunctions::new();
+        mock.signals.set(true);
+        for _ in 0..4 {
+            mock.add_llm_response(thinks("same"));
+        }
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        agent.run(&session_log_input("go")).unwrap();
+        assert_eq!(agent.host.corrections.borrow().len(), 1);
+        assert_eq!(
+            agent.host.corrections.borrow()[0],
+            vec!["repeat_call".to_string()]
+        );
+        let reqs = agent.host.captured_requests.borrow();
+        let third = tool_texts(&reqs[2]);
+        assert!(
+            third.last().unwrap().contains("[Correction]"),
+            "{:?}",
+            third
+        );
+        assert!(third.last().unwrap().contains("think"));
+        let all: usize = reqs
+            .iter()
+            .map(|r| {
+                tool_texts(r)
+                    .iter()
+                    .filter(|t| t.contains("[Correction]"))
+                    .count()
+            })
+            .max()
+            .unwrap();
+        assert_eq!(all, 1, "the note is added once, not per step");
+    }
+
+    #[test]
+    fn a_slow_signal_is_used_when_it_lands() {
+        let mock = MockHostFunctions::new();
+        mock.signals.set(true);
+        *mock.latest.borrow_mut() = Some(crate::host::StepSignalsView {
+            step: 0,
+            drift: Some(0.95),
+            irrelevant_bulk: None,
+        });
+        mock.add_llm_response(thinks("a"));
+        mock.add_llm_response(thinks("b"));
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        agent.run(&session_log_input("go")).unwrap();
+        assert_eq!(
+            agent.host.corrections.borrow()[0],
+            vec!["drift".to_string()]
+        );
+    }
+
+    #[test]
+    fn with_signals_off_nothing_is_asked() {
+        let mock = MockHostFunctions::new();
+        for _ in 0..4 {
+            mock.add_llm_response(thinks("same"));
+        }
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        agent.run(&session_log_input("go")).unwrap();
+        assert!(agent.host.asked.borrow().is_empty());
+        assert!(agent.host.corrections.borrow().is_empty());
+        assert_eq!(agent.host.settled.get(), 0);
+        for r in agent.host.captured_requests.borrow().iter() {
+            assert!(tool_texts(r).iter().all(|t| !t.contains("[Correction]")));
+        }
+    }
+
+    #[test]
+    fn a_failing_read_loop_gets_one_correction() {
+        // The plan's Focus 3 case (review I1): repeat_call at step 2, then
+        // error_streak at step 3 over the same attempts — still one note.
+        let mock = MockHostFunctions::new();
+        mock.signals.set(true);
+        *mock.tool_read_error.borrow_mut() = Some("not found".into());
+        for _ in 0..4 {
+            mock.add_llm_response(LlmResponse {
+                text: "".into(),
+                tool_calls: vec![a_tool_call(
+                    "read",
+                    serde_json::json!({"file_path": "missing.txt"}),
+                )],
+                reasoning: None,
+            });
+        }
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        agent.run(&session_log_input("go")).unwrap();
+        assert_eq!(
+            agent.host.corrections.borrow().len(),
+            1,
+            "{:?}",
+            agent.host.corrections.borrow()
+        );
+        let reqs = agent.host.captured_requests.borrow();
+        let last = tool_texts(reqs.last().unwrap());
+        let note = last
+            .iter()
+            .find(|t| t.contains("[Correction]"))
+            .expect("note");
+        assert!(
+            note.contains("read(") && note.contains("not found"),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn results_sharing_a_call_id_keep_their_own_stubs() {
+        // Review I5: Gemini reuses the function name as the call id.
+        let big = "z".repeat(13_000);
+        let mock = MockHostFunctions::new();
+        mock.visibility.set(true);
+        *mock.render_with.borrow_mut() = Some(big);
+        let same: Vec<ToolCall> = (0..18)
+            .map(|_| ToolCall {
+                id: "think".into(),
+                call_id: None,
+                name: "think".into(),
+                arguments: serde_json::json!({ "thought": "x" }),
+                signature: None,
+            })
+            .collect();
+        mock.add_llm_response(LlmResponse {
+            text: "".into(),
+            tool_calls: same,
+            reasoning: None,
+        });
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        agent.run(&session_log_input("go")).unwrap();
+        let req = agent.host.captured_requests.borrow()[1].clone();
+        let texts = tool_texts(&req);
+        for (i, t) in texts.iter().enumerate().take(6) {
+            assert!(t.contains(&format!("recall(\"c{i}\")")), "{i}: {t}");
+        }
+    }
+
+    #[test]
+    fn history_len_is_set_only_on_the_jev_path() {
+        let input = || {
+            let mut i = session_log_input("go");
+            i.history = vec![Message::user("earlier"), Message::assistant("answer")];
+            i
+        };
+        let mock = MockHostFunctions::new();
+        mock.signals.set(true);
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        agent.run(&input()).unwrap();
+        assert_eq!(
+            agent.host.captured_requests.borrow()[0].history_len,
+            Some(3)
+        );
+
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        agent.run(&input()).unwrap();
+        assert_eq!(agent.host.captured_requests.borrow()[0].history_len, None);
+    }
+
+    fn reads(args: serde_json::Value) -> LlmResponse {
+        LlmResponse {
+            text: "".into(),
+            tool_calls: vec![a_tool_call("read", args)],
+            reasoning: None,
+        }
+    }
+
+    #[test]
+    fn stale_content_adds_a_correction() {
+        let mock = MockHostFunctions::new();
+        mock.signals.set(true);
+        *mock.read_text.borrow_mut() = Some("x".repeat(20_000));
+        mock.add_llm_response(reads(serde_json::json!({"file_path": "a.txt"})));
+        mock.add_llm_response(reads(serde_json::json!({"file_path": "a.txt"})));
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        agent.run(&session_log_input("go")).unwrap();
+        let c = agent.host.corrections.borrow();
+        assert_eq!(c.len(), 1, "{c:?}");
+        assert!(c[0].contains(&"stale_content".to_string()), "{c:?}");
+    }
+
+    #[test]
+    fn paging_through_a_file_is_not_stale_content() {
+        let mock = MockHostFunctions::new();
+        mock.signals.set(true);
+        *mock.read_text.borrow_mut() = Some("x".repeat(20_000));
+        mock.add_llm_response(reads(
+            serde_json::json!({"file_path": "a.txt", "offset": 1}),
+        ));
+        mock.add_llm_response(reads(
+            serde_json::json!({"file_path": "a.txt", "offset": 400}),
+        ));
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        agent.run(&session_log_input("go")).unwrap();
+        let c = agent.host.corrections.borrow();
+        assert!(
+            c.iter().all(|t| !t.contains(&"stale_content".to_string())),
+            "{c:?}"
+        );
+    }
+
+    #[test]
+    fn content_share_counts_what_the_model_sees() {
+        // A 300 KB file read twice is shown cut to the result cap; against a
+        // large conversation that stale copy is a small share.
+        let mock = MockHostFunctions::new();
+        mock.signals.set(true);
+        *mock.read_text.borrow_mut() = Some("x".repeat(300_000));
+        mock.add_llm_response(reads(serde_json::json!({"file_path": "a.txt"})));
+        mock.add_llm_response(reads(serde_json::json!({"file_path": "a.txt"})));
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        let mut input = session_log_input("go");
+        input.history = vec![
+            Message::user("earlier"),
+            Message::assistant("y".repeat(400_000)),
+        ];
+        agent.run(&input).unwrap();
+        let c = agent.host.corrections.borrow();
+        assert!(
+            c.iter().all(|t| !t.contains(&"stale_content".to_string())),
+            "{c:?}"
+        );
+    }
+
+    #[test]
+    fn earlier_turn_results_are_not_aged_by_the_loop() {
+        // The history's results are graded already (spec §5.6.7): the aged
+        // pass works on this turn's results only.
+        let big = "z".repeat(13_000);
+        let mock = MockHostFunctions::new();
+        mock.visibility.set(true);
+        *mock.render_with.borrow_mut() = Some(big.clone());
+        mock.add_llm_response(LlmResponse {
+            text: "".into(),
+            tool_calls: calls(18, "think"),
+            reasoning: None,
+        });
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        let mut input = session_log_input("go");
+        let old = "h".repeat(13_000);
+        input.history = vec![
+            Message::user("earlier"),
+            Message::assistant_with_tool_calls_and_reasoning(
+                String::new(),
+                vec![ToolCall {
+                    id: "old1".into(),
+                    call_id: None,
+                    name: "read".into(),
+                    arguments: serde_json::json!({}),
+                    signature: None,
+                }],
+                None,
+            ),
+            Message::tool("old1".to_string(), old.clone()),
+            Message::assistant("done before"),
+        ];
+        agent.run(&input).unwrap();
+        let req = agent.host.captured_requests.borrow()[1].clone();
+        assert_eq!(req.messages[3].content, old);
+    }
+
+    fn polluted_run(steps: usize) -> (Agent<MockHostFunctions>, AgentInput) {
+        let mock = MockHostFunctions::new();
+        mock.signals.set(true);
+        *mock.latest.borrow_mut() = Some(crate::host::StepSignalsView {
+            step: 0,
+            drift: None,
+            irrelevant_bulk: Some(0.95),
+        });
+        *mock.rebuild_with.borrow_mut() = Some(vec![
+            Message::user("earlier (rebuilt)"),
+            Message::assistant("answer (rebuilt)"),
+        ]);
+        for i in 0..steps {
+            mock.add_llm_response(thinks(&format!("t{i}")));
+        }
+        mock.add_llm_response(says("done"));
+        let mut input = session_log_input("go");
+        input.history = vec![
+            Message::user("q1"),
+            Message::assistant("a1"),
+            Message::user("q2"),
+            Message::assistant("a2"),
+        ];
+        (session_log_agent(mock), input)
+    }
+
+    #[test]
+    fn a_mid_turn_rebuild_keeps_the_current_turn_verbatim() {
+        let (agent, input) = polluted_run(1);
+        agent.run(&input).unwrap();
+        let reqs = agent.host.captured_requests.borrow();
+        let before = &reqs[0].messages;
+        let after = &reqs[1].messages;
+        assert_eq!(before.len(), 6, "system + 4 history + user");
+        assert_eq!(after[1].content, "earlier (rebuilt)");
+        assert_eq!(after[2].content, "answer (rebuilt)");
+        // the current turn: the user message, then step 0's call and result
+        assert_eq!(after[3].content, before[5].content);
+        assert!(matches!(after[4].role, MessageRole::Assistant));
+        assert_eq!(after[4].tool_calls.len(), 1);
+        assert!(matches!(after[5].role, MessageRole::Tool));
+        assert_eq!(after.len(), 6);
+        assert_eq!(reqs[1].history_len, Some(3));
+        assert_eq!(
+            *agent.host.rebuild_asked.borrow(),
+            vec!["polluted".to_string()]
+        );
+        // The daemon prices re-writing the current turn: user, call, result.
+        assert_eq!(*agent.host.rebuild_current.borrow(), vec![3]);
+    }
+
+    #[test]
+    fn rebuild_is_asked_at_most_once_per_turn() {
+        let (agent, input) = polluted_run(4);
+        agent.run(&input).unwrap();
+        assert_eq!(agent.host.rebuild_asked.borrow().len(), 1);
+    }
+
+    #[test]
+    fn with_signals_off_no_rebuild_is_asked() {
+        let (agent, input) = polluted_run(2);
+        agent.host.signals.set(false);
+        agent.run(&input).unwrap();
+        assert!(agent.host.rebuild_asked.borrow().is_empty());
     }
 
     fn a_tool_call(name: &str, args: serde_json::Value) -> ToolCall {
