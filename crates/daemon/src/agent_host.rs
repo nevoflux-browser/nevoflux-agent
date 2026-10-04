@@ -2333,6 +2333,7 @@ impl HostFunctions for DaemonHostFunctions {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         let env = crate::jev::rebuild::RebuildEnv {
+            forced: None,
             jev: &cfg.jev,
             wire,
             events,

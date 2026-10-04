@@ -45,6 +45,10 @@ pub struct RebuildEnv<'a> {
     pub stats: Option<Arc<TurnStats>>,
     pub opts: HistoryOpts,
     pub now_ms: i64,
+    /// A rebuild the caller forces (`tool_change`: the tools changed, so the
+    /// cache is rewritten anyway). The cache is priced cold and the logged
+    /// reason is this one; the economics still decide keep or rebuild.
+    pub forced: Option<&'static str>,
 }
 
 /// Jev, its rebuild point, egress and a cloud provider: the conditions for
@@ -246,7 +250,7 @@ fn persist(env: &RebuildEnv<'_>, r: &Regraded) {
     }
 }
 
-fn last_request_ms(events: &[SessionEvent]) -> Option<i64> {
+pub(crate) fn last_request_ms(events: &[SessionEvent]) -> Option<i64> {
     events
         .iter()
         .rev()
@@ -299,7 +303,7 @@ fn keep_price(
     rate: CacheRate,
 ) -> f64 {
     let p = tokens(keep);
-    let cached = if warm(last_request_ms(&env.events), env.now_ms, rate) {
+    let cached = if env.forced.is_none() && warm(last_request_ms(&env.events), env.now_ms, rate) {
         let before = last_turn(&env.events)
             .map(|t| derive_history(&env.events, t, old, &env.opts))
             .unwrap_or_default();
@@ -333,13 +337,13 @@ pub async fn history_for_turn(env: &RebuildEnv<'_>) -> Vec<Message> {
             .flatten(),
     );
     let rate = cache_rate(env.wire, &env.jev.cache);
-    let is_warm = warm(last_request_ms(&env.events), env.now_ms, rate);
+    let is_warm = env.forced.is_none() && warm(last_request_ms(&env.events), env.now_ms, rate);
     let keep_c = keep_price(env, &keep, &old, h, rate);
-    let reason = if is_warm {
+    let reason = env.forced.unwrap_or(if is_warm {
         "cost_formula"
     } else {
         "ttl_expired"
-    };
+    });
     if is_warm {
         // The best a rebuild could do: every window chunk shown short.
         let mut floor: HashMap<String, Grade> = old.clone();
@@ -512,32 +516,9 @@ pub async fn history_from_log(
     max_messages: usize,
     table: Vec<TableTurn>,
 ) -> Option<Vec<Message>> {
-    let events = nevoflux_storage::repositories::SessionEventRepository::new(database)
-        .list(session_id)
-        .ok()?;
-    let wire = cfg
-        .llm
-        .active_provider()
-        .and_then(|p| cfg.llm.resolve_wire(p))?;
-    let writer = Arc::new(SessionEventWriter::new(
-        database.clone(),
-        session_id.to_string(),
-    ));
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    let env = RebuildEnv {
-        jev: &cfg.jev,
-        wire,
-        events,
-        query,
-        writer: Some(writer),
-        stats: None,
-        opts: history_opts(cfg, max_messages, table),
-        now_ms,
-    };
-    Some(history_for_turn(&env).await)
+    super::turn::turn_start(cfg, database, session_id, query, max_messages, table, None)
+        .await
+        .history
 }
 
 /// The log's history when it has turns, the caller's otherwise (a task's
@@ -689,6 +670,7 @@ mod tests {
         w: Arc<SessionEventWriter>,
     ) -> Vec<Message> {
         let env = RebuildEnv {
+            forced: None,
             jev: j,
             wire: ProviderType::Anthropic,
             events,
@@ -814,6 +796,7 @@ mod tests {
         let (w, db) = writer();
         let j = jev_cfg(&url, 2000);
         let env = RebuildEnv {
+            forced: None,
             jev: &j,
             wire: ProviderType::Anthropic,
             events: one_turn(NOW - 30_000, "jev", &hundred_lines("a")),

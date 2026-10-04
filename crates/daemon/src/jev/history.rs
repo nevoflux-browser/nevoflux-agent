@@ -151,7 +151,7 @@ impl Turn {
 /// session, so its turn is logged inside the parent's open tool call. A
 /// `turn/start` while a call waits for its result (or inside a nested run)
 /// opens one; its `turn/end` closes it.
-fn nested(events: &[SessionEvent]) -> Vec<bool> {
+pub(crate) fn nested(events: &[SessionEvent]) -> Vec<bool> {
     let mut out = Vec::with_capacity(events.len());
     let mut depth = 0u32;
     let mut open: Vec<&str> = Vec::new();
