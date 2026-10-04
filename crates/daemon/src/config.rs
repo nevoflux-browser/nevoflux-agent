@@ -2253,9 +2253,7 @@ mod tests {
     #[test]
     fn jev_tools_k_defaults_to_ten_and_reads_from_toml() {
         assert_eq!(JevConfig::default().tools_k, 10);
-        let c: AgentConfig = toml::from_str("[jev]
-tools_k = 6
-").unwrap();
+        let c: AgentConfig = toml::from_str("[jev]\ntools_k = 6\n").unwrap();
         assert_eq!(c.jev.tools_k, 6);
     }
 
