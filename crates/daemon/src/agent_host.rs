@@ -2351,6 +2351,33 @@ impl HostFunctions for DaemonHostFunctions {
         })
     }
 
+    fn record_tool_set(&self, reason: &str, names: &[String]) {
+        let Some(w) = self.event_writer() else {
+            return;
+        };
+        // The set before this change: the last tools/select of this session.
+        let prev = self
+            .services
+            .as_ref()
+            .and_then(|s| {
+                let sid = self.session_id.as_deref().unwrap_or(s.session_id.as_str());
+                nevoflux_storage::repositories::SessionEventRepository::new(&s.database)
+                    .list(sid)
+                    .ok()
+            })
+            .and_then(|events| crate::jev::turn::current_set(&events))
+            .unwrap_or_default();
+        w.append(
+            nevoflux_protocol::session_event::SessionEventPayload::ToolsSelect {
+                reason: reason.to_string(),
+                names: names.to_vec(),
+                added: names.iter().filter(|n| !prev.contains(n)).cloned().collect(),
+                removed: prev.iter().filter(|n| !names.contains(n)).cloned().collect(),
+                elapsed_ms: 0,
+            },
+        );
+    }
+
     fn record_correction(&self, step: u32, triggers: &[&str], entries: u32) {
         if let Some(w) = self.event_writer() {
             w.append(

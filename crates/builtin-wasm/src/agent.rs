@@ -487,6 +487,15 @@ pub struct Agent<H: HostFunctions> {
     /// `[0, n)` of this run's messages are the system prompt and the earlier
     /// turns (Jev path only), for the host's history cache breakpoint.
     history_anchor: Cell<Option<usize>>,
+    /// `act` is offered: a Jev tool set is active this run (spec §5.5).
+    act_on: Cell<bool>,
+    /// Jev tool set: every tool the run may offer, and the set offered.
+    jev_all: RefCell<Option<Vec<ToolDefinition>>>,
+    jev_set: RefCell<Vec<String>>,
+    /// The set grew this step (a missed tool or `act`).
+    jev_grown: Cell<bool>,
+    /// The set changed this turn and the earlier turns were not yet rebuilt.
+    jev_changed: Cell<bool>,
     /// Current keywords extracted from user message and LLM context, used for auto-snapshots.
     current_keywords: RefCell<Vec<String>>,
     /// Skills that have been loaded in this session (prevent redundant re-loading).
@@ -667,6 +676,11 @@ impl<H: HostFunctions> Agent<H> {
             selector_tools_loaded: Cell::new(false),
             visibility_on: Cell::new(false),
             history_anchor: Cell::new(None),
+            act_on: Cell::new(false),
+            jev_all: RefCell::new(None),
+            jev_set: RefCell::new(Vec::new()),
+            jev_grown: Cell::new(false),
+            jev_changed: Cell::new(false),
             current_keywords: RefCell::new(Vec::new()),
             loaded_skills: RefCell::new(std::collections::HashSet::new()),
             local_index: RefCell::new(None),
@@ -690,6 +704,11 @@ impl<H: HostFunctions> Agent<H> {
             selector_tools_loaded: Cell::new(false),
             visibility_on: Cell::new(false),
             history_anchor: Cell::new(None),
+            act_on: Cell::new(false),
+            jev_all: RefCell::new(None),
+            jev_set: RefCell::new(Vec::new()),
+            jev_grown: Cell::new(false),
+            jev_changed: Cell::new(false),
             current_keywords: RefCell::new(Vec::new()),
             loaded_skills: RefCell::new(std::collections::HashSet::new()),
             local_index: RefCell::new(None),
@@ -752,6 +771,23 @@ impl<H: HostFunctions> Agent<H> {
             if let Some(soul) = &input.soul_context {
                 sections.push(PromptSectionText::body("soul", soul.clone()));
             }
+        }
+
+        // Jev's tool set (spec §5.5): the model is offered a selection, so the
+        // prompt lists every tool that exists — the same bytes whatever the
+        // selection, so the cached prefix survives a change of set (v1.4
+        // §4.3: the tier-1 index is in L0).
+        let jev_all = match &input.jev_tools {
+            Some(_) if input.local.is_none() && !self.config.is_subagent => {
+                Some(self.filter_tools(self.get_tools_for_mode(mode), &input.tools_config))
+            }
+            _ => None,
+        };
+        if let Some(all) = &jev_all {
+            sections.push(PromptSectionText::body(
+                "tools/index",
+                Self::tier1_index(all),
+            ));
         }
 
         // Prepended, not appended: an explicitly invoked skill outranks
@@ -822,6 +858,16 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
 
         // Apply tool filtering based on tools_config
         tools = self.filter_tools(tools, &input.tools_config);
+
+        // Jev's set replaces the mode's list (spec §5.5); `None` leaves it.
+        self.act_on.set(jev_all.is_some());
+        *self.jev_set.borrow_mut() = input.jev_tools.clone().unwrap_or_default();
+        self.jev_grown.set(false);
+        self.jev_changed.set(false);
+        if let Some(all) = &jev_all {
+            tools = Self::with_jev_set(all, &self.jev_set.borrow());
+        }
+        *self.jev_all.borrow_mut() = jev_all;
 
         // On-device: the mode's tools become a searchable index instead of the
         // advertised list, and the turn opens with `tool_search` plus whatever
@@ -1746,6 +1792,8 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
     ) -> HostResult<AgentOutput> {
         let mut messages = vec![Message::system(system_prompt)];
         messages.extend(input.history.clone());
+        // The turn's tools before the gates; a Jev set can grow mid-turn.
+        let mut turn_tools: Vec<ToolDefinition> = tools.to_vec();
 
         // Build context prefixes for user message
         let local_files_prefix = format_local_files(&input.local_files);
@@ -1864,7 +1912,7 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
         let mut active_tools = Self::gate_selector_tools(
             &Self::gate_network_tools(
                 &Self::gate_speech_tools(
-                    &Self::gate_canvas_tools(tools, canvas_unlocked),
+                    &Self::gate_canvas_tools(&turn_tools, canvas_unlocked),
                     canvas_unlocked || speech_useful,
                 ),
                 network_on,
@@ -1961,6 +2009,26 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                 shrink_aged_tool_results_with(&mut messages, budget);
             }
 
+            // The tools changed this turn (a missed tool or `act`): the cache
+            // is rewritten anyway, so ask once for a rebuild of the earlier
+            // turns (spec §5.5, §5.7 `tool_change`). Shares the once-per-turn
+            // budget with the polluted rebuild below.
+            if signals && !rebuilt && history_count > 1 && self.jev_changed.get() {
+                self.jev_changed.set(false);
+                rebuilt = true;
+                let rebuilt_history = self.host.rebuild_history(&crate::host::RebuildRequest {
+                    query: &input.user_message,
+                    reason: "tool_change",
+                    history_len: history_count,
+                    current: &messages[1 + history_count..],
+                });
+                if let Some(new) = rebuilt_history {
+                    Self::splice_history(&mut messages, &mut chunks, &mut history_count, new);
+                    self.history_anchor
+                        .set((history_count > 0).then(|| 1 + history_count));
+                }
+            }
+
             // Polluted earlier turns (Jev's irrelevant bulk over θ, fresh):
             // ask once per turn for a rebuild of them; this turn's messages
             // stay as they are (spec §5.6.3, §5.7).
@@ -1977,20 +2045,7 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                         current: &messages[1 + history_count..],
                     });
                     if let Some(new) = rebuilt_history {
-                        let old_end = 1 + history_count;
-                        let delta = new.len() as isize - history_count as isize;
-                        messages.splice(1..old_end, new.iter().cloned());
-                        chunks = chunks
-                            .into_iter()
-                            .map(|(k, v)| {
-                                if k >= old_end {
-                                    ((k as isize + delta) as usize, v)
-                                } else {
-                                    (k, v)
-                                }
-                            })
-                            .collect();
-                        history_count = new.len();
+                        Self::splice_history(&mut messages, &mut chunks, &mut history_count, new);
                         self.history_anchor
                             .set((history_count > 0).then(|| 1 + history_count));
                     }
@@ -2384,7 +2439,7 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                 // 没被点名的工具悄悄放回请求里。
                 active_tools = Self::gate_selector_tools(
                     &Self::gate_network_tools(
-                        &Self::gate_speech_tools(&Self::gate_canvas_tools(tools, true), true),
+                        &Self::gate_speech_tools(&Self::gate_canvas_tools(&turn_tools, true), true),
                         network_on,
                         console_named,
                     ),
@@ -2408,7 +2463,7 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                 } else {
                     active_tools = Self::gate_network_tools(
                         &Self::gate_speech_tools(
-                            &Self::gate_canvas_tools(tools, canvas_unlocked),
+                            &Self::gate_canvas_tools(&turn_tools, canvas_unlocked),
                             canvas_unlocked || speech_useful,
                         ),
                         network_on,
@@ -2434,6 +2489,46 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                     ),
                     selector_unlocked,
                 );
+            }
+
+            // Jev's set (spec §5.5): a tool the model called that the set did
+            // not offer is offered from the next request on. A name that is
+            // no tool at all ("Unknown tool") changes nothing.
+            if let Some(all) = self.jev_all.borrow().as_ref() {
+                let mut missed = false;
+                {
+                    let mut set = self.jev_set.borrow_mut();
+                    for tc in &tool_calls {
+                        let name = Self::normalize_tool_name(&tc.name);
+                        if !set.iter().any(|n| n == name)
+                            && !JEV_CORE_TOOLS.contains(&name)
+                            && all.iter().any(|t| t.name == name)
+                        {
+                            set.push(name.to_string());
+                            missed = true;
+                        }
+                    }
+                }
+                if missed {
+                    let names = Self::jev_names(&self.jev_set.borrow());
+                    self.host.record_tool_set("missed", &names);
+                    self.jev_grown.set(true);
+                }
+                if self.jev_grown.replace(false) {
+                    turn_tools = Self::with_jev_set(all, &self.jev_set.borrow());
+                    active_tools = Self::gate_selector_tools(
+                        &Self::gate_network_tools(
+                            &Self::gate_speech_tools(
+                                &Self::gate_canvas_tools(&turn_tools, canvas_unlocked),
+                                canvas_unlocked || speech_useful,
+                            ),
+                            network_on,
+                            console_named,
+                        ),
+                        selector_unlocked,
+                    );
+                    self.jev_changed.set(true);
+                }
             }
 
             // Move tool calls into the accumulator (avoids a second clone)
@@ -3807,6 +3902,92 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
     /// Check if a tool name is handled by execute_tool (not an MCP tool).
     /// `tools` plus `recall` (Jev visibility). An empty list stays empty:
     /// it means tools are disabled for this run.
+    /// `all` narrowed to Jev's set and the core tools, in `all`'s order,
+    /// with `act` last (spec §5.5).
+    fn with_jev_set(all: &[ToolDefinition], set: &[String]) -> Vec<ToolDefinition> {
+        let mut out: Vec<ToolDefinition> = all
+            .iter()
+            .filter(|t| {
+                JEV_CORE_TOOLS.contains(&t.name.as_str()) || set.iter().any(|n| *n == t.name)
+            })
+            .cloned()
+            .collect();
+        out.push(Self::act_def());
+        out
+    }
+
+    /// The set as logged: core tools included, sorted, no repeats.
+    fn jev_names(set: &[String]) -> Vec<String> {
+        let mut out: Vec<String> = set
+            .iter()
+            .cloned()
+            .chain(JEV_CORE_TOOLS.iter().map(|s| s.to_string()))
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// `act(intent)`: the fallback for a tool the set does not offer (v1.4
+    /// §4.6). It loads a tool; the model calls it itself next.
+    fn act_def() -> ToolDefinition {
+        ToolDefinition {
+            name: "act".into(),
+            description: "Load a tool you do not have yet: describe what you want to do, and the best-fitting tool from the tool index in the system prompt is added. Call that tool yourself in your next step.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "intent": {
+                        "type": "string",
+                        "description": "What you want to do next, in one sentence"
+                    }
+                },
+                "required": ["intent"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    /// The tier-1 index (v1.4 §4.3): every tool, one line each, sorted, so
+    /// the prompt does not change when the set does.
+    fn tier1_index(all: &[ToolDefinition]) -> String {
+        let mut lines: Vec<String> = all
+            .iter()
+            .filter(|t| t.name != "recall" && t.name != "act")
+            .map(|t| format!("- {}: {}", t.name, first_sentence(&t.description)))
+            .collect();
+        lines.sort();
+        format!(
+            "# Tool index\n\nYou are offered a selection of the tools below. To use one you were not offered, call it by name, or call `act(intent)` describing what you want to do; it is loaded for your next step.\n\n{}",
+            lines.join("\n")
+        )
+    }
+
+    /// Replace the earlier turns (`messages[1..1 + history_count]`) with
+    /// `new`, moving this turn's chunk entries with them.
+    fn splice_history(
+        messages: &mut Vec<Message>,
+        chunks: &mut std::collections::HashMap<usize, (String, u64)>,
+        history_count: &mut usize,
+        new: Vec<Message>,
+    ) {
+        let old_end = 1 + *history_count;
+        let delta = new.len() as isize - *history_count as isize;
+        let n = new.len();
+        messages.splice(1..old_end, new);
+        *chunks = std::mem::take(chunks)
+            .into_iter()
+            .map(|(k, v)| {
+                if k >= old_end {
+                    ((k as isize + delta) as usize, v)
+                } else {
+                    (k, v)
+                }
+            })
+            .collect();
+        *history_count = n;
+    }
+
     fn with_recall(tools: &[ToolDefinition]) -> Vec<ToolDefinition> {
         let mut out = tools.to_vec();
         if out.is_empty() || out.iter().any(|t| t.name == "recall") {
@@ -3842,6 +4023,10 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
             // Jev's recall only while visibility is on; otherwise an MCP
             // server's own `recall` stays reachable.
             return self.visibility_on.get();
+        }
+        if name == "act" {
+            // Same for `act`: only while a Jev tool set is active.
+            return self.act_on.get();
         }
         matches!(
             name,
@@ -7044,6 +7229,25 @@ impl<H: HostFunctions> Drop for SettleSignals<'_, H> {
     }
 }
 
+/// Always offered with a Jev tool set (spec §5.5).
+const JEV_CORE_TOOLS: &[&str] = &[
+    "browser_navigate",
+    "browser_get_markdown",
+    "browser_get_tabs",
+];
+
+/// A tool description's first sentence, at most 160 characters.
+fn first_sentence(description: &str) -> String {
+    description
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(160)
+        .collect()
+}
+
 fn shrink_aged_tool_results_with(messages: &mut [Message], budget: ResultBudget) {
     for i in aged_selection(messages, budget, 0) {
         messages[i].content = shrunk(&messages[i].content, budget);
@@ -9051,6 +9255,149 @@ mod tests {
                 .iter()
                 .all(|n| n == "web_search" || n.starts_with("browser_")),
             "{names:?}"
+        );
+    }
+
+    fn jev_input(set: &[&str]) -> AgentInput {
+        let mut i = session_log_input("go");
+        i.jev_tools = Some(set.iter().map(|s| s.to_string()).collect());
+        i
+    }
+
+    fn fingerprint(text: &str) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut h);
+        h.finish()
+    }
+
+    #[test]
+    fn a_jev_set_offers_core_set_and_act_only() {
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        agent.run(&jev_input(&["web_search"])).unwrap();
+        let mut offered = agent.host.captured_tool_names.borrow()[0].clone();
+        offered.sort();
+        assert_eq!(
+            offered,
+            vec![
+                "act",
+                "browser_get_markdown",
+                "browser_get_tabs",
+                "browser_navigate",
+                "web_search"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_system_prompt_does_not_depend_on_the_set() {
+        let run = |set: &[&str]| {
+            let mock = MockHostFunctions::new();
+            mock.add_llm_response(says("done"));
+            let agent = session_log_agent(mock);
+            agent.run(&jev_input(set)).unwrap();
+            let sys = agent.host.captured_requests.borrow()[0].messages[0]
+                .content
+                .clone();
+            sys
+        };
+        let a = run(&["web_search"]);
+        assert_eq!(a, run(&["think", "read"]));
+        assert!(
+            a.contains("- web_search: "),
+            "the index lists unloaded tools too"
+        );
+        assert!(a.contains("act(intent)"));
+    }
+
+    #[test]
+    fn without_a_set_the_tools_and_prompt_are_unchanged() {
+        // Captured before P2-4 changed the loop: the tools offered and the
+        // system prompt with no Jev set must stay exactly these.
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        agent.run(&session_log_input("go")).unwrap();
+        let offered = agent.host.captured_tool_names.borrow()[0].join(",");
+        let sys = agent.host.captured_requests.borrow()[0].messages[0]
+            .content
+            .clone();
+        assert_eq!(
+            (fingerprint(&offered), fingerprint(&sys)),
+            (10903556052262945669, 17264621039969533755),
+            "offered: {offered}"
+        );
+    }
+
+    #[test]
+    fn a_known_tool_outside_the_set_is_loaded_once() {
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(LlmResponse {
+            text: "".into(),
+            tool_calls: vec![a_tool_call("think", serde_json::json!({"thought": "x"}))],
+            reasoning: None,
+        });
+        mock.add_llm_response(LlmResponse {
+            text: "".into(),
+            tool_calls: vec![a_tool_call("think", serde_json::json!({"thought": "y"}))],
+            reasoning: None,
+        });
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        agent.run(&jev_input(&["web_search"])).unwrap();
+        let reqs = agent.host.captured_tool_names.borrow();
+        assert!(!reqs[0].contains(&"think".to_string()));
+        assert!(reqs[1].contains(&"think".to_string()) && reqs[2].contains(&"think".to_string()));
+        let sets = agent.host.tool_sets.borrow();
+        assert_eq!(sets.len(), 1, "{sets:?}");
+        assert_eq!(sets[0].0, "missed");
+        assert!(sets[0].1.contains(&"think".to_string()));
+    }
+
+    #[test]
+    fn an_unknown_name_loads_nothing() {
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(LlmResponse {
+            text: "".into(),
+            tool_calls: vec![a_tool_call("no_such_tool", serde_json::json!({}))],
+            reasoning: None,
+        });
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        agent.run(&jev_input(&["web_search"])).unwrap();
+        assert!(agent.host.tool_sets.borrow().is_empty());
+        assert!(agent.host.rebuild_asked.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_missed_tool_asks_one_tool_change_rebuild() {
+        let mock = MockHostFunctions::new();
+        mock.signals.set(true);
+        mock.add_llm_response(LlmResponse {
+            text: "".into(),
+            tool_calls: vec![a_tool_call("think", serde_json::json!({"thought": "x"}))],
+            reasoning: None,
+        });
+        mock.add_llm_response(LlmResponse {
+            text: "".into(),
+            tool_calls: vec![a_tool_call("plan", serde_json::json!({}))],
+            reasoning: None,
+        });
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        let mut input = jev_input(&["web_search"]);
+        input.history = vec![Message::user("q1"), Message::assistant("a1")];
+        agent.run(&input).unwrap();
+        assert_eq!(
+            *agent.host.rebuild_asked.borrow(),
+            vec!["tool_change".to_string()]
+        );
+        assert_eq!(
+            agent.host.tool_sets.borrow().len(),
+            2,
+            "each missed tool is logged"
         );
     }
 

@@ -1085,6 +1085,11 @@ pub trait HostFunctions {
         None
     }
 
+    /// The tools offered changed mid-turn (spec §5.5): `reason` is `missed`
+    /// (the model called a tool it was not offered) or `act`; `names` is the
+    /// whole set now, sorted.
+    fn record_tool_set(&self, _reason: &str, _names: &[String]) {}
+
     /// The full text of an earlier result shown shortened or hidden, from
     /// byte `offset`.
     fn tool_recall(&self, _chunk_id: &str, _offset: u64) -> HostResult<String> {
@@ -1284,6 +1289,8 @@ pub struct MockHostFunctions {
     pub rebuild_asked: std::cell::RefCell<Vec<String>>,
     /// The current-turn length each rebuild request carried.
     pub rebuild_current: std::cell::RefCell<Vec<usize>>,
+    /// Every tool-set change the loop reported: (reason, names).
+    pub tool_sets: std::cell::RefCell<Vec<(String, Vec<String>)>>,
 }
 
 #[cfg(test)]
@@ -1331,6 +1338,7 @@ impl MockHostFunctions {
             read_text: std::cell::RefCell::new(None),
             rebuild_asked: std::cell::RefCell::new(vec![]),
             rebuild_current: std::cell::RefCell::new(vec![]),
+            tool_sets: std::cell::RefCell::new(vec![]),
         }
     }
 
@@ -1463,6 +1471,12 @@ impl HostFunctions for MockHostFunctions {
 
     fn settle_signals(&self) {
         self.settled.set(self.settled.get() + 1);
+    }
+
+    fn record_tool_set(&self, reason: &str, names: &[String]) {
+        self.tool_sets
+            .borrow_mut()
+            .push((reason.to_string(), names.to_vec()));
     }
 
     fn rebuild_history(&self, req: &RebuildRequest<'_>) -> Option<Vec<Message>> {
