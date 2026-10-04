@@ -5993,6 +5993,21 @@ fn convert_history_messages(
         .collect()
 }
 
+/// The tools Jev chooses from for a chat turn (spec §5.5): the mode's tools
+/// under the soul's allowlist, or `None` when Jev's tools point is off.
+fn jev_catalog(
+    services: &HostServices,
+    agent: &Agent<crate::agent_host::DaemonHostFunctions>,
+    mode: AgentMode,
+    tools_config: &Option<nevoflux_protocol::subagent::ToolsConfig>,
+) -> Option<Vec<nevoflux_builtin_wasm::ToolDefinition>> {
+    services
+        .agent_config
+        .as_ref()
+        .filter(|c| crate::jev::turn::tools_point_on(c))
+        .map(|_| agent.tools_for_input(mode, tools_config))
+}
+
 /// Load session history messages for the agent.
 ///
 /// Retrieves only the most recent messages using an efficient SQL query with
@@ -6007,7 +6022,8 @@ async fn load_session_history(
     max_messages: u32,
     services: &HostServices,
     active_soul: Option<&AgentRoleDefinition>,
-) -> Vec<WasmMessage> {
+    catalog: Option<Vec<nevoflux_builtin_wasm::ToolDefinition>>,
+) -> (Vec<WasmMessage>, Option<Vec<String>>) {
     // Fetch max_messages + 1 so we can pop the current user message and still
     // have max_messages of history.
     match session_manager
@@ -6026,54 +6042,35 @@ async fn load_session_history(
                     .unwrap_or_else(|| slug.to_string())
             };
             let active = active_soul.map(|s| s.slug.as_str());
+            let text = convert_history_messages(messages.clone(), active, &display_name);
             // Jev on: earlier turns come from the session log with their tool
-            // results, graded (spec §5.2); the messages table stays the source
-            // otherwise, and whenever the log has no earlier turns.
-            let log = match (services.agent_config.as_ref(), current.as_ref()) {
-                (Some(cfg), Some(query)) if crate::jev::rebuild::rebuild_point_on(cfg) => {
+            // results, graded (spec §5.2), and Jev chooses the tools (§5.5);
+            // the messages table stays the source otherwise, and whenever the
+            // log has no earlier turns.
+            match (services.agent_config.as_ref(), current.as_ref()) {
+                (Some(cfg), Some(query)) => {
                     let table = crate::jev::rebuild::table_turns(&messages, active, &display_name);
-                    jev_history(
+                    crate::jev::turn::start_turn(
                         cfg,
+                        &services.database,
                         session_id,
                         &query.content,
-                        max_messages,
-                        services,
+                        max_messages as usize,
+                        text,
                         table,
+                        catalog.as_deref(),
+                        true,
                     )
                     .await
                 }
-                _ => None,
-            };
-            let text = convert_history_messages(messages, active, &display_name);
-            crate::jev::rebuild::prefer_log(log, text)
+                _ => (text, None),
+            }
         }
         Err(e) => {
             warn!("Failed to load session history for {}: {}", session_id, e);
-            vec![]
+            (vec![], None)
         }
     }
-}
-
-/// Earlier turns from the session log, kept or rebuilt (Jev P2-3b). `None`
-/// when the log cannot be read, so the caller falls back to the messages
-/// table.
-async fn jev_history(
-    cfg: &crate::config::AgentConfig,
-    session_id: &str,
-    query: &str,
-    max_messages: u32,
-    services: &HostServices,
-    table: Vec<crate::jev::history::TableTurn>,
-) -> Option<Vec<WasmMessage>> {
-    crate::jev::rebuild::history_from_log(
-        cfg,
-        &services.database,
-        session_id,
-        query,
-        max_messages as usize,
-        table,
-    )
-    .await
 }
 
 /// Build the synthetic `chat_message` payload that re-enters
@@ -6916,19 +6913,29 @@ async fn handle_chat_message_streaming(
     // turn ran on-device.
     let local_mode_active = config.llm.active_provider() == Some("local");
 
+    let (history, jev_tools) = load_session_history(
+        session_manager,
+        &session_id,
+        config.daemon.context.max_history_messages,
+        &services,
+        active_soul.as_deref(),
+        jev_catalog(
+            &services,
+            &agent,
+            mode,
+            &active_soul.as_deref().and_then(|s| s.tools_config.clone()),
+        ),
+    )
+    .await;
+    // A plan re-run continues this turn with the same tools.
+    let jev_tools_for_rerun = jev_tools.clone();
+
     let input = AgentInput {
-        jev_tools: None,
+        jev_tools,
         session_id: session_id.clone(),
         mode,
         user_message: effective_message,
-        history: load_session_history(
-            session_manager,
-            &session_id,
-            config.daemon.context.max_history_messages,
-            &services,
-            active_soul.as_deref(),
-        )
-        .await,
+        history,
         attachments,
         local_files,
         custom_system_prompt: None, // Use default mode-based prompt
@@ -7535,7 +7542,7 @@ async fn handle_chat_message_streaming(
 
                         // Build new input with plan as user message
                         let rerun_input = AgentInput {
-                            jev_tools: None,
+                            jev_tools: jev_tools_for_rerun.clone(),
                             session_id: session_id.clone(),
                             mode,
                             user_message: plan_text.clone(),
@@ -7545,8 +7552,10 @@ async fn handle_chat_message_streaming(
                                 config.daemon.context.max_history_messages,
                                 &services,
                                 active_soul.as_deref(),
+                                None,
                             )
-                            .await,
+                            .await
+                            .0,
                             attachments: vec![],
                             local_files: vec![],
                             custom_system_prompt: None,
@@ -8772,19 +8781,27 @@ async fn handle_chat_message(
                 .unwrap_or_default();
 
             // Build agent input with skill context injected into system prompt
+            let (history, jev_tools) = load_session_history(
+                session_manager,
+                &session_id,
+                config.daemon.context.max_history_messages,
+                &services,
+                active_soul.as_deref(),
+                jev_catalog(
+                    &services,
+                    &agent,
+                    mode,
+                    &active_soul.as_deref().and_then(|s| s.tools_config.clone()),
+                ),
+            )
+            .await;
+
             let input = AgentInput {
-                jev_tools: None,
+                jev_tools,
                 session_id: session_id.clone(),
                 mode,
                 user_message,
-                history: load_session_history(
-                    session_manager,
-                    &session_id,
-                    config.daemon.context.max_history_messages,
-                    &services,
-                    active_soul.as_deref(),
-                )
-                .await,
+                history,
                 attachments,
                 local_files,
                 custom_system_prompt: None, // Use default mode-based prompt

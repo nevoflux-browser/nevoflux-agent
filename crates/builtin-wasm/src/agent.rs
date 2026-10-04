@@ -931,6 +931,16 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
     /// Get tools for a specific mode. Public so daemon-side callers (e.g.
     /// the /loop iteration executor) can enumerate the canonical tool list
     /// for a given mode without going through `Agent::run`.
+    /// The tools a main (non-subagent) run of `mode` may offer under
+    /// `tools_config`: what Jev chooses from (spec §5.5).
+    pub fn tools_for_input(
+        &self,
+        mode: AgentMode,
+        tools_config: &Option<nevoflux_protocol::subagent::ToolsConfig>,
+    ) -> Vec<ToolDefinition> {
+        self.filter_tools(self.get_tools_for_mode(mode), tools_config)
+    }
+
     pub fn get_tools_for_mode(&self, mode: AgentMode) -> Vec<ToolDefinition> {
         match mode {
             AgentMode::Chat => self.get_chat_tools(),
@@ -9020,6 +9030,28 @@ mod tests {
             tool_calls: vec![a_tool_call("read", args)],
             reasoning: None,
         }
+    }
+
+    #[test]
+    fn the_catalog_respects_the_soul_allowlist() {
+        let agent = session_log_agent(MockHostFunctions::new());
+        let allow = Some(nevoflux_protocol::subagent::ToolsConfig::Allow(vec![
+            "web_search".into(),
+            "browser_*".into(),
+        ]));
+        let names: Vec<String> = agent
+            .tools_for_input(AgentMode::Browser, &allow)
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert!(names.contains(&"web_search".to_string()));
+        assert!(names.contains(&"browser_navigate".to_string()));
+        assert!(
+            names
+                .iter()
+                .all(|n| n == "web_search" || n.starts_with("browser_")),
+            "{names:?}"
+        );
     }
 
     #[test]

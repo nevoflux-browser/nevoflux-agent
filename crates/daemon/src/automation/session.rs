@@ -307,31 +307,9 @@ async fn run_one_turn(
             reasoning: None,
         })
         .collect();
-    // Jev on: a follow-up's earlier turns come from the session log with their
-    // tool results, graded (spec §5.2); history the log never saw stays.
-    let history = if !text_history.is_empty()
-        && !session_id.is_empty()
-        && crate::jev::rebuild::rebuild_point_on(&agent_config)
-    {
-        let max = agent_config.daemon.context.max_history_messages as usize;
-        let table = crate::jev::rebuild::table_from_text(&text_history);
-        crate::jev::rebuild::prefer_log(
-            crate::jev::rebuild::history_from_log(
-                &agent_config,
-                &services.database,
-                &session_id,
-                &user_message,
-                max,
-                table,
-            )
-            .await,
-            text_history,
-        )
-    } else {
-        text_history
-    };
-
     let turn_stats = crate::turn_stats::TurnStats::new();
+    let cfg = agent_config.clone();
+    let database = services.database.clone();
     let host = DaemonHostFunctions::new(agent_config, runtime_handle)
         .with_services(services.with_own_session_state())
         .with_session_id(session_id.clone())
@@ -344,9 +322,30 @@ async fn run_one_turn(
         .map(|t| t.name)
         .collect();
     let allowlist = policy.tool_allowlist(&mode_tools);
+    let tools_config = Some(nevoflux_protocol::subagent::ToolsConfig::Allow(allowlist));
+
+    // Jev on: a follow-up's earlier turns come from the session log with their
+    // tool results, graded (spec §5.2), and Jev chooses the tools (§5.5);
+    // history the log never saw stays.
+    let catalog =
+        crate::jev::turn::tools_point_on(&cfg).then(|| agent.tools_for_input(mode, &tools_config));
+    let use_log = !text_history.is_empty();
+    let table = crate::jev::rebuild::table_from_text(&text_history);
+    let (history, jev_tools) = crate::jev::turn::start_turn(
+        &cfg,
+        &database,
+        &session_id,
+        &user_message,
+        cfg.daemon.context.max_history_messages as usize,
+        text_history,
+        table,
+        catalog.as_deref(),
+        use_log,
+    )
+    .await;
 
     let input = nevoflux_builtin_wasm::AgentInput {
-        jev_tools: None,
+        jev_tools,
         // No soul is bound on this path, so every skill stays suggested.
         skills_filter: None,
         session_id,
@@ -362,7 +361,7 @@ async fn run_one_turn(
         available_models: vec![],
         mcp_servers: vec![],
         soul_context: None,
-        tools_config: Some(nevoflux_protocol::subagent::ToolsConfig::Allow(allowlist)),
+        tools_config,
         os_platform: Some(std::env::consts::OS.to_string()),
         local: None,
     };

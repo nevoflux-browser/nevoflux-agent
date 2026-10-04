@@ -204,6 +204,45 @@ pub async fn turn_start(
     TurnStart { history, tools }
 }
 
+/// A turn's starting history and tool set for chat and tasks: the log's
+/// history when `use_log` (and the rebuild point is on), `text` otherwise or
+/// when the log has no earlier turns; Jev's tool set when `catalog` is given
+/// and the tools point is on. With Jev off: `(text, None)`, nothing read.
+#[allow(clippy::too_many_arguments)]
+pub async fn start_turn(
+    cfg: &crate::config::AgentConfig,
+    database: &Arc<nevoflux_storage::Database>,
+    session_id: &str,
+    query: &str,
+    max_messages: usize,
+    text: Vec<Message>,
+    table: Vec<TableTurn>,
+    catalog: Option<&[ToolDefinition]>,
+    use_log: bool,
+) -> (Vec<Message>, Option<Vec<String>>) {
+    let use_log = use_log && rebuild_point_on(cfg);
+    let catalog = catalog.filter(|_| tools_point_on(cfg));
+    if session_id.is_empty() || !(use_log || catalog.is_some()) {
+        return (text, None);
+    }
+    let ts = turn_start(
+        cfg,
+        database,
+        session_id,
+        query,
+        max_messages,
+        table,
+        catalog,
+    )
+    .await;
+    let history = if use_log {
+        super::rebuild::prefer_log(ts.history, text)
+    } else {
+        text
+    };
+    (history, ts.tools)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,5 +471,30 @@ mod tests {
         let all = bodies.lock().unwrap().join("\n");
         assert!(all.contains("which flight is cheapest?") && all.contains("web_search"));
         assert!(!all.contains("SECRET"));
+    }
+
+    #[tokio::test]
+    async fn jev_off_leaves_the_text_history_and_offers_every_tool() {
+        let db = db_with(earlier_turn());
+        let c = crate::config::AgentConfig::default();
+        let text = vec![Message::user("q"), Message::assistant("a")];
+        let (h, tools) = start_turn(
+            &c,
+            &db,
+            "s1",
+            "next?",
+            50,
+            text.clone(),
+            vec![],
+            Some(&catalog()),
+            true,
+        )
+        .await;
+        assert_eq!(h.len(), 2);
+        assert_eq!(h[0].content, "q");
+        assert_eq!(tools, None);
+        assert!(!logged(&db)
+            .iter()
+            .any(|e| matches!(e, SessionEventPayload::ToolsSelect { .. })));
     }
 }

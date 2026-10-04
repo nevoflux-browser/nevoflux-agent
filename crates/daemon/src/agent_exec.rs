@@ -259,33 +259,10 @@ pub async fn run_agent_once(
     // Reset interrupt flag so a stray prior cancel doesn't poison this run.
     services_for_run.reset_interrupt();
 
-    // Jev on: a task's earlier turns come from the session log with their
-    // tool results, graded (spec §5.2); a caller-supplied history the log
-    // never saw (A2A) stays as given.
     let text_history = history_to_messages(req.history);
-    let history = if !text_history.is_empty()
-        && !req.session_id.is_empty()
-        && crate::jev::rebuild::rebuild_point_on(&agent_config)
-    {
-        let max = agent_config.daemon.context.max_history_messages as usize;
-        let table = crate::jev::rebuild::table_from_text(&text_history);
-        crate::jev::rebuild::prefer_log(
-            crate::jev::rebuild::history_from_log(
-                &agent_config,
-                &services_for_run.database,
-                &req.session_id,
-                &req.user_message,
-                max,
-                table,
-            )
-            .await,
-            text_history,
-        )
-    } else {
-        text_history
-    };
-
     let turn_stats = crate::turn_stats::TurnStats::new();
+    let cfg = agent_config.clone();
+    let database = services_for_run.database.clone();
     let mut host = crate::agent_host::DaemonHostFunctions::new(agent_config, runtime_handle)
         .with_services(services_for_run)
         .with_session_id(req.session_id.clone())
@@ -309,8 +286,30 @@ pub async fn run_agent_once(
         &req.forbidden_prefixes,
     );
 
+    let tools_config = Some(nevoflux_protocol::subagent::ToolsConfig::Allow(allowlist));
+
+    // Jev on: a task's earlier turns come from the session log with their
+    // tool results, graded (spec §5.2), and Jev chooses the tools (§5.5); a
+    // caller-supplied history the log never saw (A2A) stays as given.
+    let catalog = crate::jev::turn::tools_point_on(&cfg)
+        .then(|| agent.tools_for_input(req.mode, &tools_config));
+    let use_log = !text_history.is_empty();
+    let table = crate::jev::rebuild::table_from_text(&text_history);
+    let (history, jev_tools) = crate::jev::turn::start_turn(
+        &cfg,
+        &database,
+        &req.session_id,
+        &req.user_message,
+        cfg.daemon.context.max_history_messages as usize,
+        text_history,
+        table,
+        catalog.as_deref(),
+        use_log,
+    )
+    .await;
+
     let input = AgentInput {
-        jev_tools: None,
+        jev_tools,
         // No soul is bound on this path, so every skill stays suggested.
         skills_filter: None,
         session_id: req.session_id.clone(),
@@ -326,7 +325,7 @@ pub async fn run_agent_once(
         available_models: vec![],
         mcp_servers: vec![],
         soul_context: None,
-        tools_config: Some(nevoflux_protocol::subagent::ToolsConfig::Allow(allowlist)),
+        tools_config,
         os_platform: Some(std::env::consts::OS.to_string()),
         local: None,
     };

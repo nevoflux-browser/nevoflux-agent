@@ -505,22 +505,6 @@ pub fn history_opts(
     }
 }
 
-/// Earlier turns from the session log, kept or rebuilt for `query` — the
-/// Jev history path shared by chat and tasks. `None` when the log cannot be
-/// read or the provider has no wire.
-pub async fn history_from_log(
-    cfg: &crate::config::AgentConfig,
-    database: &Arc<nevoflux_storage::Database>,
-    session_id: &str,
-    query: &str,
-    max_messages: usize,
-    table: Vec<TableTurn>,
-) -> Option<Vec<Message>> {
-    super::turn::turn_start(cfg, database, session_id, query, max_messages, table, None)
-        .await
-        .history
-}
-
 /// The log's history when it has turns, the caller's otherwise (a task's
 /// caller may supply history the log never saw, e.g. A2A).
 pub fn prefer_log(log: Option<Vec<Message>>, text: Vec<Message>) -> Vec<Message> {
