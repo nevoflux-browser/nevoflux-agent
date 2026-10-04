@@ -25,6 +25,16 @@ def script(step: int, user_text: str, turn: int = 0):
         return ("text", "The direct one is NF752.\nANSWER: NF752", None)
     m = URL.search(user_text)
     url = m.group(0) if m else "about:blank"
+    if "[fake:act]" in user_text:
+        # Jev tool assembly (P2-4): ask for a tool by intent, then use it.
+        plan = [
+            ("tool", "browser_navigate", {"url": url}),
+            ("tool", "act", {"intent": "think about the result"}),
+            ("tool", "think", {"thought": "ok"}),
+        ]
+        if step < len(plan):
+            return plan[step]
+        return ("text", "Done.\nANSWER: NF752", None)
     plan = [
         ("tool", "browser_navigate", {"url": url}),
         ("tool", "browser_get_markdown", {}),

@@ -1,0 +1,22 @@
+{
+ "id": "fake-act",
+ "set": "fake",
+ "lang": "en",
+ "site": "flights",
+ "task": "On {base}/index.html find the cheapest direct flight from Shanghai to Singapore on 2026-10-09. Check every result page. End your reply with a final line in the form 'ANSWER: <flight number>'. [fake:act]",
+ "followups": [],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "ANSWER:\\s*NF752\\b",
+   "turn": -1
+  }
+ ],
+ "tags": [
+  "fake",
+  "jev",
+  "tools"
+ ],
+ "timeout_secs": 600,
+ "note": "Fake-model only (eval/harness/fake_anthropic.py): navigate, act(intent), the loaded tool, answer. Never run with a real model."
+}

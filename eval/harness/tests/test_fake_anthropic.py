@@ -21,6 +21,15 @@ class FakeAnthropicTest(unittest.TestCase):
         self.assertEqual(first_user_text(body), "go to http://a.example/")
 
 
+class ActScriptTest(unittest.TestCase):
+    def test_an_act_marker_scripts_act_then_the_loaded_tool(self):
+        user = "go [fake:act] http://localtest.me:5000/flights/index.html"
+        self.assertEqual(script(0, user)[1], "browser_navigate")
+        self.assertEqual(script(1, user), ("tool", "act", {"intent": "think about the result"}))
+        self.assertEqual(script(2, user), ("tool", "think", {"thought": "ok"}))
+        self.assertEqual(script(3, user)[0], "text")
+
+
 class FollowUpTest(unittest.TestCase):
     def test_a_follow_up_turn_reads_then_answers(self):
         self.assertEqual(script(0, "x", turn=1)[1], "browser_get_markdown")

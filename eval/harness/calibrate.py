@@ -11,8 +11,10 @@ MISSING = {"harness_error", "timeout", "provider_error"}
 
 
 def jev_summary(rows) -> dict:
-    """Jev numbers from the session logs (spec §8.3): grades, fallbacks,
-    per-step signals and the error of H, corrections, recalls.
+    """Jev numbers from the session logs (spec §8.2, §8.3): grades, fallbacks,
+    per-step signals and the error of H, corrections, recalls, and the tool
+    sets (decisions by reason, missed tools, tool_change rebuilds, the size of
+    a turn-start set and how long choosing it took).
 
     H is "tool-using steps still needed" asked at step s; the actual value is
     last step of the turn - s - 1 (the last step is the answer).
@@ -20,6 +22,8 @@ def jev_summary(rows) -> dict:
     vis, corrections = {}, {}
     fallbacks = signals = recalls = 0
     errors = []
+    tool_sets, set_sizes, select_ms = {}, [], []
+    missed = tool_change_rebuilds = 0
     for r in rows:
         events = [json.loads(l) for l in (r.get("session_jsonl") or "").splitlines() if l.strip()]
         turn, last_step, asked = None, {}, []
@@ -43,6 +47,17 @@ def jev_summary(rows) -> dict:
                     corrections[trig] = corrections.get(trig, 0) + 1
             elif t == "tool/call" and e.get("name") == "recall":
                 recalls += 1
+            elif t == "tools/select":
+                reason = e.get("reason")
+                tool_sets[reason] = tool_sets.get(reason, 0) + 1
+                if reason in ("missed", "act"):
+                    missed += 1
+                else:
+                    set_sizes.append(len(e.get("names") or []))
+                    if e.get("elapsed_ms"):
+                        select_ms.append(e["elapsed_ms"])
+            elif t == "context/rebuild" and e.get("reason") == "tool_change":
+                tool_change_rebuilds += 1
         for turn_, step, h in asked:
             if turn_ in last_step:
                 errors.append(h - max(0, last_step[turn_] - step - 1))
@@ -54,6 +69,11 @@ def jev_summary(rows) -> dict:
         "h_bias": statistics.mean(errors) if errors else None,
         "corrections": corrections,
         "recalls": recalls,
+        "tool_sets": tool_sets,
+        "missed": missed,
+        "tool_change_rebuilds": tool_change_rebuilds,
+        "tool_set_size": statistics.mean(set_sizes) if set_sizes else None,
+        "tool_select_ms": statistics.mean(select_ms) if select_ms else None,
     }
 
 

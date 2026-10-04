@@ -100,6 +100,25 @@ class JevSummaryTest(unittest.TestCase):
         self.assertEqual(j["corrections"], {"drift": 1})
         self.assertEqual(j["recalls"], 1)
 
+    def test_jev_summary_counts_tool_sets(self):
+        log = "\n".join([
+            ev(type="turn/start", turn=1),
+            ev(type="tools/select", reason="initial", names=["a", "b", "c", "d", "e"], added=[], removed=[], elapsed_ms=900),
+            ev(type="tools/select", reason="missed", names=["a", "b", "c", "d", "e", "f", "g"], added=["f"], removed=[], elapsed_ms=0),
+            ev(type="tools/select", reason="act", names=["a", "b", "c", "d", "e", "f", "g", "h", "i"], added=["h"], removed=[], elapsed_ms=0),
+            ev(type="context/rebuild", reason="tool_change", decision="keep", keep_cost=1.0, rebuild_cost=2.0,
+               h=3, before_tokens=10, after_tokens=10, regraded=0),
+            ev(type="turn/end", turn=1),
+        ])
+        r = row(0, "a", True)
+        r["session_jsonl"] = log
+        j = summarize([r])["jev"]
+        self.assertEqual(j["tool_sets"], {"initial": 1, "missed": 1, "act": 1})
+        self.assertEqual(j["missed"], 2)
+        self.assertEqual(j["tool_change_rebuilds"], 1)
+        self.assertEqual(j["tool_set_size"], 5)   # turn-start sets only
+        self.assertEqual(j["tool_select_ms"], 900)
+
     def test_no_jev_events_gives_empty_numbers(self):
         j = summarize([row(0, "a", True)])["jev"]
         self.assertEqual((j["signals"], j["h_mae"], j["h_bias"]), (0, None, None))
