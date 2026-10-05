@@ -1939,6 +1939,17 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
             selector_unlocked,
         );
 
+        // A skill Jev chose for this turn is loaded as the first step (spec
+        // §5.7): only on a cloud main turn, never next to a skill the user
+        // invoked, and only when the run can call `skill_load` at all.
+        let mut pending_skill: Option<String> = input.jev_skill.clone().filter(|_| {
+            input.local.is_none()
+                && !self.config.is_subagent
+                && input.skill_context.is_none()
+                && !active_tools.is_empty()
+                && turn_tools.iter().any(|t| t.name == "skill_load")
+        });
+
         if let Some(all) = self.jev_all.borrow().as_ref() {
             let visible = Self::gated(
                 all,
@@ -2134,8 +2145,31 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                 active_tools.clone()
             };
 
+            // The Jev skill step: a response made up here, not asked of the
+            // model, so the skill's instructions arrive through the ordinary
+            // tool path (recorded, graded, kept as a pair).
+            let synthetic = pending_skill.take().map(|name| {
+                let call = ToolCall {
+                    id: "jev_skill_0".into(),
+                    call_id: None,
+                    name: "skill_load".into(),
+                    arguments: serde_json::json!({ "name": name }),
+                    signature: None,
+                };
+                self.host
+                    .record_synthetic_response("", std::slice::from_ref(&call));
+                LlmResponse {
+                    text: String::new(),
+                    tool_calls: vec![call],
+                    reasoning: None,
+                }
+            });
+            let is_synthetic = synthetic.is_some();
+
             // Use streaming or non-streaming LLM based on config
-            let response = if self.config.use_streaming && !self.config.suppress_streaming {
+            let response = if let Some(r) = synthetic {
+                r
+            } else if self.config.use_streaming && !self.config.suppress_streaming {
                 self.call_llm_streaming(&messages, &offered)?
             } else {
                 // Call LLM non-streaming
@@ -2173,7 +2207,8 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
             let llm_kws = Self::extract_keywords_from_text(&response.text);
 
             // Jev request ①: asked now, in parallel with the tools; never waited for.
-            if signals {
+            // Not for the Jev skill step: the model took no action there.
+            if signals && !is_synthetic {
                 let stubs: Vec<String> = chunks
                     .values()
                     .map(|(c, o)| format!("[{c} · offset {o}]"))
@@ -9784,6 +9819,116 @@ mod tests {
             .collect();
         assert_eq!(names, vec!["research".to_string()]);
         assert_eq!(agent.skills_for_input(None).len(), 2);
+    }
+
+    fn skill_input(skill: &str) -> AgentInput {
+        let mut i = session_log_input("research rust");
+        i.jev_skill = Some(skill.to_string());
+        i
+    }
+
+    #[test]
+    fn a_jev_skill_is_the_first_step() {
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        agent.run(&skill_input("research")).unwrap();
+        let reqs = agent.host.captured_requests.borrow();
+        assert_eq!(reqs.len(), 1, "the skill step calls no model");
+        let msgs = &reqs[0].messages;
+        let call = msgs
+            .iter()
+            .flat_map(|m| m.tool_calls.iter())
+            .find(|c| c.name == "skill_load")
+            .expect("an injected call");
+        assert_eq!(call.arguments["name"], "research");
+        assert!(msgs
+            .iter()
+            .any(|m| m.tool_call_id.as_deref() == Some("jev_skill_0")));
+        assert_eq!(
+            *agent.host.synthetic.borrow(),
+            vec![vec!["skill_load".to_string()]]
+        );
+    }
+
+    #[test]
+    fn an_explicit_skill_is_never_joined_by_jev_s() {
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        let mut input = skill_input("research");
+        input.skill_context = Some(SkillContext {
+            name: "cooking".into(),
+            base_path: String::new(),
+            content: "c".into(),
+            available_files: vec![],
+        });
+        agent.run(&input).unwrap();
+        assert!(agent.host.synthetic.borrow().is_empty());
+    }
+
+    #[test]
+    fn no_injection_without_skill_load_in_the_run() {
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        let mut input = skill_input("research");
+        input.tools_config = Some(nevoflux_protocol::subagent::ToolsConfig::Allow(vec![
+            "think".into(),
+        ]));
+        agent.run(&input).unwrap();
+        assert!(agent.host.synthetic.borrow().is_empty());
+
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        let mut toolless = skill_input("research");
+        toolless.tools_config = Some(nevoflux_protocol::subagent::ToolsConfig::None);
+        agent.run(&toolless).unwrap();
+        assert!(agent.host.synthetic.borrow().is_empty());
+    }
+
+    #[test]
+    fn without_jev_skill_the_first_request_is_the_model_s() {
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        agent.run(&session_log_input("go")).unwrap();
+        assert!(agent.host.synthetic.borrow().is_empty());
+        assert!(agent.host.captured_requests.borrow()[0]
+            .messages
+            .iter()
+            .all(|m| m.tool_calls.is_empty()));
+    }
+
+    #[test]
+    fn the_skill_step_sends_no_step_signals() {
+        let mock = MockHostFunctions::new();
+        mock.signals.set(true);
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        agent.run(&skill_input("research")).unwrap();
+        assert!(
+            agent.host.asked.borrow().is_empty(),
+            "{:?}",
+            agent.host.asked.borrow()
+        );
+    }
+
+    #[test]
+    fn a_skill_with_a_jev_set_offers_skill_load_without_a_missed_load() {
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(says("done"));
+        let agent = session_log_agent(mock);
+        let mut input = skill_input("research");
+        input.jev_tools = Some(vec!["skill_load".into(), "web_search".into()]);
+        agent.run(&input).unwrap();
+        assert!(agent.host.captured_tool_names.borrow()[0].contains(&"skill_load".to_string()));
+        assert!(
+            agent.host.tool_sets.borrow().is_empty(),
+            "{:?}",
+            agent.host.tool_sets.borrow()
+        );
     }
 
     #[test]

@@ -1095,6 +1095,10 @@ pub trait HostFunctions {
         None
     }
 
+    /// A response the agent made up instead of asking the model (a Jev
+    /// skill loaded as the run's first step, spec §5.7): log it like one.
+    fn record_synthetic_response(&self, _text: &str, _calls: &[ToolCall]) {}
+
     /// The candidate that fits `req.intent`, or `None` (no confident
     /// answer; the agent then matches keywords itself).
     fn choose_tool(&self, _req: &ChooseToolRequest<'_>) -> Option<String> {
@@ -1311,6 +1315,8 @@ pub struct MockHostFunctions {
     pub choose_with: std::cell::RefCell<Option<String>>,
     /// The run allowlist each `tool_pre` saw.
     pub pre_allowed: std::cell::RefCell<Vec<Option<Vec<String>>>>,
+    /// The tool names of each response the agent made up (a Jev skill step).
+    pub synthetic: std::cell::RefCell<Vec<Vec<String>>>,
 }
 
 #[cfg(test)]
@@ -1361,6 +1367,7 @@ impl MockHostFunctions {
             tool_sets: std::cell::RefCell::new(vec![]),
             choose_with: std::cell::RefCell::new(None),
             pre_allowed: std::cell::RefCell::new(vec![]),
+            synthetic: std::cell::RefCell::new(vec![]),
         }
     }
 
@@ -1500,6 +1507,12 @@ impl HostFunctions for MockHostFunctions {
 
     fn choose_tool(&self, _req: &ChooseToolRequest<'_>) -> Option<String> {
         self.choose_with.borrow().clone()
+    }
+
+    fn record_synthetic_response(&self, _text: &str, calls: &[ToolCall]) {
+        self.synthetic
+            .borrow_mut()
+            .push(calls.iter().map(|c| c.name.clone()).collect());
     }
 
     fn record_tool_set(&self, reason: &str, names: &[String]) {

@@ -2397,6 +2397,23 @@ impl HostFunctions for DaemonHostFunctions {
         }
     }
 
+    fn record_synthetic_response(&self, text: &str, calls: &[nevoflux_builtin_wasm::ToolCall]) {
+        // Logged like a model response so the session log, and the history
+        // derived from it, keep the step's call/result pair; the provider
+        // says who made it.
+        if let Some(writer) = self.event_writer() {
+            let logged = calls
+                .iter()
+                .map(|c| nevoflux_protocol::session_event::LoggedToolCall {
+                    id: c.id.clone(),
+                    name: c.name.clone(),
+                    args: c.arguments.clone(),
+                })
+                .collect();
+            writer.record_assistant(text, logged, None, "jev", "skill");
+        }
+    }
+
     fn record_tool_set(&self, reason: &str, names: &[String]) {
         let Some(w) = self.event_writer() else {
             return;
