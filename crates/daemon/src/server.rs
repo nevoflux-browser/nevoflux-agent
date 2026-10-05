@@ -6931,6 +6931,7 @@ async fn handle_chat_message_streaming(
     let jev_tools_for_rerun = jev_tools.clone();
 
     let input = AgentInput {
+        jev_skill: None,
         jev_tools,
         session_id: session_id.clone(),
         mode,
@@ -7561,6 +7562,7 @@ async fn handle_chat_message_streaming(
                             )
                         });
                         let rerun_input = AgentInput {
+                            jev_skill: None,
                             jev_tools: rerun_tools,
                             session_id: session_id.clone(),
                             mode,
@@ -8807,6 +8809,7 @@ async fn handle_chat_message(
             .await;
 
             let input = AgentInput {
+                jev_skill: None,
                 jev_tools,
                 session_id: session_id.clone(),
                 mode,

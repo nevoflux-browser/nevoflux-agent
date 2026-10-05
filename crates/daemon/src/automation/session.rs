@@ -345,6 +345,7 @@ async fn run_one_turn(
     .await;
 
     let input = nevoflux_builtin_wasm::AgentInput {
+        jev_skill: None,
         jev_tools,
         // No soul is bound on this path, so every skill stays suggested.
         skills_filter: None,

@@ -560,6 +560,7 @@ impl SubagentExecutor {
 
         // Build input with custom prompt and optional tab access
         let input = AgentInput {
+            jev_skill: None,
             jev_tools: None,
             // No soul is bound on this path, so every skill stays suggested.
             skills_filter: None,

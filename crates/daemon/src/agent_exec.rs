@@ -309,6 +309,7 @@ pub async fn run_agent_once(
     .await;
 
     let input = AgentInput {
+        jev_skill: None,
         jev_tools,
         // No soul is bound on this path, so every skill stays suggested.
         skills_filter: None,

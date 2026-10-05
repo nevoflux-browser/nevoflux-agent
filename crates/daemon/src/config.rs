@@ -1741,6 +1741,9 @@ pub struct JevConfig {
     pub cache: std::collections::BTreeMap<String, crate::jev::economics::CacheRate>,
     /// Tools Jev picks for a task beyond the core ones (spec §5.5, K).
     pub tools_k: usize,
+    /// A skill is loaded for a turn only at this probability or above
+    /// (spec §5.7); raise it when Jev loads skills that go unused.
+    pub skill_threshold: f64,
 }
 
 impl Default for JevConfig {
@@ -1755,6 +1758,7 @@ impl Default for JevConfig {
             sensitive_domains: Vec::new(),
             cache: std::collections::BTreeMap::new(),
             tools_k: 10,
+            skill_threshold: 0.8,
         }
     }
 }
@@ -2248,6 +2252,13 @@ mod tests {
         assert!(j.points.tools && j.points.skills && j.points.visibility && j.points.rebuild);
         assert!(!j.points.permissions);
         assert!(j.sensitive_domains.is_empty());
+    }
+
+    #[test]
+    fn jev_skill_threshold_defaults_to_the_spec_value() {
+        assert_eq!(JevConfig::default().skill_threshold, 0.8);
+        let c: AgentConfig = toml::from_str("[jev]\nskill_threshold = 0.9\n").unwrap();
+        assert_eq!(c.jev.skill_threshold, 0.9);
     }
 
     #[test]

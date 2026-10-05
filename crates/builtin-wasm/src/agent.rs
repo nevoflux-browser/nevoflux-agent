@@ -7897,6 +7897,7 @@ mod tests {
         let agent = Agent::new(mock);
 
         let input = AgentInput {
+            jev_skill: None,
             jev_tools: None,
             session_id: "sess-001".into(),
             mode: AgentMode::Agent,
@@ -8531,6 +8532,7 @@ mod tests {
 
     fn local_input(mode: AgentMode, message: &str, carried: &[&str]) -> AgentInput {
         AgentInput {
+            jev_skill: None,
             jev_tools: None,
             session_id: "t".into(),
             mode,
@@ -10315,6 +10317,7 @@ mod tests {
         let agent = Agent::new(mock);
 
         let input = AgentInput {
+            jev_skill: None,
             jev_tools: None,
             session_id: "sess-001".into(),
             mode: AgentMode::Chat,
@@ -10345,6 +10348,7 @@ mod tests {
         let agent = Agent::new(mock);
 
         let input = AgentInput {
+            jev_skill: None,
             jev_tools: None,
             session_id: "sess-001".into(),
             mode: AgentMode::Browser,
@@ -10375,6 +10379,7 @@ mod tests {
         let agent = Agent::new(mock);
 
         let input = AgentInput {
+            jev_skill: None,
             jev_tools: None,
             session_id: "sess-001".into(),
             mode: AgentMode::Agent,
@@ -10428,6 +10433,7 @@ mod tests {
         };
         let agent = Agent::with_config(mock, config);
         let input = AgentInput {
+            jev_skill: None,
             jev_tools: None,
             session_id: "sess-001".into(),
             mode: AgentMode::Chat,
@@ -10853,6 +10859,7 @@ mod tests {
         let agent = Agent::with_config(mock, config);
         let tools = agent.get_browser_tools();
         let input = AgentInput {
+            jev_skill: None,
             jev_tools: None,
             session_id: "t".into(),
             mode: AgentMode::Browser,
@@ -11225,6 +11232,7 @@ mod tests {
         let tools = agent.get_chat_tools();
 
         let input = AgentInput {
+            jev_skill: None,
             jev_tools: None,
             session_id: "t".into(),
             mode: AgentMode::Chat,
@@ -11560,6 +11568,7 @@ mod tests {
         let agent = Agent::new(mock);
 
         let input = AgentInput {
+            jev_skill: None,
             jev_tools: None,
             session_id: "sess-001".into(),
             mode: AgentMode::Chat,
@@ -11594,6 +11603,7 @@ mod tests {
         let agent = Agent::new(mock);
 
         let input = AgentInput {
+            jev_skill: None,
             jev_tools: None,
             session_id: "sess-001".into(),
             mode: AgentMode::Chat,

@@ -362,6 +362,17 @@ pub enum SessionEventPayload {
         #[serde(default)]
         elapsed_ms: u64,
     },
+    /// A skill Jev chose for the turn, loaded as its first step (spec §5.7).
+    #[serde(rename = "skills/inject")]
+    SkillInject {
+        /// The skill loaded.
+        name: String,
+        /// Jev's probability that the request needs it.
+        p: f64,
+        /// Time the turn-start Jev request took.
+        #[serde(default)]
+        elapsed_ms: u64,
+    },
 }
 
 impl SessionEventPayload {
@@ -393,6 +404,7 @@ impl SessionEventPayload {
             Self::ContextCorrection { .. } => "context/correction",
             Self::ContextRebuild { .. } => "context/rebuild",
             Self::ToolsSelect { .. } => "tools/select",
+            Self::SkillInject { .. } => "skills/inject",
         }
     }
 }
@@ -524,6 +536,20 @@ mod tests {
         assert_eq!(p.type_str(), "context/correction");
         let back: SessionEventPayload = serde_json::from_value(v).unwrap();
         assert_eq!(back, p);
+    }
+
+    #[test]
+    fn skill_inject_wire_shape() {
+        let p = SessionEventPayload::SkillInject {
+            name: "research".into(),
+            p: 0.91,
+            elapsed_ms: 640,
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["type"], "skills/inject");
+        assert_eq!(v["name"], "research");
+        assert_eq!(p.type_str(), "skills/inject");
+        assert_eq!(serde_json::from_value::<SessionEventPayload>(v).unwrap(), p);
     }
 
     #[test]
