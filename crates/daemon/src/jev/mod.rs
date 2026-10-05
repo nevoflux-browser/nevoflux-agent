@@ -10,6 +10,7 @@ pub mod rebuild;
 pub mod render;
 pub mod rpc;
 pub mod signals;
+pub mod skills;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod tools;
