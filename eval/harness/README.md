@@ -401,6 +401,39 @@ instead of every tool:
   mode tools. `recall` had the same problem since P2-2. Both now pass while
   they are offered.
 
+## Jev P2-4b (skills), 2026-10-05
+
+Agent `feat/jev-p2-4b`: the turn-start request also carries one Noul per
+skill (`skill/<name>`). When one skill reaches `[jev] skill_threshold`
+(0.8), it is loaded as the turn's first step: a synthetic `skill_load` call
+in place of a model call, logged as `assistant/message{provider:"jev"}`. It
+then runs through the ordinary tool path, so the body is recorded, graded,
+and kept as a pair in later turns. At most one skill a turn.
+
+Nothing is injected when:
+- the user invoked a skill (`/skill`);
+- the history already loaded that skill;
+- the run cannot call `skill_load`;
+- Jev's answer covers less than 90% of the skills.
+
+`skills/inject` logs each injection. `jev_summary.skills` counts injections
+and turns where the model then loaded a different skill itself
+(`other_loaded`, the likely misinjections, spec §8.3).
+
+**End to end with the fake model** (`tasks/fake/fake-skill`, real TypeSafe):
+- "Build a Canvas app with a bar chart …" → `skills/inject{app, p:0.89}`,
+  decided in 815 ms;
+- `skill_load` was in the turn's tool set;
+- the 54 KB body was the first step's result, graded `long` by Jev;
+- the model made 4 calls instead of 5. Jev's input for the turn was 36.9k
+  tokens, mostly grading that body.
+- A weaker prompt ("a small interactive calculator app as a canvas widget")
+  scored 0.8 on a direct probe and below the threshold in the full request,
+  so nothing was injected.
+- The first run found turn start panicking: reading the skill registry takes
+  a blocking lock, and turn start runs on the async runtime. It is now read
+  through `block_in_place`.
+
 ## Known gaps
 
 - Agent-loop tasks have no deadline on the daemon side: `wall_clock_secs`

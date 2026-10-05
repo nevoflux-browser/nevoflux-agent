@@ -3,7 +3,7 @@
  "set": "fake",
  "lang": "en",
  "site": "flights",
- "task": "Build me a small interactive calculator app as a canvas widget; use {base}/index.html only as a style reference. End your reply with a final line in the form 'ANSWER: <flight number>'.",
+ "task": "Build a Canvas app with a bar chart of the cheapest flights on {base}/index.html. End your reply with a final line in the form 'ANSWER: <flight number>'.",
  "followups": [],
  "checks": [
   {
