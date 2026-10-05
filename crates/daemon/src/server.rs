@@ -6023,7 +6023,7 @@ async fn load_session_history(
     services: &HostServices,
     active_soul: Option<&AgentRoleDefinition>,
     catalog: Option<Vec<nevoflux_builtin_wasm::ToolDefinition>>,
-) -> (Vec<WasmMessage>, Option<Vec<String>>) {
+) -> crate::jev::turn::StartedTurn {
     // Fetch max_messages + 1 so we can pop the current user message and still
     // have max_messages of history.
     match session_manager
@@ -6059,16 +6059,20 @@ async fn load_session_history(
                         text,
                         table,
                         catalog.as_deref(),
+                        None,
                         true,
                     )
                     .await
                 }
-                _ => (text, None),
+                _ => crate::jev::turn::StartedTurn {
+                    history: text,
+                    ..Default::default()
+                },
             }
         }
         Err(e) => {
             warn!("Failed to load session history for {}: {}", session_id, e);
-            (vec![], None)
+            crate::jev::turn::StartedTurn::default()
         }
     }
 }
@@ -6913,7 +6917,7 @@ async fn handle_chat_message_streaming(
     // turn ran on-device.
     let local_mode_active = config.llm.active_provider() == Some("local");
 
-    let (history, jev_tools) = load_session_history(
+    let started = load_session_history(
         session_manager,
         &session_id,
         config.daemon.context.max_history_messages,
@@ -6927,6 +6931,7 @@ async fn handle_chat_message_streaming(
         ),
     )
     .await;
+    let (history, jev_tools) = (started.history, started.tools);
     // A plan re-run continues this turn with the same tools.
     let jev_tools_for_rerun = jev_tools.clone();
 
@@ -7551,7 +7556,7 @@ async fn handle_chat_message_streaming(
                             None,
                         )
                         .await
-                        .0;
+                        .history;
                         // The re-run continues this turn: its tools as they
                         // stand now, plus any its history's pairs need.
                         let rerun_tools = jev_tools_for_rerun.as_ref().and_then(|_| {
@@ -8793,7 +8798,7 @@ async fn handle_chat_message(
                 .unwrap_or_default();
 
             // Build agent input with skill context injected into system prompt
-            let (history, jev_tools) = load_session_history(
+            let started = load_session_history(
                 session_manager,
                 &session_id,
                 config.daemon.context.max_history_messages,
@@ -8807,6 +8812,7 @@ async fn handle_chat_message(
                 ),
             )
             .await;
+            let (history, jev_tools) = (started.history, started.tools);
 
             let input = AgentInput {
                 jev_skill: None,

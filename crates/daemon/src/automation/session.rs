@@ -331,7 +331,7 @@ async fn run_one_turn(
         crate::jev::turn::tools_point_on(&cfg).then(|| agent.tools_for_input(mode, &tools_config));
     let use_log = !text_history.is_empty();
     let table = crate::jev::rebuild::table_from_text(&text_history);
-    let (history, jev_tools) = crate::jev::turn::start_turn(
+    let started = crate::jev::turn::start_turn(
         &cfg,
         &database,
         &session_id,
@@ -340,9 +340,11 @@ async fn run_one_turn(
         text_history,
         table,
         catalog.as_deref(),
+        None,
         use_log,
     )
     .await;
+    let (history, jev_tools) = (started.history, started.tools);
 
     let input = nevoflux_builtin_wasm::AgentInput {
         jev_skill: None,

@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use nevoflux_builtin_wasm::{Message, ToolDefinition};
+use nevoflux_builtin_wasm::{Message, SkillSummary, ToolDefinition};
 use nevoflux_llm::ProviderType;
 use nevoflux_protocol::session_event::{SessionEvent, SessionEventPayload};
 
@@ -14,6 +14,7 @@ use super::client;
 use super::economics::{cache_rate, warm};
 use super::history::{nested, TableTurn};
 use super::oracle::{DecisionOracle, JevOracle, OracleContext, Verdict};
+use super::wire::Question;
 use super::rebuild::{
     history_for_turn, history_opts, last_request_ms, rebuild_point_on, RebuildEnv,
 };
@@ -42,6 +43,22 @@ pub fn tools_point_on(cfg: &crate::config::AgentConfig) -> bool {
     // no missed-tool loading: v1 is the native loop only.
     jev.is_usable()
         && jev.points.tools
+        && cloud
+        && !cfg.llm.active_provider_is_acp()
+        && client::egress_allowed(crate::local::latch::is_on(), &jev.endpoint)
+}
+
+/// Jev, its skills point, egress and a cloud, non-ACP provider: the
+/// conditions for Jev choosing a skill (spec §5.7).
+pub fn skills_point_on(cfg: &crate::config::AgentConfig) -> bool {
+    let jev = &cfg.jev;
+    let cloud = cfg
+        .llm
+        .active_provider()
+        .and_then(|p| cfg.llm.resolve_wire(p))
+        .is_some_and(|w| w != ProviderType::Local);
+    jev.is_usable()
+        && jev.points.skills
         && cloud
         && !cfg.llm.active_provider_is_acp()
         && client::egress_allowed(crate::local::latch::is_on(), &jev.endpoint)
@@ -102,17 +119,20 @@ pub struct TurnStart {
     pub history: Option<Vec<Message>>,
     /// The tool set (`None`: offer the mode's tools as before).
     pub tools: Option<Vec<String>>,
+    /// A skill to load as the turn's first step (spec §5.7).
+    pub skill: Option<String>,
 }
 
-/// Jev's "will the request need it?" for every candidate, or `None` on any
-/// fallback. Split into requests of at most [`MAX_NOULS_PER_REQUEST`].
-async fn ask_tools(
+/// Jev's probabilities for every question, or `None` on any fallback.
+/// Split into requests of at most [`MAX_NOULS_PER_REQUEST`]; no questions
+/// asks nothing.
+async fn ask_nouls(
     cfg: &crate::config::AgentConfig,
     writer: Option<Arc<SessionEventWriter>>,
     query: &str,
-    cands: &[(String, String)],
+    questions: BTreeMap<String, Question>,
 ) -> Option<BTreeMap<String, f64>> {
-    if cands.is_empty() {
+    if questions.is_empty() {
         return Some(BTreeMap::new());
     }
     let c = client::shared(&cfg.jev).ok()?;
@@ -124,9 +144,11 @@ async fn ask_tools(
     let state = serde_json::json!({
         "query": query.chars().take(QUERY_CHARS).collect::<String>(),
     });
-    let asks = cands.chunks(MAX_NOULS_PER_REQUEST).map(|part| {
+    let all: Vec<(String, Question)> = questions.into_iter().collect();
+    let asks = all.chunks(MAX_NOULS_PER_REQUEST).map(|part| {
         let (oracle, ctx, state) = (&oracle, &ctx, state.clone());
-        async move { oracle.ask(ctx, state, questions(part)).await }
+        let part: BTreeMap<String, Question> = part.iter().cloned().collect();
+        async move { oracle.ask(ctx, state, part).await }
     });
     let mut answers = Vec::new();
     for v in futures::future::join_all(asks).await {
@@ -135,12 +157,15 @@ async fn ask_tools(
             Verdict::Fallback { .. } => return None,
         }
     }
-    asked(probabilities(&answers), cands)
+    Some(probabilities(&answers))
 }
 
 /// Turn start with Jev on: the tool set (when `catalog` is given and the
 /// tools point is on), then the earlier turns (when the rebuild point is
-/// on), then the tools those turns' native pairs still need.
+/// on), then the tools those turns' native pairs still need, then a skill
+/// (when `skills` are given and the skills point is on). Tool and skill
+/// Nouls share the requests (spec §5.4).
+#[allow(clippy::too_many_arguments)]
 pub async fn turn_start(
     cfg: &crate::config::AgentConfig,
     database: &Arc<nevoflux_storage::Database>,
@@ -149,6 +174,7 @@ pub async fn turn_start(
     max_messages: usize,
     table: Vec<TableTurn>,
     catalog: Option<&[ToolDefinition]>,
+    skills: Option<&[SkillSummary]>,
 ) -> TurnStart {
     let Ok(events) =
         nevoflux_storage::repositories::SessionEventRepository::new(database).list(session_id)
@@ -189,19 +215,39 @@ pub async fn turn_start(
             })
         })
     });
+    let skills = skills.filter(|s| !s.is_empty() && skills_point_on(cfg));
+    let tool_cands = catalog.map(candidates);
+    let skill_cands = skills.map(super::skills::candidates);
+    let mut questions_all = BTreeMap::new();
+    if let Some(c) = &tool_cands {
+        questions_all.extend(questions(c));
+    }
+    if let Some(c) = &skill_cands {
+        questions_all.extend(super::skills::questions(c));
+    }
+    // Each subset counts only when Jev answered most of it (§5.8): a
+    // partial answer for skills does not sink the tools, and vice versa.
+    let answers = ask_nouls(cfg, Some(writer.clone()), query, questions_all).await;
+    let (tool_p, skill_p) = match &answers {
+        Some(p) => {
+            let (t, k) = super::skills::split(p);
+            (
+                tool_cands.as_ref().and_then(|c| asked(t, c)),
+                skill_cands.as_ref().and_then(|c| asked(k, c)),
+            )
+        }
+        None => (None, None),
+    };
     let mut set: Option<(Option<Vec<String>>, &'static str)> = None;
-    if let Some(catalog) = catalog {
-        let cands = candidates(catalog);
-        set = Some(
-            match ask_tools(cfg, Some(writer.clone()), query, &cands).await {
-                Some(p) => {
-                    let d = decide_set(current.as_deref(), &p, cfg.jev.tools_k, is_warm);
-                    (Some(d.names), d.reason)
-                }
-                // §5.8: keep the current set; none yet → the full list.
-                None => (current.clone(), "fallback"),
-            },
-        );
+    if catalog.is_some() {
+        set = Some(match tool_p {
+            Some(p) => {
+                let d = decide_set(current.as_deref(), &p, cfg.jev.tools_k, is_warm);
+                (Some(d.names), d.reason)
+            }
+            // §5.8: keep the current set; none yet → the full list.
+            None => (current.clone(), "fallback"),
+        });
     }
     let elapsed_ms = started.elapsed().as_millis() as u64;
     // Any change of what the last turn was offered — a new set, a set
@@ -229,11 +275,20 @@ pub async fn turn_start(
         None
     };
 
-    // The unload constraint: a tool with a native pair in the history stays.
+    // A skill (§5.7): at most one, not one the history already loaded; a
+    // Jev failure injects nothing (§5.8).
+    let skill = skill_p.and_then(|p| {
+        let loaded = super::skills::loaded_in(history.as_deref().unwrap_or(&[]));
+        super::skills::choose_skill(&p, cfg.jev.skill_threshold, &loaded)
+    });
+
+    // The unload constraint: a tool with a native pair in the history stays;
+    // an injected skill's `skill_load` pair needs its tool too.
     let tools = match set {
         Some((Some(names), reason)) => {
             let pins = history.as_deref().map(pinned).unwrap_or_default();
-            let names = with_core(names.into_iter().chain(pins));
+            let skill_tool = skill.as_ref().map(|_| "skill_load".to_string());
+            let names = with_core(names.into_iter().chain(pins).chain(skill_tool));
             let prev = current.unwrap_or_default();
             writer.append(SessionEventPayload::ToolsSelect {
                 reason: reason.to_string(),
@@ -254,13 +309,33 @@ pub async fn turn_start(
         }
         _ => None,
     };
-    TurnStart { history, tools }
+    if let Some((name, p)) = &skill {
+        writer.append(SessionEventPayload::SkillInject {
+            name: name.clone(),
+            p: *p,
+            elapsed_ms,
+        });
+    }
+    TurnStart {
+        history,
+        tools,
+        skill: skill.map(|(n, _)| n),
+    }
 }
 
-/// A turn's starting history and tool set for chat and tasks: the log's
-/// history when `use_log` (and the rebuild point is on), `text` otherwise or
-/// when the log has no earlier turns; Jev's tool set when `catalog` is given
-/// and the tools point is on. With Jev off: `(text, None)`, nothing read.
+/// What [`start_turn`] gives a run.
+#[derive(Debug, Clone, Default)]
+pub struct StartedTurn {
+    pub history: Vec<Message>,
+    pub tools: Option<Vec<String>>,
+    pub skill: Option<String>,
+}
+
+/// A turn's starting history, tool set and skill for chat and tasks: the
+/// log's history when `use_log` (and the rebuild point is on), `text`
+/// otherwise or when the log has no earlier turns; Jev's tool set when
+/// `catalog` is given and the tools point is on; a skill when `skills` are
+/// given and the skills point is on. With Jev off: `text`, nothing read.
 #[allow(clippy::too_many_arguments)]
 pub async fn start_turn(
     cfg: &crate::config::AgentConfig,
@@ -271,12 +346,17 @@ pub async fn start_turn(
     text: Vec<Message>,
     table: Vec<TableTurn>,
     catalog: Option<&[ToolDefinition]>,
+    skills: Option<&[SkillSummary]>,
     use_log: bool,
-) -> (Vec<Message>, Option<Vec<String>>) {
+) -> StartedTurn {
     let use_log = use_log && rebuild_point_on(cfg);
     let catalog = catalog.filter(|_| tools_point_on(cfg));
-    if session_id.is_empty() || !(use_log || catalog.is_some()) {
-        return (text, None);
+    let skills = skills.filter(|_| skills_point_on(cfg));
+    if session_id.is_empty() || !(use_log || catalog.is_some() || skills.is_some()) {
+        return StartedTurn {
+            history: text,
+            ..Default::default()
+        };
     }
     let ts = turn_start(
         cfg,
@@ -286,6 +366,7 @@ pub async fn start_turn(
         max_messages,
         table,
         catalog,
+        skills,
     )
     .await;
     let history = if use_log {
@@ -293,7 +374,11 @@ pub async fn start_turn(
     } else {
         text
     };
-    (history, ts.tools)
+    StartedTurn {
+        history,
+        tools: ts.tools,
+        skill: ts.skill,
+    }
 }
 
 #[cfg(test)]
@@ -382,6 +467,7 @@ mod tests {
             50,
             vec![],
             Some(&catalog()),
+            None,
         )
         .await
     }
@@ -531,7 +617,7 @@ mod tests {
         let db = db_with(earlier_turn());
         let c = crate::config::AgentConfig::default();
         let text = vec![Message::user("q"), Message::assistant("a")];
-        let (h, tools) = start_turn(
+        let st = start_turn(
             &c,
             &db,
             "s1",
@@ -540,9 +626,11 @@ mod tests {
             text.clone(),
             vec![],
             Some(&catalog()),
+            None,
             true,
         )
         .await;
+        let (h, tools) = (st.history, st.tools);
         assert_eq!(h.len(), 2);
         assert_eq!(h[0].content, "q");
         assert_eq!(tools, None);
@@ -580,7 +668,7 @@ mod tests {
         // a set of core tools the soul does not have.
         let (url, bodies) = answering(answer(), Duration::ZERO).await;
         let db = db_with(earlier_turn());
-        let ts = turn_start(&cfg(&url, 2000), &db, "s1", "q", 50, vec![], Some(&[])).await;
+        let ts = turn_start(&cfg(&url, 2000), &db, "s1", "q", 50, vec![], Some(&[]), None).await;
         assert_eq!(ts.tools, None);
         assert!(bodies.lock().unwrap().iter().all(|b| !b.contains("noul")));
     }
@@ -713,5 +801,107 @@ mod tests {
             "{set:?}"
         );
         assert_eq!(rerun_set(&[], &history), None);
+    }
+
+    fn skill(name: &str, desc: &str) -> nevoflux_builtin_wasm::SkillSummary {
+        nevoflux_builtin_wasm::SkillSummary {
+            name: name.into(),
+            description: desc.into(),
+            tags: vec![],
+        }
+    }
+    fn skills() -> Vec<nevoflux_builtin_wasm::SkillSummary> {
+        vec![
+            skill("research", "Deep research. Many sources."),
+            skill("cooking", "Recipes."),
+        ]
+    }
+    fn answer_with(skill_p: f64) -> serde_json::Value {
+        json!({"answers": {
+            "web_search": {"noul": 0.95}, "think": {"noul": 0.1}, "read": {"noul": 0.05},
+            "skill/research": {"noul": skill_p}, "skill/cooking": {"noul": 0.02},
+            "remaining_steps": {"type": "score", "probabilities": {"1": 1.0}},
+            "visibility": {"choice": "full", "probabilities": {}}
+        }, "usage": {"input_tokens": 100, "output_tokens": 5}})
+    }
+    async fn start_with_skills(
+        c: &crate::config::AgentConfig,
+        db: &Arc<nevoflux_storage::Database>,
+    ) -> TurnStart {
+        turn_start(
+            c,
+            db,
+            "s1",
+            "research the history of rust",
+            50,
+            vec![],
+            Some(&catalog()),
+            Some(&skills()),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_likely_skill_is_chosen_and_skill_load_joins_the_set() {
+        let (url, _) = answering(answer_with(0.9), Duration::ZERO).await;
+        let db = db_with(earlier_turn());
+        let ts = start_with_skills(&cfg(&url, 2000), &db).await;
+        assert_eq!(ts.skill.as_deref(), Some("research"));
+        assert!(ts.tools.unwrap().contains(&"skill_load".to_string()));
+        assert!(logged(&db).iter().any(|e| matches!(e,
+            SessionEventPayload::SkillInject { name, .. } if name == "research")));
+    }
+
+    #[tokio::test]
+    async fn a_skill_under_the_threshold_is_not_chosen() {
+        let (url, _) = answering(answer_with(0.7), Duration::ZERO).await;
+        let db = db_with(earlier_turn());
+        assert_eq!(start_with_skills(&cfg(&url, 2000), &db).await.skill, None);
+    }
+
+    #[tokio::test]
+    async fn a_skill_already_in_history_is_not_injected_again() {
+        let (url, _) = answering(answer_with(0.9), Duration::ZERO).await;
+        let mut ev = earlier_turn();
+        ev.insert(2, json!({"type": "assistant/message", "content": "", "tool_calls": [{"id": "s1", "name": "skill_load", "args": {"name": "research"}}], "model": "skill", "provider": "jev"}));
+        ev.insert(3, json!({"type": "tool/call", "id": "s1", "name": "skill_load", "args": {"name": "research"}, "origin": "model"}));
+        ev.insert(4, json!({"type": "tool/result", "id": "s1", "content": "research body", "is_error": false, "duration_ms": 1}));
+        let db = db_with(ev);
+        assert_eq!(start_with_skills(&cfg(&url, 2000), &db).await.skill, None);
+    }
+
+    #[tokio::test]
+    async fn skill_answers_missing_inject_nothing_but_tools_still_decide() {
+        let tools_only = json!({"answers": {"web_search": {"noul": 0.95}, "think": {"noul": 0.1}, "read": {"noul": 0.05}},
+                                "usage": {"input_tokens": 1, "output_tokens": 1}});
+        let (url, _) = answering(tools_only, Duration::ZERO).await;
+        let db = db_with(earlier_turn());
+        let ts = start_with_skills(&cfg(&url, 2000), &db).await;
+        assert_eq!(ts.skill, None);
+        assert!(ts.tools.unwrap().contains(&"web_search".to_string()));
+    }
+
+    #[tokio::test]
+    async fn skills_off_asks_no_skill_nouls() {
+        let (url, bodies) = answering(answer_with(0.9), Duration::ZERO).await;
+        let db = db_with(earlier_turn());
+        let mut c = cfg(&url, 2000);
+        c.jev.points.skills = false;
+        let ts = start_with_skills(&c, &db).await;
+        assert_eq!(ts.skill, None);
+        assert!(!bodies.lock().unwrap().join("\n").contains("skill/"));
+    }
+
+    #[tokio::test]
+    async fn skills_without_the_tools_point_ask_skill_nouls_alone() {
+        let (url, bodies) = answering(answer_with(0.9), Duration::ZERO).await;
+        let db = db_with(earlier_turn());
+        let mut c = cfg(&url, 2000);
+        c.jev.points.tools = false;
+        let ts = start_with_skills(&c, &db).await;
+        assert_eq!(ts.skill.as_deref(), Some("research"));
+        assert_eq!(ts.tools, None);
+        let all = bodies.lock().unwrap().join("\n");
+        assert!(all.contains("skill/research") && !all.contains("`web_search`"));
     }
 }
