@@ -14,7 +14,6 @@ use super::client;
 use super::economics::{cache_rate, warm};
 use super::history::{nested, TableTurn};
 use super::oracle::{DecisionOracle, JevOracle, OracleContext, Verdict};
-use super::wire::Question;
 use super::rebuild::{
     history_for_turn, history_opts, last_request_ms, rebuild_point_on, RebuildEnv,
 };
@@ -22,6 +21,7 @@ use super::tools::{
     asked, candidates, decide_set, pinned, probabilities, questions, with_core,
     MAX_NOULS_PER_REQUEST,
 };
+use super::wire::Question;
 use crate::session_events::SessionEventWriter;
 
 /// The tools request asks ~100 Nouls at once; it may take this many Jev
@@ -62,6 +62,12 @@ pub fn skills_point_on(cfg: &crate::config::AgentConfig) -> bool {
         && cloud
         && !cfg.llm.active_provider_is_acp()
         && client::egress_allowed(crate::local::latch::is_on(), &jev.endpoint)
+}
+
+/// Whether a chat turn offers Jev the skills: not when the user invoked a
+/// skill explicitly (`/skill` pins its own), not with the skills point off.
+pub fn skill_catalog_wanted(cfg: &crate::config::AgentConfig, explicit_skill: bool) -> bool {
+    !explicit_skill && skills_point_on(cfg)
 }
 
 /// The set the last turn ran with: the last `tools/select` logged for it
@@ -668,7 +674,17 @@ mod tests {
         // a set of core tools the soul does not have.
         let (url, bodies) = answering(answer(), Duration::ZERO).await;
         let db = db_with(earlier_turn());
-        let ts = turn_start(&cfg(&url, 2000), &db, "s1", "q", 50, vec![], Some(&[]), None).await;
+        let ts = turn_start(
+            &cfg(&url, 2000),
+            &db,
+            "s1",
+            "q",
+            50,
+            vec![],
+            Some(&[]),
+            None,
+        )
+        .await;
         assert_eq!(ts.tools, None);
         assert!(bodies.lock().unwrap().iter().all(|b| !b.contains("noul")));
     }
@@ -903,5 +919,15 @@ mod tests {
         assert_eq!(ts.tools, None);
         let all = bodies.lock().unwrap().join("\n");
         assert!(all.contains("skill/research") && !all.contains("`web_search`"));
+    }
+
+    #[test]
+    fn an_explicit_skill_turn_offers_no_skill_catalog() {
+        let c = cfg("http://127.0.0.1:1", 2000);
+        assert!(skill_catalog_wanted(&c, false));
+        assert!(!skill_catalog_wanted(&c, true), "/skill pins its own skill");
+        let mut off = c.clone();
+        off.jev.points.skills = false;
+        assert!(!skill_catalog_wanted(&off, false));
     }
 }

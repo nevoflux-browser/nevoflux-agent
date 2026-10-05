@@ -999,6 +999,12 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
         self.filter_tools(self.get_tools_for_mode(mode), tools_config)
     }
 
+    /// The skills a run may load under `skills_filter`, sorted: what Jev
+    /// chooses from (spec §5.7).
+    pub fn skills_for_input(&self, skills_filter: Option<&[String]>) -> Vec<SkillSummary> {
+        filter_skills(self.host.skill_list().unwrap_or_default(), skills_filter)
+    }
+
     pub fn get_tools_for_mode(&self, mode: AgentMode) -> Vec<ToolDefinition> {
         match mode {
             AgentMode::Chat => self.get_chat_tools(),
@@ -9753,6 +9759,31 @@ mod tests {
             .borrow()
             .iter()
             .all(|(_, n)| !n.contains(&"browser_click".to_string())));
+    }
+
+    #[test]
+    fn skills_for_input_follow_the_soul_filter() {
+        let mock = MockHostFunctions::new();
+        *mock.skills.borrow_mut() = vec![
+            SkillSummary {
+                name: "research".into(),
+                description: "r".into(),
+                tags: vec![],
+            },
+            SkillSummary {
+                name: "cooking".into(),
+                description: "c".into(),
+                tags: vec![],
+            },
+        ];
+        let agent = session_log_agent(mock);
+        let names: Vec<String> = agent
+            .skills_for_input(Some(&["research".to_string()][..]))
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names, vec!["research".to_string()]);
+        assert_eq!(agent.skills_for_input(None).len(), 2);
     }
 
     #[test]

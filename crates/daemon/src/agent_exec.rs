@@ -293,6 +293,7 @@ pub async fn run_agent_once(
     // caller-supplied history the log never saw (A2A) stays as given.
     let catalog = crate::jev::turn::tools_point_on(&cfg)
         .then(|| agent.tools_for_input(req.mode, &tools_config));
+    let skills = crate::jev::turn::skills_point_on(&cfg).then(|| agent.skills_for_input(None));
     let use_log = !text_history.is_empty();
     let table = crate::jev::rebuild::table_from_text(&text_history);
     let started = crate::jev::turn::start_turn(
@@ -304,14 +305,14 @@ pub async fn run_agent_once(
         text_history,
         table,
         catalog.as_deref(),
-        None,
+        skills.as_deref(),
         use_log,
     )
     .await;
-    let (history, jev_tools) = (started.history, started.tools);
+    let (history, jev_tools, jev_skill) = (started.history, started.tools, started.skill);
 
     let input = AgentInput {
-        jev_skill: None,
+        jev_skill,
         jev_tools,
         // No soul is bound on this path, so every skill stays suggested.
         skills_filter: None,

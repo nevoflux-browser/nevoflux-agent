@@ -6008,6 +6008,21 @@ fn jev_catalog(
         .map(|_| agent.tools_for_input(mode, tools_config))
 }
 
+/// The skills Jev chooses from for a chat turn (spec §5.7): the soul's, or
+/// `None` when the user invoked a skill explicitly or the skills point is off.
+fn jev_skill_catalog(
+    services: &HostServices,
+    agent: &Agent<crate::agent_host::DaemonHostFunctions>,
+    active_soul: Option<&AgentRoleDefinition>,
+    explicit_skill: bool,
+) -> Option<Vec<nevoflux_builtin_wasm::SkillSummary>> {
+    services
+        .agent_config
+        .as_ref()
+        .filter(|c| crate::jev::turn::skill_catalog_wanted(c, explicit_skill))
+        .map(|_| agent.skills_for_input(soul_skills_filter(active_soul).as_deref()))
+}
+
 /// Load session history messages for the agent.
 ///
 /// Retrieves only the most recent messages using an efficient SQL query with
@@ -6023,6 +6038,7 @@ async fn load_session_history(
     services: &HostServices,
     active_soul: Option<&AgentRoleDefinition>,
     catalog: Option<Vec<nevoflux_builtin_wasm::ToolDefinition>>,
+    skills: Option<Vec<nevoflux_builtin_wasm::SkillSummary>>,
 ) -> crate::jev::turn::StartedTurn {
     // Fetch max_messages + 1 so we can pop the current user message and still
     // have max_messages of history.
@@ -6059,7 +6075,7 @@ async fn load_session_history(
                         text,
                         table,
                         catalog.as_deref(),
-                        None,
+                        skills.as_deref(),
                         true,
                     )
                     .await
@@ -6929,14 +6945,20 @@ async fn handle_chat_message_streaming(
             mode,
             &active_soul.as_deref().and_then(|s| s.tools_config.clone()),
         ),
+        jev_skill_catalog(
+            &services,
+            &agent,
+            active_soul.as_deref(),
+            skill_context.is_some(),
+        ),
     )
     .await;
-    let (history, jev_tools) = (started.history, started.tools);
+    let (history, jev_tools, jev_skill) = (started.history, started.tools, started.skill);
     // A plan re-run continues this turn with the same tools.
     let jev_tools_for_rerun = jev_tools.clone();
 
     let input = AgentInput {
-        jev_skill: None,
+        jev_skill,
         jev_tools,
         session_id: session_id.clone(),
         mode,
@@ -7553,6 +7575,7 @@ async fn handle_chat_message_streaming(
                             config.daemon.context.max_history_messages,
                             &services,
                             active_soul.as_deref(),
+                            None,
                             None,
                         )
                         .await
@@ -8810,12 +8833,18 @@ async fn handle_chat_message(
                     mode,
                     &active_soul.as_deref().and_then(|s| s.tools_config.clone()),
                 ),
+                jev_skill_catalog(
+                    &services,
+                    &agent,
+                    active_soul.as_deref(),
+                    skill_context.is_some(),
+                ),
             )
             .await;
-            let (history, jev_tools) = (started.history, started.tools);
+            let (history, jev_tools, jev_skill) = (started.history, started.tools, started.skill);
 
             let input = AgentInput {
-                jev_skill: None,
+                jev_skill,
                 jev_tools,
                 session_id: session_id.clone(),
                 mode,
