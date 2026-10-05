@@ -329,7 +329,8 @@ async fn run_one_turn(
     // history the log never saw stays.
     let catalog =
         crate::jev::turn::tools_point_on(&cfg).then(|| agent.tools_for_input(mode, &tools_config));
-    let skills = crate::jev::turn::skills_point_on(&cfg).then(|| agent.skills_for_input(None));
+    let skills = crate::jev::turn::skills_point_on(&cfg)
+        .then(|| crate::jev::turn::skill_catalog(&agent, None));
     let use_log = !text_history.is_empty();
     let table = crate::jev::rebuild::table_from_text(&text_history);
     let started = crate::jev::turn::start_turn(

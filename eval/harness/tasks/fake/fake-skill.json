@@ -1,0 +1,22 @@
+{
+ "id": "fake-skill",
+ "set": "fake",
+ "lang": "en",
+ "site": "flights",
+ "task": "Build me a small interactive calculator app as a canvas widget; use {base}/index.html only as a style reference. End your reply with a final line in the form 'ANSWER: <flight number>'.",
+ "followups": [],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "ANSWER:\\s*NF752\\b",
+   "turn": -1
+  }
+ ],
+ "tags": [
+  "fake",
+  "jev",
+  "skills"
+ ],
+ "timeout_secs": 600,
+ "note": "Fake-model only (eval/harness/fake_anthropic.py). Checks that Jev loads the app skill as the first step (skills/inject); the fake script then navigates and answers."
+}

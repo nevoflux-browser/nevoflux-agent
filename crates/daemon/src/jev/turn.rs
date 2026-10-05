@@ -64,6 +64,16 @@ pub fn skills_point_on(cfg: &crate::config::AgentConfig) -> bool {
         && client::egress_allowed(crate::local::latch::is_on(), &jev.endpoint)
 }
 
+/// The run's skills under `filter`, read from turn start, which runs on the
+/// async runtime: the registry loads behind a blocking lock, so the read is
+/// moved to a thread that may block.
+pub fn skill_catalog<H: nevoflux_builtin_wasm::HostFunctions>(
+    agent: &nevoflux_builtin_wasm::Agent<H>,
+    filter: Option<&[String]>,
+) -> Vec<SkillSummary> {
+    tokio::task::block_in_place(|| agent.skills_for_input(filter))
+}
+
 /// Whether a chat turn offers Jev the skills: not when the user invoked a
 /// skill explicitly (`/skill` pins its own), not with the skills point off.
 pub fn skill_catalog_wanted(cfg: &crate::config::AgentConfig, explicit_skill: bool) -> bool {
@@ -929,5 +939,19 @@ mod tests {
         let mut off = c.clone();
         off.jev.points.skills = false;
         assert!(!skill_catalog_wanted(&off, false));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_skill_catalog_is_read_inside_the_runtime() {
+        // The registry loads behind a blocking lock; turn start runs on the
+        // async runtime, where blocking panics unless it is moved off.
+        let db = Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        let host = crate::agent_host::DaemonHostFunctions::new(
+            Arc::new(crate::config::AgentConfig::default()),
+            tokio::runtime::Handle::current(),
+        )
+        .with_services(crate::wasm::services::HostServices::new(db));
+        let agent = nevoflux_builtin_wasm::Agent::new(host);
+        let _ = skill_catalog(&agent, None);
     }
 }

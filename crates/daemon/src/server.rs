@@ -6020,7 +6020,7 @@ fn jev_skill_catalog(
         .agent_config
         .as_ref()
         .filter(|c| crate::jev::turn::skill_catalog_wanted(c, explicit_skill))
-        .map(|_| agent.skills_for_input(soul_skills_filter(active_soul).as_deref()))
+        .map(|_| crate::jev::turn::skill_catalog(agent, soul_skills_filter(active_soul).as_deref()))
 }
 
 /// Load session history messages for the agent.
