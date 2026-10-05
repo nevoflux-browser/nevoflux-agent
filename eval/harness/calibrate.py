@@ -31,13 +31,20 @@ def jev_summary(rows) -> dict:
     for r in rows:
         events = [json.loads(l) for l in (r.get("session_jsonl") or "").splitlines() if l.strip()]
         turn, last_step, asked = None, {}, []
-        injected_now, other_now = None, False
+        # skills/inject is logged at turn start, before the agent's
+        # turn/start; it lasts until that turn's turn/end. A subagent's turn
+        # nested inside (turn/start while one is open) is not a turn.
+        injected_now, other_now, depth = None, False, 0
         for e in events:
             t = e.get("type")
-            if t in ("turn/start", "turn/end"):
-                if injected_now and other_now:
-                    other_loaded += 1
-                injected_now, other_now = None, False
+            if t == "turn/start":
+                depth += 1
+            elif t == "turn/end":
+                depth = max(0, depth - 1)
+                if depth == 0:
+                    if injected_now and other_now:
+                        other_loaded += 1
+                    injected_now, other_now = None, False
             if t == "turn/start":
                 turn = e.get("turn")
             elif t == "step/start":

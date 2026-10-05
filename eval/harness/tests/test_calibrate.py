@@ -120,14 +120,20 @@ class JevSummaryTest(unittest.TestCase):
         self.assertEqual(j["tool_select_ms"], 900)
 
     def test_jev_summary_counts_skill_injections(self):
+        # The real order: the daemon logs skills/inject at turn start, before
+        # the agent's turn/start; a subagent's nested turn sits inside.
         log = "\n".join([
-            ev(type="turn/start", turn=1),
             ev(type="skills/inject", name="research", p=0.9, elapsed_ms=600),
+            ev(type="turn/start", turn=1),
             ev(type="tool/call", id="s", name="skill_load", args={"name": "research"}),
             ev(type="turn/end", turn=1),
-            ev(type="turn/start", turn=2),
             ev(type="skills/inject", name="cooking", p=0.85, elapsed_ms=600),
+            ev(type="turn/start", turn=2),
             ev(type="tool/call", id="s", name="skill_load", args={"name": "cooking"}),
+            ev(type="tool/call", id="sub", name="subagent_spawn", args={}),
+            ev(type="turn/start", turn=1),
+            ev(type="turn/end", turn=1),
+            ev(type="tool/result", id="sub", content="done"),
             ev(type="tool/call", id="t", name="skill_load", args={"name": "brain"}),
             ev(type="turn/end", turn=2),
         ])

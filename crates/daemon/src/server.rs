@@ -6013,13 +6013,21 @@ fn jev_catalog(
 fn jev_skill_catalog(
     services: &HostServices,
     agent: &Agent<crate::agent_host::DaemonHostFunctions>,
+    mode: AgentMode,
     active_soul: Option<&AgentRoleDefinition>,
     explicit_skill: bool,
 ) -> Option<Vec<nevoflux_builtin_wasm::SkillSummary>> {
+    // A run that cannot call `skill_load` (a soul's allowlist, `tools: none`)
+    // is not offered skills: the agent would decline the injection.
+    let tools_config = active_soul.and_then(|s| s.tools_config.clone());
+    let can_load = agent
+        .tools_for_input(mode, &tools_config)
+        .iter()
+        .any(|t| t.name == "skill_load");
     services
         .agent_config
         .as_ref()
-        .filter(|c| crate::jev::turn::skill_catalog_wanted(c, explicit_skill))
+        .filter(|c| crate::jev::turn::skill_catalog_wanted(c, explicit_skill, can_load))
         .map(|_| crate::jev::turn::skill_catalog(agent, soul_skills_filter(active_soul).as_deref()))
 }
 
@@ -6948,6 +6956,7 @@ async fn handle_chat_message_streaming(
         jev_skill_catalog(
             &services,
             &agent,
+            mode,
             active_soul.as_deref(),
             skill_context.is_some(),
         ),
@@ -8836,6 +8845,7 @@ async fn handle_chat_message(
                 jev_skill_catalog(
                     &services,
                     &agent,
+                    mode,
                     active_soul.as_deref(),
                     skill_context.is_some(),
                 ),

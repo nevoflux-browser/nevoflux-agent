@@ -329,7 +329,10 @@ async fn run_one_turn(
     // history the log never saw stays.
     let catalog =
         crate::jev::turn::tools_point_on(&cfg).then(|| agent.tools_for_input(mode, &tools_config));
-    let skills = crate::jev::turn::skills_point_on(&cfg)
+    // Only a run that can call `skill_load` is offered skills.
+    let can_load = matches!(&tools_config,
+        Some(nevoflux_protocol::subagent::ToolsConfig::Allow(l)) if l.iter().any(|n| n == "skill_load"));
+    let skills = crate::jev::turn::skill_catalog_wanted(&cfg, false, can_load)
         .then(|| crate::jev::turn::skill_catalog(&agent, None));
     let use_log = !text_history.is_empty();
     let table = crate::jev::rebuild::table_from_text(&text_history);

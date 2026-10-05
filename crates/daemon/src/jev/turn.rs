@@ -57,9 +57,19 @@ pub fn skills_point_on(cfg: &crate::config::AgentConfig) -> bool {
         .active_provider()
         .and_then(|p| cfg.llm.resolve_wire(p))
         .is_some_and(|w| w != ProviderType::Local);
+    // The skill step is an assistant tool call the model never made: no
+    // reasoning, no signature. DeepSeek/MiMo thinking modes and Gemini 3
+    // reject such a message, so they get no skill step.
+    let thinking = super::rebuild::needs_reasoning_back(cfg)
+        || cfg
+            .llm
+            .active_provider()
+            .and_then(|p| cfg.llm.resolve_wire(p))
+            == Some(ProviderType::Gemini);
     jev.is_usable()
         && jev.points.skills
         && cloud
+        && !thinking
         && !cfg.llm.active_provider_is_acp()
         && client::egress_allowed(crate::local::latch::is_on(), &jev.endpoint)
 }
@@ -74,10 +84,15 @@ pub fn skill_catalog<H: nevoflux_builtin_wasm::HostFunctions>(
     tokio::task::block_in_place(|| agent.skills_for_input(filter))
 }
 
-/// Whether a chat turn offers Jev the skills: not when the user invoked a
-/// skill explicitly (`/skill` pins its own), not with the skills point off.
-pub fn skill_catalog_wanted(cfg: &crate::config::AgentConfig, explicit_skill: bool) -> bool {
-    !explicit_skill && skills_point_on(cfg)
+/// Whether a turn offers Jev the skills: not when the user invoked a skill
+/// explicitly (`/skill` pins its own), not when the run cannot call
+/// `skill_load` (`can_load`), not with the skills point off.
+pub fn skill_catalog_wanted(
+    cfg: &crate::config::AgentConfig,
+    explicit_skill: bool,
+    can_load: bool,
+) -> bool {
+    !explicit_skill && can_load && skills_point_on(cfg)
 }
 
 /// The set the last turn ran with: the last `tools/select` logged for it
@@ -934,11 +949,14 @@ mod tests {
     #[test]
     fn an_explicit_skill_turn_offers_no_skill_catalog() {
         let c = cfg("http://127.0.0.1:1", 2000);
-        assert!(skill_catalog_wanted(&c, false));
-        assert!(!skill_catalog_wanted(&c, true), "/skill pins its own skill");
+        assert!(skill_catalog_wanted(&c, false, true));
+        assert!(
+            !skill_catalog_wanted(&c, true, true),
+            "/skill pins its own skill"
+        );
         let mut off = c.clone();
         off.jev.points.skills = false;
-        assert!(!skill_catalog_wanted(&off, false));
+        assert!(!skill_catalog_wanted(&off, false, true));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -953,5 +971,26 @@ mod tests {
         .with_services(crate::wasm::services::HostServices::new(db));
         let agent = nevoflux_builtin_wasm::Agent::new(host);
         let _ = skill_catalog(&agent, None);
+    }
+
+    #[test]
+    fn a_run_that_cannot_load_skills_is_offered_none() {
+        // A soul without `skill_load`, a toolless soul, an evolve run: the
+        // agent would decline the injection, so Jev is not asked at all.
+        let c = cfg("http://127.0.0.1:1", 2000);
+        assert!(!skill_catalog_wanted(&c, false, false));
+    }
+
+    #[test]
+    fn thinking_providers_get_no_skill_injection() {
+        // The made-up skill step is an assistant tool call with no
+        // reasoning or signature: DeepSeek/MiMo thinking and Gemini 3 reject
+        // it. Anthropic (thinking never requested) is fine.
+        let mut c = cfg("http://127.0.0.1:1", 2000);
+        assert!(skills_point_on(&c));
+        c.llm.provider = Some("deepseek".into());
+        assert!(!skills_point_on(&c));
+        c.llm.provider = Some("gemini".into());
+        assert!(!skills_point_on(&c));
     }
 }
