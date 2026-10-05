@@ -14,7 +14,8 @@ def jev_summary(rows) -> dict:
     """Jev numbers from the session logs (spec §8.2, §8.3): grades, fallbacks,
     per-step signals and the error of H, corrections, recalls, and the tool
     sets (decisions by reason, missed tools, tool_change rebuilds, the size of
-    a turn-start set and how long choosing it took).
+    a turn-start set and how long choosing it took), and the skills Jev loaded
+    with how often the model loaded a different one in the same turn.
 
     H is "tool-using steps still needed" asked at step s; the actual value is
     last step of the turn - s - 1 (the last step is the answer).
@@ -24,11 +25,19 @@ def jev_summary(rows) -> dict:
     errors = []
     tool_sets, set_sizes, select_ms = {}, [], []
     missed = tool_change_rebuilds = 0
+    # Skills Jev loaded (spec §5.7), and turns where the model then loaded a
+    # different skill itself: the likely misinjections (§8.3).
+    injected = other_loaded = 0
     for r in rows:
         events = [json.loads(l) for l in (r.get("session_jsonl") or "").splitlines() if l.strip()]
         turn, last_step, asked = None, {}, []
+        injected_now, other_now = None, False
         for e in events:
             t = e.get("type")
+            if t in ("turn/start", "turn/end"):
+                if injected_now and other_now:
+                    other_loaded += 1
+                injected_now, other_now = None, False
             if t == "turn/start":
                 turn = e.get("turn")
             elif t == "step/start":
@@ -58,6 +67,12 @@ def jev_summary(rows) -> dict:
                         select_ms.append(e["elapsed_ms"])
             elif t == "context/rebuild" and e.get("reason") == "tool_change":
                 tool_change_rebuilds += 1
+            elif t == "skills/inject":
+                injected += 1
+                injected_now = e.get("name")
+            if (t == "tool/call" and e.get("name") == "skill_load" and injected_now
+                    and (e.get("args") or {}).get("name") != injected_now):
+                other_now = True
         for turn_, step, h in asked:
             if turn_ in last_step:
                 errors.append(h - max(0, last_step[turn_] - step - 1))
@@ -74,6 +89,7 @@ def jev_summary(rows) -> dict:
         "tool_change_rebuilds": tool_change_rebuilds,
         "tool_set_size": statistics.mean(set_sizes) if set_sizes else None,
         "tool_select_ms": statistics.mean(select_ms) if select_ms else None,
+        "skills": {"injected": injected, "other_loaded": other_loaded},
     }
 
 

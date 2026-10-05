@@ -119,6 +119,23 @@ class JevSummaryTest(unittest.TestCase):
         self.assertEqual(j["tool_set_size"], 5)   # turn-start sets only
         self.assertEqual(j["tool_select_ms"], 900)
 
+    def test_jev_summary_counts_skill_injections(self):
+        log = "\n".join([
+            ev(type="turn/start", turn=1),
+            ev(type="skills/inject", name="research", p=0.9, elapsed_ms=600),
+            ev(type="tool/call", id="s", name="skill_load", args={"name": "research"}),
+            ev(type="turn/end", turn=1),
+            ev(type="turn/start", turn=2),
+            ev(type="skills/inject", name="cooking", p=0.85, elapsed_ms=600),
+            ev(type="tool/call", id="s", name="skill_load", args={"name": "cooking"}),
+            ev(type="tool/call", id="t", name="skill_load", args={"name": "brain"}),
+            ev(type="turn/end", turn=2),
+        ])
+        r = row(0, "a", True)
+        r["session_jsonl"] = log
+        j = summarize([r])["jev"]
+        self.assertEqual(j["skills"], {"injected": 2, "other_loaded": 1})
+
     def test_no_jev_events_gives_empty_numbers(self):
         j = summarize([row(0, "a", True)])["jev"]
         self.assertEqual((j["signals"], j["h_mae"], j["h_bias"]), (0, None, None))
