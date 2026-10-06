@@ -179,16 +179,31 @@ pub fn handle_set(
     shared_config: &SharedAgentConfig,
 ) -> serde_json::Value {
     let id = crate::local::rpc::request_id(params);
-    let cmd = "jev.set";
     let Ok(path) = crate::config::AgentConfig::default_config_path() else {
         return err_response(
             &id,
-            cmd,
+            "jev.set",
             "config_error",
             "could not resolve the config file path",
         );
     };
-    let mut cfg = match crate::config::AgentConfig::load_from_path(&path) {
+    set_with_path(params, shared_config, &path)
+}
+
+/// [`handle_set`] against the config file at `path`.
+pub fn set_with_path(
+    params: &serde_json::Value,
+    shared_config: &SharedAgentConfig,
+    path: &std::path::PathBuf,
+) -> serde_json::Value {
+    let id = crate::local::rpc::request_id(params);
+    let cmd = "jev.set";
+    // Load, change and save as one step: the settings page saves on every
+    // change, and two overlapping saves would otherwise undo each other or
+    // read the file half-written.
+    static SET_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = SET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut cfg = match crate::config::AgentConfig::load_from_path(path) {
         Ok(c) => c,
         Err(e) => {
             return err_response(
@@ -202,7 +217,7 @@ pub fn handle_set(
     if let Err((code, message)) = apply_set(&mut cfg, params) {
         return err_response(&id, cmd, code, message);
     }
-    if let Err(e) = cfg.save_to_path(&path) {
+    if let Err(e) = cfg.save_to_path(path) {
         return err_response(
             &id,
             cmd,
@@ -307,6 +322,56 @@ pub async fn handle_test(
 mod tests {
     use crate::config::AgentConfig;
     use serde_json::json;
+
+    #[test]
+    fn concurrent_saves_lose_no_change() {
+        // The settings page saves on every change; two saves that overlap
+        // must not undo each other (load-modify-save is one step).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        AgentConfig::default().save_to_path(&path).unwrap();
+        let shared: crate::server::SharedAgentConfig = std::sync::Arc::new(std::sync::RwLock::new(
+            std::sync::Arc::new(AgentConfig::default()),
+        ));
+        let writers: Vec<(&str, Box<dyn Fn(usize) -> serde_json::Value + Send + Sync>)> = vec![
+            ("timeout", Box::new(|i| json!({"timeout_ms": 1000 + i}))),
+            (
+                "tools",
+                Box::new(|i| json!({"points": {"tools": i % 2 == 0}})),
+            ),
+            (
+                "skills",
+                Box::new(|i| json!({"points": {"skills": i % 2 == 1}})),
+            ),
+            (
+                "domains",
+                Box::new(|i| json!({"sensitive_domains": [format!("d{i}.example")]})),
+            ),
+            (
+                "key",
+                Box::new(|i| json!({"api_key": format!("sk-{i:04}")})),
+            ),
+        ];
+        const N: usize = 60;
+        std::thread::scope(|scope| {
+            for (_, f) in &writers {
+                let (path, shared) = (&path, &shared);
+                scope.spawn(move || {
+                    for i in 0..N {
+                        let r = set_with_path(&f(i), shared, path);
+                        assert_eq!(r["payload"]["success"], true, "{r}");
+                    }
+                });
+            }
+        });
+        let last = N - 1;
+        let saved = AgentConfig::load_from_path(&path).unwrap().jev;
+        assert_eq!(saved.timeout_ms, 1000 + last as u64);
+        assert_eq!(saved.points.tools, last % 2 == 0);
+        assert_eq!(saved.points.skills, last % 2 == 1);
+        assert_eq!(saved.sensitive_domains, vec![format!("d{last}.example")]);
+        assert_eq!(saved.api_key, format!("sk-{last:04}"));
+    }
 
     fn cfg_with_key(key: &str) -> AgentConfig {
         let mut c = AgentConfig::default();
