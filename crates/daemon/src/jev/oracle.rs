@@ -138,6 +138,9 @@ impl JevOracle {
     }
 
     fn fall_back(&self, point: &str, reason: String, started: Instant) -> Verdict {
+        if let Some(s) = &self.stats {
+            s.record_jev_fallback();
+        }
         if let Some(w) = &self.events {
             w.append(SessionEventPayload::JevFallback {
                 point: point.to_string(),
@@ -339,5 +342,39 @@ mod tests {
             metadata_only(&s),
             serde_json::json!({"domain":"d","title":"t","element_count":3,"query":"q","step":2})
         );
+    }
+
+    #[tokio::test]
+    async fn a_fallback_is_counted_in_the_turn_stats() {
+        let (url, _) = answering(
+            serde_json::json!({"answers": {}}),
+            Duration::from_millis(400),
+        )
+        .await;
+        let stats = TurnStats::new();
+        let oracle = JevOracle::new(
+            JevClient::new(&url, "k", "jev-latest"),
+            vec![],
+            None,
+            Some(stats.clone()),
+        );
+        let v = oracle
+            .ask(
+                &OracleContext::no_page("t", Duration::from_millis(50)),
+                serde_json::json!({}),
+                one_noul(),
+            )
+            .await;
+        assert!(matches!(v, Verdict::Fallback { .. }));
+        stats.record(crate::turn_stats::CallStats {
+            model: "m".into(),
+            ..Default::default()
+        });
+        let jev = stats
+            .snapshot()
+            .unwrap()
+            .jev
+            .expect("a jev bucket for a turn where Jev only failed");
+        assert_eq!((jev.calls, jev.fallbacks), (0, 1));
     }
 }

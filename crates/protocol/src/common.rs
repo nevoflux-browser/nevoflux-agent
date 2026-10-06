@@ -520,6 +520,10 @@ pub struct StreamMetadata {
 }
 
 /// Skip `false` when serializing so wire frames only carry meaningful flags.
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
 fn is_false(b: &bool) -> bool {
     !*b
 }
@@ -544,6 +548,10 @@ pub struct UsageBucket {
     /// Part of `input` written to the provider's prompt cache.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_write: Option<u64>,
+    /// Requests that failed and fell back to local rules (the Jev bucket
+    /// only; spec §5.8: the sidebar warns when most of a reply fell back).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub fallbacks: u32,
 }
 
 /// Token usage snapshot for one assistant reply.
@@ -1215,12 +1223,21 @@ mod tool_result_tests {
     #[test]
     fn network_actions_serialize_to_the_strings_the_extension_matches() {
         for (action, expected) in [
-            (BrowserToolAction::NetworkCaptureStart, "network_capture_start"),
-            (BrowserToolAction::NetworkCaptureStop, "network_capture_stop"),
+            (
+                BrowserToolAction::NetworkCaptureStart,
+                "network_capture_start",
+            ),
+            (
+                BrowserToolAction::NetworkCaptureStop,
+                "network_capture_stop",
+            ),
             (BrowserToolAction::NetworkRequests, "network_requests"),
             (BrowserToolAction::ConsoleMessages, "console_messages"),
         ] {
-            assert_eq!(serde_json::to_string(&action).unwrap(), format!("\"{expected}\""));
+            assert_eq!(
+                serde_json::to_string(&action).unwrap(),
+                format!("\"{expected}\"")
+            );
         }
     }
 }
@@ -1332,5 +1349,24 @@ mod turn_usage_tests {
             (v["cache_read"].as_u64(), v["cache_write"].as_u64()),
             (Some(900), Some(50))
         );
+    }
+
+    #[test]
+    fn usage_fallbacks_are_omitted_at_zero_and_default_when_absent() {
+        let b = UsageBucket {
+            calls: 2,
+            ..Default::default()
+        };
+        assert!(!serde_json::to_string(&b).unwrap().contains("fallbacks"));
+        let back: UsageBucket =
+            serde_json::from_str(r#"{"input":1,"output":1,"calls":1}"#).unwrap();
+        assert_eq!(back.fallbacks, 0);
+        let with = UsageBucket {
+            fallbacks: 3,
+            ..Default::default()
+        };
+        assert!(serde_json::to_string(&with)
+            .unwrap()
+            .contains("\"fallbacks\":3"));
     }
 }

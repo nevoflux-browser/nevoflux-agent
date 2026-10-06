@@ -131,6 +131,13 @@ impl TurnStats {
         self.sink.get().is_some()
     }
 
+    /// One Jev request that failed and fell back to local rules.
+    pub fn record_jev_fallback(&self) {
+        if let Ok(mut j) = self.jev.lock() {
+            j.fallbacks += 1;
+        }
+    }
+
     /// One Jev request's tokens (spec §9 M2 `jev` role; user-paid, shown in
     /// the sidebar in P2-5).
     pub fn record_jev(&self, input_tokens: u64, output_tokens: u64) {
@@ -236,7 +243,7 @@ impl TurnStats {
             usage.decode_ms = Some(decode_total);
         }
         if let Ok(j) = self.jev.lock() {
-            usage.jev = (j.calls > 0).then(|| j.clone());
+            usage.jev = (j.calls > 0 || j.fallbacks > 0).then(|| j.clone());
         }
         Some(usage)
     }
@@ -559,5 +566,31 @@ mod turn_stats_tests {
         stats.record(call());
         let u = stats.snapshot().unwrap();
         assert_eq!((u.main.cache_read, u.main.cache_write), (None, None));
+    }
+
+    #[test]
+    fn jev_fallbacks_are_counted_beside_its_calls() {
+        let s = TurnStats::new();
+        s.record(CallStats {
+            model: "m".into(),
+            ..Default::default()
+        });
+        s.record_jev(100, 5);
+        s.record_jev_fallback();
+        s.record_jev_fallback();
+        let jev = s.snapshot().unwrap().jev.expect("a jev bucket");
+        assert_eq!((jev.calls, jev.fallbacks), (1, 2));
+
+        let only_failed = TurnStats::new();
+        only_failed.record(CallStats {
+            model: "m".into(),
+            ..Default::default()
+        });
+        only_failed.record_jev_fallback();
+        assert_eq!(
+            only_failed.snapshot().unwrap().jev.unwrap().fallbacks,
+            1,
+            "a turn where Jev only failed still reports it"
+        );
     }
 }
