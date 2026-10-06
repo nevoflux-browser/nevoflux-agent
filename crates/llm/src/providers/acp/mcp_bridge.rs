@@ -50,7 +50,24 @@ pub struct PermissionRequest {
     pub tool_name: String,
     pub arguments_summary: String,
     pub result_tx: oneshot::Sender<PermissionResponse>,
+    /// Flagged as risky (spec §5.7, J14): offer Allow/Deny only, and refuse
+    /// when nobody can answer.
+    pub must_ask: bool,
 }
+
+/// Decides whether a call must be put to the user whatever the tier and the
+/// always-allow cache say: `(tool, arguments_summary, would_auto)` →
+/// must ask. `would_auto` is whether the gate would pass the call without
+/// asking. Injected by the daemon, which owns Jev.
+pub type Tightener = Arc<
+    dyn Fn(
+            String,
+            String,
+            bool,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// User's response to a permission request.
 /// How long to wait for a human permission decision before giving up.
@@ -94,6 +111,8 @@ pub struct McpToolBridge {
     /// (which resolves it from config, incl. per-session override) so this ACP
     /// gate auto-approves the same risk buckets as the native gate.
     execution_tier: RwLock<nevoflux_protocol::ExecutionTier>,
+    /// Asked first by `request_permission`; `None` changes nothing.
+    tightener: RwLock<Option<Tightener>>,
 }
 
 impl Drop for McpToolBridge {
@@ -128,6 +147,7 @@ impl McpToolBridge {
             always_allowed_tools: Arc::new(RwLock::new(std::collections::HashSet::new())),
             gate_tool_calls: std::sync::atomic::AtomicBool::new(false),
             execution_tier: RwLock::new(nevoflux_protocol::ExecutionTier::default()),
+            tightener: RwLock::new(None),
         }
     }
 
@@ -208,6 +228,11 @@ impl McpToolBridge {
     }
 
     /// Set the effective "Agent execution" tier used by `request_permission`.
+    /// Set (or clear) the check that can require a confirmation.
+    pub fn set_tightener(&self, tightener: Option<Tightener>) {
+        *self.tightener.write().unwrap() = tightener;
+    }
+
     pub fn set_execution_tier(&self, tier: nevoflux_protocol::ExecutionTier) {
         *self.execution_tier.write().unwrap() = tier;
     }
@@ -237,16 +262,36 @@ impl McpToolBridge {
         tool_name: &str,
         arguments_summary: &str,
     ) -> PermissionResponse {
-        // Tier-based auto-approve: same classifier the native gate uses, so the
-        // ACP path honors the "Agent execution" setting instead of a fixed
-        // read-only-only list.
-        if nevoflux_protocol::tier_auto_approves(tool_name, *self.execution_tier.read().unwrap()) {
-            return PermissionResponse::AllowOnce;
-        }
+        let tier_auto =
+            nevoflux_protocol::tier_auto_approves(tool_name, *self.execution_tier.read().unwrap());
+        let always = self.is_always_allowed(tool_name);
 
-        // Check always-allow list
-        if self.is_always_allowed(tool_name) {
-            return PermissionResponse::AllowAlways;
+        // The tightener first: a flagged call skips the tier and the cache.
+        let tightener = self.tightener.read().unwrap().clone();
+        let must_ask = match tightener {
+            Some(t) => {
+                t(
+                    tool_name.to_string(),
+                    arguments_summary.to_string(),
+                    tier_auto || always,
+                )
+                .await
+            }
+            None => false,
+        };
+
+        if !must_ask {
+            // Tier-based auto-approve: same classifier the native gate uses,
+            // so the ACP path honors the "Agent execution" setting instead of
+            // a fixed read-only-only list.
+            if tier_auto {
+                return PermissionResponse::AllowOnce;
+            }
+
+            // Check always-allow list
+            if always {
+                return PermissionResponse::AllowAlways;
+            }
         }
 
         // Try to send to sidebar for user decision
@@ -263,6 +308,7 @@ impl McpToolBridge {
                 tool_name: tool_name.to_string(),
                 arguments_summary: arguments_summary.to_string(),
                 result_tx,
+                must_ask,
             })
             .await
             .is_err()
@@ -277,6 +323,8 @@ impl McpToolBridge {
         // conversation that simply stops replying with nothing logged.
         // Rejecting is the safe direction — it denies rather than grants.
         match tokio::time::timeout(PERMISSION_TIMEOUT, result_rx).await {
+            // A flagged call is allowed once at most, never cached.
+            Ok(Ok(PermissionResponse::AllowAlways)) if must_ask => PermissionResponse::AllowOnce,
             Ok(Ok(response)) => {
                 if response == PermissionResponse::AllowAlways {
                     self.add_always_allowed(tool_name);
@@ -350,6 +398,83 @@ mod tests {
         assert_eq!(
             bridge.request_permission("web_fetch", "{}").await,
             PermissionResponse::AllowOnce
+        );
+    }
+
+    fn always_flag() -> Tightener {
+        Arc::new(|_tool, _args, _would_auto| Box::pin(async { true }))
+    }
+
+    /// A call Jev flagged is put to the user even when the tier and the
+    /// always-allow cache would pass it, and the answer is never cached.
+    #[tokio::test]
+    async fn a_flagged_call_skips_tier_and_always_allow() {
+        let bridge = Arc::new(McpToolBridge::new());
+        bridge.set_execution_tier(nevoflux_protocol::ExecutionTier::FullAuto);
+        bridge.set_tightener(Some(always_flag()));
+        let (tx, mut rx) = mpsc::channel(1);
+        bridge.set_permission_handler(tx);
+
+        // Full-auto would pass it: the user is asked, and "always" is not kept.
+        let b = bridge.clone();
+        let call =
+            tokio::spawn(async move { b.request_permission("run_command", "rm -rf ~/x").await });
+        let req = rx.recv().await.expect("the user is asked");
+        assert!(req.must_ask);
+        req.result_tx.send(PermissionResponse::AllowAlways).unwrap();
+        assert_eq!(call.await.unwrap(), PermissionResponse::AllowOnce);
+        assert!(!bridge.is_always_allowed("run_command"), "never cached");
+
+        // An earlier "always allow" does not pass it either.
+        bridge.add_always_allowed("run_command");
+        let b = bridge.clone();
+        let call = tokio::spawn(async move { b.request_permission("run_command", "x").await });
+        let req = rx.recv().await.expect("asked despite always-allow");
+        req.result_tx.send(PermissionResponse::Reject).unwrap();
+        assert_eq!(call.await.unwrap(), PermissionResponse::Reject);
+    }
+
+    #[tokio::test]
+    async fn a_flagged_call_with_no_handler_is_rejected() {
+        let bridge = McpToolBridge::new();
+        bridge.set_execution_tier(nevoflux_protocol::ExecutionTier::FullAuto);
+        bridge.set_tightener(Some(always_flag()));
+        assert_eq!(
+            bridge.request_permission("run_command", "x").await,
+            PermissionResponse::Reject
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tightener_that_says_no_changes_nothing() {
+        let bridge = McpToolBridge::new();
+        bridge.set_execution_tier(nevoflux_protocol::ExecutionTier::FullAuto);
+        bridge.set_tightener(Some(Arc::new(|_t, _a, _w| Box::pin(async { false }))));
+        assert_eq!(
+            bridge.request_permission("run_command", "x").await,
+            PermissionResponse::AllowOnce
+        );
+    }
+
+    /// The tightener is told whether the gate would have let the call through.
+    #[tokio::test]
+    async fn the_tightener_learns_whether_the_gate_would_pass_the_call() {
+        let bridge = McpToolBridge::new();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s = seen.clone();
+        bridge.set_tightener(Some(Arc::new(move |t, _a, w| {
+            s.lock().unwrap().push((t, w));
+            Box::pin(async { false })
+        })));
+        bridge.add_always_allowed("write_file");
+        let _ = bridge.request_permission("write_file", "x").await;
+        let _ = bridge.request_permission("run_command", "x").await;
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                ("write_file".to_string(), true),
+                ("run_command".to_string(), false)
+            ]
         );
     }
 

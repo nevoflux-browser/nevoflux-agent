@@ -4258,6 +4258,17 @@ async fn stream_acp_completion(
             // override) from config and hand it to the bridge.
             tool_bridge.set_execution_tier(crate::agent_host::resolve_execution_tier(&services));
             let is_iteration = services.is_iteration;
+            // Jev can require a confirmation the tier or cache would skip
+            // (spec §5.7, J14). Nobody to ask: the iteration handler or the
+            // missing handler refuses a flagged call.
+            tool_bridge.set_tightener(services.agent_config.clone().and_then(|cfg| {
+                crate::jev::permission::acp_tightener(
+                    cfg,
+                    services.database.clone(),
+                    services.session_id.clone(),
+                    is_iteration || services.browser_context().is_none(),
+                )
+            }));
             if let Some(browser_ctx) = services.browser_context() {
                 tokio::spawn(crate::wasm::mcp_tool_executor::run_permission_handler(
                     perm_rx,

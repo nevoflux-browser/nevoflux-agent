@@ -118,6 +118,44 @@ pub fn unattended_message(tool: &str) -> String {
     )
 }
 
+/// The ACP gate's tightener (spec §5.7, J14), or `None` with the
+/// permissions point off. It asks Jev about a call the gate would pass
+/// without asking (`unattended` runs auto-approve everything, so they count
+/// as such), and logs each flag.
+pub fn acp_tightener(
+    cfg: Arc<crate::config::AgentConfig>,
+    db: Arc<nevoflux_storage::Database>,
+    session_id: String,
+    unattended: bool,
+) -> Option<nevoflux_llm::providers::acp::mcp_bridge::Tightener> {
+    if !permissions_point_on(&cfg) {
+        return None;
+    }
+    Some(Arc::new(
+        move |tool: String, args: String, would_auto: bool| {
+            let (cfg, db, session_id) = (cfg.clone(), db.clone(), session_id.clone());
+            Box::pin(async move {
+                if !should_assess(&tool, would_auto || unattended) {
+                    return false;
+                }
+                match assess(&cfg, &db, &session_id, None, &tool, &args, None).await {
+                    Some(p) if p >= RISK_P => {
+                        SessionEventWriter::new(db, session_id).append(
+                            SessionEventPayload::PermissionJev {
+                                tool,
+                                p,
+                                unattended,
+                            },
+                        );
+                        true
+                    }
+                    _ => false,
+                }
+            })
+        },
+    ))
+}
+
 /// Jev's risk for a call, or `None` (point off, fallback, no answer).
 #[allow(clippy::too_many_arguments)]
 pub async fn assess(
@@ -276,6 +314,62 @@ mod tests {
             assess(&c, &db, "s1", None, "run_command", "rm -rf ~/x", None).await,
             None
         );
+    }
+
+    #[test]
+    fn the_acp_tightener_is_absent_with_the_point_off() {
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        let off = std::sync::Arc::new(crate::config::AgentConfig::default());
+        assert!(acp_tightener(off, db, "s1".into(), false).is_none());
+    }
+
+    #[tokio::test]
+    async fn the_acp_tightener_flags_a_risky_call_and_logs_it() {
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        let (url, bodies) = answering(
+            json!({"answers": {"risk": {"noul": 0.9}}, "usage": {"input_tokens": 1, "output_tokens": 1}}),
+            Duration::ZERO,
+        )
+        .await;
+        let attended = acp_tightener(
+            std::sync::Arc::new(cfg(&url)),
+            db.clone(),
+            "s1".into(),
+            false,
+        )
+        .expect("point on");
+        assert!(
+            !attended("run_command".into(), "x".into(), false).await,
+            "asked anyway"
+        );
+        assert!(
+            !attended("browser_get_markdown".into(), "".into(), true).await,
+            "read-only"
+        );
+        assert!(bodies.lock().unwrap().is_empty());
+        // Unattended runs auto-approve everything, so every call is assessed.
+        let t = acp_tightener(
+            std::sync::Arc::new(cfg(&url)),
+            db.clone(),
+            "s1".into(),
+            true,
+        )
+        .expect("point on");
+        assert!(t("run_command".into(), "rm -rf ~".into(), false).await);
+        let logged: Vec<_> = nevoflux_storage::repositories::SessionEventRepository::new(&db)
+            .list("s1")
+            .unwrap()
+            .into_iter()
+            .filter(|e| matches!(e.payload, SessionEventPayload::PermissionJev { .. }))
+            .collect();
+        assert_eq!(logged.len(), 1);
+        assert!(matches!(
+            logged[0].payload,
+            SessionEventPayload::PermissionJev {
+                unattended: true,
+                ..
+            }
+        ));
     }
 
     #[test]

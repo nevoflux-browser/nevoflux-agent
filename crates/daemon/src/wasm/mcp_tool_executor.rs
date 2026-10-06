@@ -72,6 +72,11 @@ pub async fn run_permission_handler(
     is_iteration: bool,
 ) {
     while let Some(req) = rx.recv().await {
+        // Jev flagged it (spec §5.7, J14) and nobody is there to confirm.
+        if req.must_ask && is_iteration {
+            let _ = req.result_tx.send(PermissionResponse::Reject);
+            continue;
+        }
         if is_iteration {
             tracing::debug!(
                 "iteration auto-approve for {} (proxy_id empty, no sidebar)",
@@ -82,16 +87,28 @@ pub async fn run_permission_handler(
         }
 
         let description = describe_tool_action(&req.tool_name, &req.arguments_summary);
-        let question = format!(
-            "AI wants to perform an action:\n\n{}\n\nDo you want to allow this?",
-            description
-        );
-
-        let options = vec![
-            "Allow".to_string(),
-            "Always allow this type of action".to_string(),
-            "Deny".to_string(),
-        ];
+        // A flagged call is allowed once at most: no "always".
+        let (question, options) = if req.must_ask {
+            (
+                format!(
+                    "Jev flagged this action as risky:\n\n{}\n\nDo you want to allow it?",
+                    description
+                ),
+                vec!["Allow".to_string(), "Deny".to_string()],
+            )
+        } else {
+            (
+                format!(
+                    "AI wants to perform an action:\n\n{}\n\nDo you want to allow this?",
+                    description
+                ),
+                vec![
+                    "Allow".to_string(),
+                    "Always allow this type of action".to_string(),
+                    "Deny".to_string(),
+                ],
+            )
+        };
 
         // Use browser_ask_user to show dialog in sidebar
         let response = execute_ask_user(&question, &description, &options, &browser_ctx).await;
@@ -3548,6 +3565,71 @@ mod tests {
 
         let events = events_of(&db, "sess-who");
         assert_eq!(events[0]["origin"], "mcp");
+    }
+
+    fn flagged(
+        tool: &str,
+    ) -> (
+        PermissionRequest,
+        tokio::sync::oneshot::Receiver<PermissionResponse>,
+    ) {
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        (
+            PermissionRequest {
+                tool_name: tool.into(),
+                arguments_summary: "{}".into(),
+                result_tx,
+                must_ask: true,
+            },
+            result_rx,
+        )
+    }
+
+    fn browser_ctx_with(
+        sender: crate::wasm::services::BrowserSender,
+    ) -> crate::wasm::services::BrowserContext {
+        let db = Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        HostServices::new(db)
+            .with_browser_sender(sender)
+            .browser_context()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_unattended_handler_refuses_a_flagged_call() {
+        let (btx, _brx) = tokio::sync::mpsc::channel(1);
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(run_permission_handler(rx, browser_ctx_with(btx), true));
+        let (req, result) = flagged("run_command");
+        tx.send(req).await.unwrap();
+        assert_eq!(result.await.unwrap(), PermissionResponse::Reject);
+    }
+
+    #[tokio::test]
+    async fn a_flagged_call_is_offered_allow_or_deny_only() {
+        let (btx, mut brx) = tokio::sync::mpsc::channel(1);
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(run_permission_handler(rx, browser_ctx_with(btx), false));
+        let (req, result) = flagged("run_command");
+        tx.send(req).await.unwrap();
+        let (asked, reply) = brx.recv().await.unwrap();
+        assert_eq!(
+            asked.params["options"],
+            serde_json::json!(["Allow", "Deny"])
+        );
+        assert!(asked.params["question"]
+            .as_str()
+            .unwrap()
+            .contains("flagged"));
+        reply
+            .send(crate::wasm::services::BrowserResponse {
+                request_id: asked.request_id,
+                success: true,
+                result: Some(serde_json::json!({"answer": "Allow"})),
+                error: None,
+            })
+            .unwrap();
+        assert_eq!(result.await.unwrap(), PermissionResponse::AllowOnce);
     }
 
     #[test]
