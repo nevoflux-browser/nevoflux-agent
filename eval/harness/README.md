@@ -434,6 +434,35 @@ and turns where the model then loaded a different skill itself
   a blocking lock, and turn start runs on the async runtime. It is now read
   through `block_in_place`.
 
+## Jev P2-6 (permissions, J14), 2026-10-06
+
+Agent `feat/jev-p2-6-permissions`, behind `[jev.points] permissions`
+(default off). With it off, the pipeline and both permission gates are
+unchanged. Two parts:
+
+- **A deterministic policy stage** in the tool pipeline, after the site
+  rules. It asks before destructive shell commands (`rm -rf ~`,
+  `curl … | sh`, `git push --force`, `mkfs`, …), writes to credential or
+  startup files (`.ssh/`, `.aws/`, `.bashrc`, the agent's own
+  `config.toml`, …) and page scripts that read cookies or storage. It never
+  denies, and it needs no network. Unattended, its ask is a
+  `CONFIRMATION_REQUIRED` refusal, like any other.
+- **Jev at the front of both permission gates**: the native
+  `check_tool_permission`, and the ACP bridge through a tightener the daemon
+  injects. Jev is asked only about a call the gate would let through without
+  asking (tier, always-allow, an unattended run, no UI), and never about a
+  read-only tool. A risk ≥ 0.7 means the user is asked Allow/Deny, with no
+  "always" and the cache ignored. With nobody to ask, the call is refused
+  with a recoverable message. A Jev fallback never tightens. ACP is covered;
+  on-device providers and the local-only latch send nothing.
+
+`permission/jev{tool, p, unattended}` logs each flag, and
+`jev_summary.permissions` counts flags and unattended refusals.
+
+**No end-to-end run**: the fake model cannot answer a real dialog. The unit
+tests cover both gates (flagged, low risk, Jev down, read-only, point off,
+unattended).
+
 ## Known gaps
 
 - Agent-loop tasks have no deadline on the daemon side: `wall_clock_secs`

@@ -142,6 +142,17 @@ class JevSummaryTest(unittest.TestCase):
         j = summarize([r])["jev"]
         self.assertEqual(j["skills"], {"injected": 2, "other_loaded": 1})
 
+    def test_jev_summary_counts_permission_flags(self):
+        log = "\n".join([
+            ev(type="turn/start", turn=1),
+            ev(type="permission/jev", tool="run_command", p=0.9, unattended=True),
+            ev(type="permission/jev", tool="write", p=0.8, unattended=False),
+            ev(type="turn/end", turn=1),
+        ])
+        r = row(0, "a", True)
+        r["session_jsonl"] = log
+        self.assertEqual(summarize([r])["jev"]["permissions"], {"flagged": 2, "unattended": 1})
+
     def test_no_jev_events_gives_empty_numbers(self):
         j = summarize([row(0, "a", True)])["jev"]
         self.assertEqual((j["signals"], j["h_mae"], j["h_bias"]), (0, None, None))
