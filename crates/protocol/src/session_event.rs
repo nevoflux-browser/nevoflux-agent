@@ -373,6 +373,18 @@ pub enum SessionEventPayload {
         #[serde(default)]
         elapsed_ms: u64,
     },
+    /// Jev flagged a tool call as risky, so it needed the user's
+    /// confirmation (spec §5.7, J14).
+    #[serde(rename = "permission/jev")]
+    PermissionJev {
+        /// The tool called.
+        tool: String,
+        /// Jev's probability that the call could do harm the user did not
+        /// ask for.
+        p: f64,
+        /// Nobody could confirm, so the call was refused.
+        unattended: bool,
+    },
 }
 
 impl SessionEventPayload {
@@ -405,6 +417,7 @@ impl SessionEventPayload {
             Self::ContextRebuild { .. } => "context/rebuild",
             Self::ToolsSelect { .. } => "tools/select",
             Self::SkillInject { .. } => "skills/inject",
+            Self::PermissionJev { .. } => "permission/jev",
         }
     }
 }
@@ -536,6 +549,19 @@ mod tests {
         assert_eq!(p.type_str(), "context/correction");
         let back: SessionEventPayload = serde_json::from_value(v).unwrap();
         assert_eq!(back, p);
+    }
+
+    #[test]
+    fn permission_jev_wire_shape() {
+        let p = SessionEventPayload::PermissionJev {
+            tool: "run_command".into(),
+            p: 0.9,
+            unattended: true,
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["type"], "permission/jev");
+        assert_eq!(p.type_str(), "permission/jev");
+        assert_eq!(serde_json::from_value::<SessionEventPayload>(v).unwrap(), p);
     }
 
     #[test]

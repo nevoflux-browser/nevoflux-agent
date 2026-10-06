@@ -5,6 +5,7 @@ pub mod economics;
 pub mod export;
 pub mod history;
 pub mod oracle;
+pub mod permission;
 pub mod privacy;
 pub mod rebuild;
 pub mod render;
