@@ -4,10 +4,74 @@ python -m eval.harness.calibrate eval/results/baseline-j20/trials.jsonl
 """
 
 import json
+import math
 import statistics
 import sys
 
 MISSING = {"harness_error", "timeout", "provider_error"}
+
+
+# Effective cost C (v1.4 §10.4) in equivalent input tokens: the Anthropic
+# wire's cache weights (`economics::cache_rate`), output at 5x, and Jev's
+# tokens priced like the main model's (TypeSafe's price is unknown; this
+# counts against Jev).
+DEFAULT_WEIGHTS = {"input": 1.0, "cache_write": 1.25, "cache_read": 0.1, "output": 5.0,
+                   "jev_input": 1.0, "jev_output": 5.0}
+
+
+def effective_cost(row, weights=DEFAULT_WEIGHTS) -> float:
+    """Effective cost C of one trial (v1.4 §10.4), in equivalent input tokens:
+    uncached input, cache writes and reads, output, and Jev's tokens."""
+    w = weights
+    c = 0.0
+    for u in row.get("usage") or []:
+        for b in (u.get("main"), u.get("subagent")):
+            if not b:
+                continue
+            read = b.get("cache_read") or 0
+            write = b.get("cache_write") or 0
+            fresh = max(0, b.get("input", 0) - read - write)
+            c += (fresh * w["input"] + write * w["cache_write"] + read * w["cache_read"]
+                  + b.get("output", 0) * w["output"])
+        j = u.get("jev") or {}
+        c += j.get("input", 0) * w["jev_input"] + j.get("output", 0) * w["jev_output"]
+    return c
+
+
+def step_waits(row) -> list:
+    """Milliseconds the loop blocked on Jev (`jev/wait`), per step (spec §6:
+    over all steps, a quiet step is 0). A wait goes to the step it happened
+    in; one before a turn's first step (the turn-start choice) goes to that
+    step; one with no step after it counts as a step of its own."""
+    steps, cur, pending = [], None, 0
+    for line in (row.get("session_jsonl") or "").splitlines():
+        if not line.strip():
+            continue
+        e = json.loads(line)
+        t = e.get("type")
+        if t == "turn/start":
+            cur = None
+        elif t == "step/start":
+            steps.append(pending)
+            pending = 0
+            cur = len(steps) - 1
+        elif t == "jev/wait":
+            if cur is None:
+                pending += e.get("ms", 0)
+            else:
+                steps[cur] += e.get("ms", 0)
+    if pending:
+        steps.append(pending)
+    return steps
+
+
+def percentile(values, q):
+    """Nearest-rank percentile (q in 0..100); None for no values."""
+    if not values:
+        return None
+    v = sorted(values)
+    k = max(0, min(len(v) - 1, math.ceil(q / 100 * len(v)) - 1))
+    return v[k]
 
 
 def jev_summary(rows) -> dict:
@@ -123,9 +187,16 @@ def summarize(rows) -> dict:
     buckets = [b for u in turns for b in (u.get("main"), u.get("subagent")) if b]
     missing = sum(r["status"] in MISSING for r in rows) / len(rows) if rows else 0.0
     total_input = sum(b.get("input", 0) for b in buckets)
+    costs = [effective_cost(r) for r in rows]
+    waits = [ms for r in rows for ms in step_waits(r)]
     cache_read = sum(b.get("cache_read") or 0 for b in buckets)
     return {
         "jev": jev_summary(rows),
+        "effective_cost": {"per_trial": statistics.mean(costs) if costs else 0.0,
+                           "total": sum(costs)},
+        "jev_wait": {"steps": len(waits), "p50": percentile(waits, 50),
+                     "p90": percentile(waits, 90),
+                     "mean": statistics.mean(waits) if waits else None},
         "per_rep_score": per_rep,
         "mean": statistics.mean(per_rep) if per_rep else 0.0,
         "sd": sd,

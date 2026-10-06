@@ -153,6 +153,59 @@ class JevSummaryTest(unittest.TestCase):
         r["session_jsonl"] = log
         self.assertEqual(summarize([r])["jev"]["permissions"], {"flagged": 2, "unattended": 1})
 
+    def test_effective_cost_weights_each_kind_of_token(self):
+        from eval.harness.calibrate import DEFAULT_WEIGHTS, effective_cost
+        r = {"usage": [
+            {"main": {"input": 1000, "output": 10, "cache_read": 600, "cache_write": 200},
+             "subagent": {"input": 100, "output": 0},
+             "jev": {"input": 50, "output": 2, "calls": 1}},
+        ]}
+        # main: (1000-600-200)*1 + 200*1.25 + 600*0.1 + 10*5 = 200+250+60+50 = 560
+        # subagent: 100; jev: 50*1 + 2*5 = 60
+        self.assertAlmostEqual(effective_cost(r), 720.0)
+        no_jev = {**DEFAULT_WEIGHTS, "jev_input": 0.0, "jev_output": 0.0}
+        self.assertAlmostEqual(effective_cost(r, no_jev), 660.0)
+
+    def test_step_waits_land_on_their_step_and_count_quiet_steps_as_zero(self):
+        from eval.harness.calibrate import step_waits
+        log = "\n".join([
+            ev(type="jev/wait", site="turn_start", ms=700),   # before the turn: goes to its first step
+            ev(type="turn/start", turn=1),
+            ev(type="step/start", step=1, turn=1),
+            ev(type="jev/wait", site="visibility", ms=300),
+            ev(type="jev/wait", site="signals", ms=20),
+            ev(type="step/start", step=2, turn=1),
+            ev(type="step/start", step=3, turn=1),
+            ev(type="turn/end", turn=1),
+        ])
+        self.assertEqual(step_waits({"session_jsonl": log}), [1020, 0, 0])
+
+    def test_waits_with_no_following_step_still_count(self):
+        from eval.harness.calibrate import step_waits
+        log = "\n".join([
+            ev(type="jev/wait", site="turn_start", ms=900),
+            ev(type="turn/start", turn=1),
+            ev(type="turn/end", turn=1),
+        ])
+        self.assertEqual(step_waits({"session_jsonl": log}), [900])
+
+    def test_summary_reports_cost_and_wait_percentiles(self):
+        log = "\n".join([
+            ev(type="turn/start", turn=1),
+            ev(type="step/start", step=1, turn=1),
+            ev(type="jev/wait", site="visibility", ms=400),
+            ev(type="step/start", step=2, turn=1),
+            ev(type="step/start", step=3, turn=1),
+            ev(type="turn/end", turn=1),
+        ])
+        r = row(0, "a", True, inp=100)
+        r["session_jsonl"] = log
+        s = summarize([r])
+        self.assertAlmostEqual(s["effective_cost"]["per_trial"], 100 + 10 * 5)
+        self.assertEqual(s["jev_wait"]["steps"], 3)
+        self.assertEqual(s["jev_wait"]["p50"], 0)
+        self.assertEqual(s["jev_wait"]["p90"], 400)
+
     def test_no_jev_events_gives_empty_numbers(self):
         j = summarize([row(0, "a", True)])["jev"]
         self.assertEqual((j["signals"], j["h_mae"], j["h_bias"]), (0, None, None))
