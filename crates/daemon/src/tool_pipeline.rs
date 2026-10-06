@@ -42,6 +42,7 @@
 pub mod allowlist;
 pub mod canvas_gate;
 pub mod pack_hook_stage;
+pub mod policy;
 pub mod site_policy;
 
 use nevoflux_builtin_wasm::{ToolCall, ToolContext, ToolDenial, ToolGate};
@@ -74,7 +75,14 @@ fn shared_hooks() -> &'static pack_hook_stage::HookRegistry {
 /// `active_packs` are the packs this session has activated: their `installed`
 /// -scope rules apply either way, their `active`-scope rules only while they
 /// are in here.
-pub fn default_pipeline(packs_dir: &std::path::Path, active_packs: &[String]) -> Pipeline {
+///
+/// `policy_on` adds the deterministic permission policy (spec §5.7, J14)
+/// after the site rules; it is the permissions point, off by default.
+pub fn default_pipeline(
+    packs_dir: &std::path::Path,
+    active_packs: &[String],
+    policy_on: bool,
+) -> Pipeline {
     // Read `active`-scope rules fresh rather than from the cache: activation
     // changes within a session, which is the one change an mtime cannot see.
     let mut rules = shared_rules().get(packs_dir);
@@ -84,11 +92,13 @@ pub fn default_pipeline(packs_dir: &std::path::Path, active_packs: &[String]) ->
     // not, so a call a rule already refuses never pays for one.
     let hooks = shared_hooks().for_session(packs_dir, active_packs);
 
-    Pipeline::new(vec![
-        Box::new(site_policy::SitePolicyStage::new(rules)),
-        Box::new(pack_hook_stage::PackHookStage::new(hooks)),
-        Box::new(allowlist::AllowlistStage),
-    ])
+    let mut stages: Vec<Box<dyn Stage>> = vec![Box::new(site_policy::SitePolicyStage::new(rules))];
+    if policy_on {
+        stages.push(Box::new(policy::PolicyStage));
+    }
+    stages.push(Box::new(pack_hook_stage::PackHookStage::new(hooks)));
+    stages.push(Box::new(allowlist::AllowlistStage));
+    Pipeline::new(stages)
 }
 
 /// What one stage decides about a call.
@@ -405,9 +415,32 @@ mod tests {
         // is all this assertion needs: the stages are present either way.
         let no_packs = std::path::Path::new("this-directory-does-not-exist");
         assert_eq!(
-            default_pipeline(no_packs, &[]).stage_names(),
+            default_pipeline(no_packs, &[], false).stage_names(),
             vec!["site_policy", "pack_hooks", "allowlist"],
         );
+        assert_eq!(
+            default_pipeline(no_packs, &[], true).stage_names(),
+            vec!["site_policy", "policy", "pack_hooks", "allowlist"],
+        );
+    }
+
+    #[test]
+    fn an_unattended_run_refuses_what_the_policy_would_ask() {
+        let p = default_pipeline(
+            std::path::Path::new("this-directory-does-not-exist"),
+            &[],
+            true,
+        );
+        let call = ToolCall {
+            id: "t".into(),
+            call_id: None,
+            name: "bash".into(),
+            arguments: serde_json::json!({"command": "rm -rf ~/x"}),
+            signature: None,
+        };
+        let gate = p.run(&call, &a_context(true), &never_asked);
+        assert!(matches!(gate, ToolGate::Deny(d)
+            if d.code == "CONFIRMATION_REQUIRED" && d.rule.as_deref() == Some("policy")));
     }
 
     #[test]

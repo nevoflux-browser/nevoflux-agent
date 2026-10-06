@@ -2595,7 +2595,8 @@ impl HostFunctions for DaemonHostFunctions {
                     .map(|g| g.iter().cloned().collect())
             })
             .unwrap_or_default();
-        crate::tool_pipeline::default_pipeline(&packs_dir, &active).run(
+        let policy_on = crate::jev::permission::policy_on(&self.config);
+        crate::tool_pipeline::default_pipeline(&packs_dir, &active, policy_on).run(
             call,
             ctx,
             &|prompt: &str| self.ask_user_allow(prompt),

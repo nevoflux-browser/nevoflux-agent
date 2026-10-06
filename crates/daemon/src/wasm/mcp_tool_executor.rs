@@ -471,7 +471,11 @@ pub async fn execute_mcp_tool(
         .read()
         .map(|g| g.iter().cloned().collect())
         .unwrap_or_default();
-    let gate = crate::tool_pipeline::default_pipeline(&packs_dir, &active).run(
+    let policy_on = services
+        .agent_config
+        .as_deref()
+        .is_some_and(crate::jev::permission::policy_on);
+    let gate = crate::tool_pipeline::default_pipeline(&packs_dir, &active, policy_on).run(
         &call,
         &ctx,
         &|prompt: &str| ask_user_allow_blocking(services, prompt),
