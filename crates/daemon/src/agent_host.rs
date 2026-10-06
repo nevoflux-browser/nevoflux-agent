@@ -726,12 +726,10 @@ impl DaemonHostFunctions {
             .session_id
             .clone()
             .unwrap_or_else(|| services.session_id.clone());
-        let page_url = self
-            .last_navigated_domain
-            .lock()
-            .ok()
-            .and_then(|d| d.clone())
-            .map(|d| format!("https://{d}/"));
+        // No page URL: the last navigated domain goes stale after a click or
+        // a tab switch, and a stale ordinary domain would send a sensitive
+        // page's data in full. Page-bound tools go as metadata only.
+        let page_url: Option<String> = None;
         let (cfg, db, stats) = (
             self.config.clone(),
             services.database.clone(),
@@ -9939,7 +9937,58 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_flagged_call_is_asked_even_under_full_auto() {
+    async fn a_flagged_call_is_asked_allow_or_deny_even_under_full_auto() {
+        let (url, _) =
+            crate::jev::test_support::answering(risk(0.9), std::time::Duration::ZERO).await;
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        nevoflux_storage::ConfigRepository::new(&db)
+            .set(
+                "config:settings",
+                serde_json::json!({"general": {"agentExecution": "full-auto"}}),
+            )
+            .unwrap();
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.llm.provider = Some("anthropic".into());
+        cfg.jev.enabled = true;
+        cfg.jev.endpoint = url.to_string();
+        cfg.jev.api_key = "k".into();
+        cfg.jev.timeout_ms = 2000;
+        cfg.jev.points.permissions = true;
+        let (btx, mut brx) = tokio::sync::mpsc::channel(1);
+        let host = super::DaemonHostFunctions::new(
+            std::sync::Arc::new(cfg),
+            tokio::runtime::Handle::current(),
+        )
+        .with_services(crate::wasm::services::HostServices::new(db).with_browser_sender(btx))
+        .with_session_id("s1");
+        let answer = tokio::spawn(async move {
+            let (req, reply) = brx.recv().await.unwrap();
+            let options = req.params["options"].clone();
+            reply
+                .send(crate::wasm::services::BrowserResponse {
+                    request_id: req.request_id,
+                    success: true,
+                    result: Some(serde_json::json!({"answer": "Allow"})),
+                    error: None,
+                })
+                .unwrap();
+            options
+        });
+        host.check_tool_permission("run_command", "rm -rf ~/Downloads")
+            .unwrap();
+        assert_eq!(answer.await.unwrap(), serde_json::json!(["Allow", "Deny"]));
+        assert!(host
+            .services
+            .as_ref()
+            .unwrap()
+            .always_allowed_tools
+            .read()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_always_allowed_unattended_flagged_call_is_refused() {
         // Always-allowed and unattended (nobody answers): the flag is decided
         // before the tier and the always-allow cache are looked at.
         let (url, _) =

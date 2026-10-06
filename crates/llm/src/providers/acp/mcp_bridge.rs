@@ -268,6 +268,10 @@ impl McpToolBridge {
 
         // The tightener first: a flagged call skips the tier and the cache.
         let tightener = self.tightener.read().unwrap().clone();
+        // With a tightener, "always" stays on this side: an agent told
+        // `allow_always` keeps its own cache and stops asking, so a later
+        // call would never reach the tightener.
+        let tightened = tightener.is_some();
         let must_ask = match tightener {
             Some(t) => {
                 t(
@@ -290,7 +294,11 @@ impl McpToolBridge {
 
             // Check always-allow list
             if always {
-                return PermissionResponse::AllowAlways;
+                return if tightened {
+                    PermissionResponse::AllowOnce
+                } else {
+                    PermissionResponse::AllowAlways
+                };
             }
         }
 
@@ -325,12 +333,15 @@ impl McpToolBridge {
         match tokio::time::timeout(PERMISSION_TIMEOUT, result_rx).await {
             // A flagged call is allowed once at most, never cached.
             Ok(Ok(PermissionResponse::AllowAlways)) if must_ask => PermissionResponse::AllowOnce,
-            Ok(Ok(response)) => {
-                if response == PermissionResponse::AllowAlways {
-                    self.add_always_allowed(tool_name);
+            Ok(Ok(PermissionResponse::AllowAlways)) => {
+                self.add_always_allowed(tool_name);
+                if tightened {
+                    PermissionResponse::AllowOnce
+                } else {
+                    PermissionResponse::AllowAlways
                 }
-                response
             }
+            Ok(Ok(response)) => response,
             Ok(Err(_)) => {
                 tracing::warn!(
                     "Permission response channel dropped, rejecting {}",
@@ -432,6 +443,29 @@ mod tests {
         let req = rx.recv().await.expect("asked despite always-allow");
         req.result_tx.send(PermissionResponse::Reject).unwrap();
         assert_eq!(call.await.unwrap(), PermissionResponse::Reject);
+    }
+
+    /// The agent keeps its own always-allow and would stop asking: while a
+    /// tightener is set, "always" stays on this side and the agent is told
+    /// "once", so every call comes back through the gate.
+    #[tokio::test]
+    async fn with_a_tightener_the_agent_is_never_told_always() {
+        let bridge = Arc::new(McpToolBridge::new());
+        bridge.set_tightener(Some(Arc::new(|_t, _a, _w| Box::pin(async { false }))));
+        bridge.add_always_allowed("run_command");
+        assert_eq!(
+            bridge.request_permission("run_command", "x").await,
+            PermissionResponse::AllowOnce
+        );
+        let (tx, mut rx) = mpsc::channel(1);
+        bridge.set_permission_handler(tx);
+        let b = bridge.clone();
+        let call = tokio::spawn(async move { b.request_permission("write_file", "x").await });
+        let req = rx.recv().await.expect("asked");
+        assert!(!req.must_ask);
+        req.result_tx.send(PermissionResponse::AllowAlways).unwrap();
+        assert_eq!(call.await.unwrap(), PermissionResponse::AllowOnce);
+        assert!(bridge.is_always_allowed("write_file"), "kept on this side");
     }
 
     #[tokio::test]

@@ -110,6 +110,12 @@ pub fn turn_query(events: &[SessionEvent]) -> String {
         .unwrap_or_default()
 }
 
+/// Tools whose arguments come from, or go into, a page or the screen.
+fn page_bound(tool: &str) -> bool {
+    let bare = tool.rsplit("__").next().unwrap_or(tool);
+    bare.starts_with("browser_") || bare.starts_with("computer_")
+}
+
 /// What the model is told when a flagged call cannot be confirmed.
 pub fn unattended_message(tool: &str) -> String {
     format!(
@@ -185,8 +191,13 @@ pub async fn assess(
     let domain = page_url
         .and_then(|u| reqwest::Url::parse(u).ok())
         .and_then(|u| u.host_str().map(str::to_string));
+    // Browser and computer arguments carry page data (typed text, page
+    // copies): with no reliably known page they go as metadata only — the
+    // question still names the tool (spec §5.8). Shell and file arguments
+    // are not page data.
     let ctx = match page_url {
         Some(u) => OracleContext::page("permissions", u, timeout),
+        None if page_bound(tool) => OracleContext::unknown_page("permissions", timeout),
         None => OracleContext::no_page("permissions", timeout),
     };
     match oracle
@@ -370,6 +381,55 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn page_bound_arguments_with_no_known_page_are_not_sent() {
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        let (url, bodies) = answering(
+            json!({"answers": {"risk": {"noul": 0.1}}, "usage": {"input_tokens": 1, "output_tokens": 1}}),
+            Duration::ZERO,
+        )
+        .await;
+        let c = cfg(&url);
+        assess(
+            &c,
+            &db,
+            "s1",
+            None,
+            "browser_type",
+            r#"{"text":"hunter2-secret"}"#,
+            None,
+        )
+        .await;
+        assess(
+            &c,
+            &db,
+            "s1",
+            None,
+            "computer_type_text",
+            "otp-424242",
+            None,
+        )
+        .await;
+        let sent = bodies.lock().unwrap().join("\n");
+        assert!(!sent.contains("hunter2-secret") && !sent.contains("otp-424242"));
+        assert!(
+            sent.contains("browser_type"),
+            "the question still names the tool"
+        );
+        // A shell command is not page data.
+        assess(
+            &c,
+            &db,
+            "s1",
+            None,
+            "run_command",
+            "rm -rf ~/zzz-marker",
+            None,
+        )
+        .await;
+        assert!(bodies.lock().unwrap().join("\n").contains("zzz-marker"));
     }
 
     #[test]
