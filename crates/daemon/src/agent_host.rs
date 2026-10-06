@@ -715,61 +715,97 @@ impl DaemonHostFunctions {
         parts.join("\n")
     }
 
-    /// Check if a tool requires user permission (API mode).
-    /// Low-risk read-only tools are auto-approved. Others prompt via browser_ask_user.
-    /// Session-level "Always Allow" decisions are cached.
-    fn check_tool_permission(&self, tool_name: &str, args_summary: &str) -> HostResult<()> {
-        // Need services for the execution-tier config, always-allow cache and
-        // browser_sender.
-        let Some(services) = self.services.as_ref() else {
-            // No services (e.g. unit tests) — auto-approve since there's no UI
-            return Ok(());
+    /// Jev's risk for this call, or `None` when the permissions point is
+    /// off or Jev falls back (spec §5.8: no tightening).
+    fn jev_risk(&self, tool_name: &str, args_summary: &str) -> Option<f64> {
+        if !crate::jev::permission::permissions_point_on(&self.config) {
+            return None;
+        }
+        let services = self.services.as_ref()?;
+        let session_id = self
+            .session_id
+            .clone()
+            .unwrap_or_else(|| services.session_id.clone());
+        let page_url = self
+            .last_navigated_domain
+            .lock()
+            .ok()
+            .and_then(|d| d.clone())
+            .map(|d| format!("https://{d}/"));
+        let (cfg, db, stats) = (
+            self.config.clone(),
+            services.database.clone(),
+            self.turn_stats.clone(),
+        );
+        let runtime = self.runtime.clone();
+        tokio::task::block_in_place(|| {
+            runtime.block_on(crate::jev::permission::assess(
+                &cfg,
+                &db,
+                &session_id,
+                stats,
+                tool_name,
+                args_summary,
+                page_url.as_deref(),
+            ))
+        })
+    }
+
+    /// A call Jev flagged: the user is asked Allow/Deny — never "always",
+    /// and the always-allow cache is not read or written. Nobody to ask
+    /// (unattended, or no browser UI) refuses it with a recoverable error.
+    fn ask_flagged(&self, tool_name: &str, args_summary: &str, p: f64) -> HostResult<()> {
+        let services = self.services.as_ref();
+        let browser_ctx = services
+            .filter(|s| !s.is_iteration)
+            .and_then(|s| s.browser_context());
+        if let Some(w) = self.event_writer() {
+            w.append(
+                nevoflux_protocol::session_event::SessionEventPayload::PermissionJev {
+                    tool: tool_name.to_string(),
+                    p,
+                    unattended: browser_ctx.is_none(),
+                },
+            );
+        }
+        let Some(browser_ctx) = browser_ctx else {
+            return Err(HostError {
+                code: 403,
+                message: crate::jev::permission::unattended_message(tool_name),
+            });
         };
-
-        // Tier-based auto-approve: the "Agent execution" setting
-        // (config:settings → general.agentExecution) decides which risk buckets
-        // skip the confirmation dialog. Read fresh so a mid-session tier change
-        // (e.g. per-session chip) takes effect on the next tool call. This
-        // replaces the old read-only-only gate; see nevoflux_protocol::execution_tier.
-        let tier = resolve_execution_tier(services);
-        if nevoflux_protocol::tier_auto_approves(tool_name, tier) {
-            return Ok(());
-        }
-
-        // /loop iteration: auto-approve (no sidebar to display dialog to;
-        // tool gating is via the loop's `allowed_tool_classes`).
-        if services.is_iteration {
-            return Ok(());
-        }
-
-        // Check always-allow cache (shared across requests on HostServices)
-        if services
-            .always_allowed_tools
-            .read()
-            .unwrap()
-            .contains(tool_name)
-        {
-            return Ok(());
-        }
-
-        let Some(browser_ctx) = services.browser_context() else {
-            // No browser UI available (headless mode, tests) — auto-approve
-            return Ok(());
-        };
-
         let description =
             crate::wasm::mcp_tool_executor::describe_tool_action(tool_name, args_summary);
         let question = format!(
-            "AI wants to perform an action:\n\n{}\n\nDo you want to allow this?",
+            "Jev flagged this action as risky:
+
+{}
+
+Do you want to allow it?",
             description
         );
-        let options = vec![
-            "Allow".to_string(),
-            "Always allow this type of action".to_string(),
-            "Deny".to_string(),
-        ];
+        let options = vec!["Allow".to_string(), "Deny".to_string()];
+        match self
+            .permission_dialog(&browser_ctx, question, description, options)
+            .as_deref()
+        {
+            Ok("Allow") => Ok(()),
+            _ => Err(HostError {
+                code: 403,
+                message: format!("Action '{}' denied by user", tool_name),
+            }),
+        }
+    }
 
-        // browser_ask_user via block_in_place
+    /// Put a permission question to the user through the browser and wait
+    /// for the answer (24 h).
+    fn permission_dialog(
+        &self,
+        browser_ctx: &crate::wasm::services::BrowserContext,
+        question: String,
+        description: String,
+        options: Vec<String>,
+    ) -> Result<String, String> {
         let sender = browser_ctx.sender.clone();
         let runtime = self.runtime.clone();
         let permission_session_id = self
@@ -777,7 +813,7 @@ impl DaemonHostFunctions {
             .as_ref()
             .map(|s| s.session_id.clone())
             .unwrap_or_default();
-        let result: Result<String, String> = tokio::task::block_in_place(|| {
+        tokio::task::block_in_place(|| {
             runtime.block_on(async {
                 use tokio::sync::oneshot;
                 let (response_tx, response_rx) = oneshot::channel();
@@ -826,7 +862,85 @@ impl DaemonHostFunctions {
                     Err("Permission dialog failed".to_string())
                 }
             })
-        });
+        })
+    }
+
+    /// Check if a tool requires user permission (API mode).
+    /// Low-risk read-only tools are auto-approved. Others prompt via browser_ask_user.
+    /// Session-level "Always Allow" decisions are cached.
+    fn check_tool_permission(&self, tool_name: &str, args_summary: &str) -> HostResult<()> {
+        // Need services for the execution-tier config, always-allow cache and
+        // browser_sender.
+        let Some(services) = self.services.as_ref() else {
+            // No services (e.g. unit tests) — auto-approve since there's no UI
+            return Ok(());
+        };
+
+        // Tier-based auto-approve: the "Agent execution" setting
+        // (config:settings → general.agentExecution) decides which risk buckets
+        // skip the confirmation dialog. Read fresh so a mid-session tier change
+        // (e.g. per-session chip) takes effect on the next tool call. This
+        // replaces the old read-only-only gate; see nevoflux_protocol::execution_tier.
+        let tier = resolve_execution_tier(services);
+        let tier_auto = nevoflux_protocol::tier_auto_approves(tool_name, tier);
+
+        // Jev first (spec §5.7, J14): a call the checks below would let
+        // through without asking may be flagged, and a flagged call skips
+        // the tier, the always-allow cache and the unattended auto-approve.
+        // A call they would ask about anyway is never put to Jev.
+        let would_auto = tier_auto
+            || services.is_iteration
+            || services
+                .always_allowed_tools
+                .read()
+                .unwrap()
+                .contains(tool_name)
+            || services.browser_context().is_none();
+        if crate::jev::permission::should_assess(tool_name, would_auto) {
+            if let Some(p) = self.jev_risk(tool_name, args_summary) {
+                if p >= crate::jev::permission::RISK_P {
+                    return self.ask_flagged(tool_name, args_summary, p);
+                }
+            }
+        }
+
+        if tier_auto {
+            return Ok(());
+        }
+
+        // /loop iteration: auto-approve (no sidebar to display dialog to;
+        // tool gating is via the loop's `allowed_tool_classes`).
+        if services.is_iteration {
+            return Ok(());
+        }
+
+        // Check always-allow cache (shared across requests on HostServices)
+        if services
+            .always_allowed_tools
+            .read()
+            .unwrap()
+            .contains(tool_name)
+        {
+            return Ok(());
+        }
+
+        let Some(browser_ctx) = services.browser_context() else {
+            // No browser UI available (headless mode, tests) — auto-approve
+            return Ok(());
+        };
+
+        let description =
+            crate::wasm::mcp_tool_executor::describe_tool_action(tool_name, args_summary);
+        let question = format!(
+            "AI wants to perform an action:\n\n{}\n\nDo you want to allow this?",
+            description
+        );
+        let options = vec![
+            "Allow".to_string(),
+            "Always allow this type of action".to_string(),
+            "Deny".to_string(),
+        ];
+        let result = self.permission_dialog(&browser_ctx, question, description, options);
 
         match result.as_deref() {
             Ok("Allow") => Ok(()),
@@ -9690,6 +9804,157 @@ mod tests {
         .with_session_id("sig-1")
         .with_services(crate::wasm::services::HostServices::new(db.clone()));
         (host, db)
+    }
+
+    fn permission_host(
+        url: &str,
+        timeout_ms: u64,
+        iteration: bool,
+    ) -> (
+        super::DaemonHostFunctions,
+        std::sync::Arc<nevoflux_storage::Database>,
+    ) {
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        nevoflux_storage::repositories::SessionEventRepository::new(&db)
+            .append(
+                "s1",
+                &serde_json::from_value(serde_json::json!({
+                    "type": "user/message", "content": "tidy my downloads", "origin": "user"
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.llm.provider = Some("anthropic".into());
+        cfg.jev.enabled = true;
+        cfg.jev.endpoint = url.to_string();
+        cfg.jev.api_key = "k".into();
+        cfg.jev.timeout_ms = timeout_ms;
+        cfg.jev.points.permissions = true;
+        let mut services = crate::wasm::services::HostServices::new(db.clone());
+        services.is_iteration = iteration;
+        let host = super::DaemonHostFunctions::new(
+            std::sync::Arc::new(cfg),
+            tokio::runtime::Handle::current(),
+        )
+        .with_services(services)
+        .with_session_id("s1");
+        (host, db)
+    }
+
+    fn risk(p: f64) -> serde_json::Value {
+        serde_json::json!({
+            "answers": {"risk": {"noul": p}},
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        })
+    }
+
+    fn jev_permission_events(
+        db: &nevoflux_storage::Database,
+    ) -> Vec<nevoflux_protocol::session_event::SessionEventPayload> {
+        nevoflux_storage::repositories::SessionEventRepository::new(db)
+            .list("s1")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.payload)
+            .filter(|p| {
+                matches!(
+                    p,
+                    nevoflux_protocol::session_event::SessionEventPayload::PermissionJev { .. }
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_flagged_action_with_no_one_to_ask_is_refused() {
+        let (url, _) =
+            crate::jev::test_support::answering(risk(0.9), std::time::Duration::ZERO).await;
+        let (host, db) = permission_host(&url, 2000, true);
+        let e = host
+            .check_tool_permission("run_command", "rm -rf ~/Downloads")
+            .unwrap_err();
+        assert_eq!(e.code, 403);
+        assert!(e.message.contains("nobody can confirm"), "{}", e.message);
+        assert_eq!(
+            jev_permission_events(&db),
+            vec![
+                nevoflux_protocol::session_event::SessionEventPayload::PermissionJev {
+                    tool: "run_command".into(),
+                    p: 0.9,
+                    unattended: true,
+                }
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_low_risk_action_passes_as_before() {
+        let (url, _) =
+            crate::jev::test_support::answering(risk(0.1), std::time::Duration::ZERO).await;
+        let (host, db) = permission_host(&url, 2000, true);
+        host.check_tool_permission("run_command", "ls ~/Downloads")
+            .unwrap();
+        assert!(jev_permission_events(&db).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn jev_down_never_tightens() {
+        let (url, _) =
+            crate::jev::test_support::answering(risk(0.9), std::time::Duration::from_millis(3000))
+                .await;
+        let (host, _) = permission_host(&url, 100, true);
+        host.check_tool_permission("run_command", "rm -rf ~/Downloads")
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_read_only_action_is_never_sent_to_jev() {
+        let (url, bodies) =
+            crate::jev::test_support::answering(risk(0.9), std::time::Duration::ZERO).await;
+        let (host, _) = permission_host(&url, 2000, true);
+        host.check_tool_permission("browser_get_markdown", "")
+            .unwrap();
+        assert!(bodies.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn permissions_off_asks_jev_nothing() {
+        let (url, bodies) =
+            crate::jev::test_support::answering(risk(0.9), std::time::Duration::ZERO).await;
+        let (mut host, _) = permission_host(&url, 2000, true);
+        let mut cfg = (*host.config).clone();
+        cfg.jev.points.permissions = false;
+        host.config = std::sync::Arc::new(cfg);
+        host.check_tool_permission("run_command", "rm -rf ~/Downloads")
+            .unwrap();
+        assert!(bodies.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_call_the_gate_would_ask_about_never_reaches_jev() {
+        // Jev's only power is "ask": a call the gate asks about anyway is
+        // never put to it, so page text steering Jev gains nothing.
+        assert!(!crate::jev::permission::should_assess("run_command", false));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_flagged_call_is_asked_even_under_full_auto() {
+        // Always-allowed and unattended (nobody answers): the flag is decided
+        // before the tier and the always-allow cache are looked at.
+        let (url, _) =
+            crate::jev::test_support::answering(risk(0.9), std::time::Duration::ZERO).await;
+        let (host, _) = permission_host(&url, 2000, true);
+        host.services
+            .as_ref()
+            .unwrap()
+            .always_allowed_tools
+            .write()
+            .unwrap()
+            .insert("run_command".into());
+        assert!(host
+            .check_tool_permission("run_command", "rm -rf ~/Downloads")
+            .is_err());
     }
 
     fn ask_once(host: &super::DaemonHostFunctions) {
