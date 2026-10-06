@@ -53,7 +53,8 @@ pub const BUILTIN_SENSITIVE_DOMAINS: &[&str] = &[
 ];
 
 /// Suffixes that only resolve inside a private network.
-const INTRANET_SUFFIXES: &[&str] = &["local", "internal", "lan", "corp", "home.arpa", "intranet"];
+pub const INTRANET_SUFFIXES: &[&str] =
+    &["local", "internal", "lan", "corp", "home.arpa", "intranet"];
 
 /// What Jev may see of a page at `url`. Unparseable URLs are treated as
 /// sensitive: when unsure, send nothing private.
@@ -104,7 +105,7 @@ fn has_suffix(host: &str, domain: &str) -> bool {
 
 /// A user-typed domain entry as a bare host: `*.acme.com`, `.acme.com`,
 /// `acme.com.`, `https://acme.com/` and ` ACME.com ` all mean `acme.com`.
-fn normalise_domain(entry: &str) -> String {
+pub fn normalise_domain(entry: &str) -> String {
     let mut d = entry.trim().to_ascii_lowercase();
     if let Some(i) = d.find("://") {
         d = d[i + 3..].to_string();

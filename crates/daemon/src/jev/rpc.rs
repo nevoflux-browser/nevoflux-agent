@@ -1,6 +1,7 @@
-//! `jev.test`: the settings page's "test connection" (spec §5.9 item 3) —
-//! three tiny requests on one connection, the median latency, and a
-//! `timeout_ms` suggestion.
+//! The settings page's Jev section (spec §5.9): `jev.get` / `jev.set` read
+//! and write `[jev]`, and `jev.test` is "test connection" — three tiny
+//! requests on one connection, the median latency, and a `timeout_ms`
+//! suggestion.
 
 use std::time::{Duration, Instant};
 
@@ -10,6 +11,209 @@ use crate::kb_wizard::{err_response, ok_response};
 use crate::server::SharedAgentConfig;
 
 const CMD: &str = "jev.test";
+
+/// Decision points the page can switch (spec §5.9 item 4).
+const POINTS: &[&str] = &["tools", "skills", "visibility", "rebuild", "permissions"];
+
+/// A key as the page may see it: `abc...wxyz`, `****` when short, `""` when
+/// none. The full key never leaves the daemon.
+fn mask(key: &str) -> String {
+    let chars: Vec<char> = key.chars().collect();
+    match chars.len() {
+        0 => String::new(),
+        1..=4 => "****".into(),
+        n => format!(
+            "{}...{}",
+            chars[..3].iter().collect::<String>(),
+            chars[n - 4..].iter().collect::<String>()
+        ),
+    }
+}
+
+/// `https://`, or `http://` to this machine only (the client's own rule).
+fn valid_endpoint(endpoint: &str) -> bool {
+    let lower = endpoint.trim().to_ascii_lowercase();
+    lower.starts_with("https://")
+        || (lower.starts_with("http://") && crate::local::latch::is_loopback_url(endpoint.trim()))
+}
+
+/// Whether Jev's context work applies with the active provider (spec §5.9
+/// item 6): `local` (on-device), `acp` (the provider runs its own loop), or
+/// `applies`.
+fn scope(cfg: &crate::config::AgentConfig) -> &'static str {
+    let wire = cfg
+        .llm
+        .active_provider()
+        .and_then(|p| cfg.llm.resolve_wire(p));
+    if wire == Some(nevoflux_llm::ProviderType::Local) {
+        "local"
+    } else if cfg.llm.active_provider_is_acp() {
+        "acp"
+    } else {
+        "applies"
+    }
+}
+
+/// The `[jev]` section as the settings page sees it. `env_key` is
+/// `NEVOFLUX_API_KEY_TYPESAFE`, reported only as present or not.
+pub fn get_data(cfg: &crate::config::AgentConfig, env_key: Option<&str>) -> serde_json::Value {
+    let j = &cfg.jev;
+    serde_json::json!({
+        "enabled": j.enabled,
+        "endpoint": j.endpoint,
+        "model": j.model,
+        "timeout_ms": j.timeout_ms,
+        "points": {
+            "tools": j.points.tools,
+            "skills": j.points.skills,
+            "visibility": j.points.visibility,
+            "rebuild": j.points.rebuild,
+            "permissions": j.points.permissions,
+        },
+        "sensitive_domains": j.sensitive_domains,
+        "has_api_key": !j.api_key.is_empty(),
+        "api_key": mask(&j.api_key),
+        "key_from_env": j.api_key.is_empty() && env_key.is_some_and(|k| !k.is_empty()),
+        "builtin_sensitive_domains": super::privacy::BUILTIN_SENSITIVE_DOMAINS,
+        "intranet_suffixes": super::privacy::INTRANET_SUFFIXES,
+        "scope": scope(cfg),
+    })
+}
+
+/// Apply `jev.set` params to `cfg` (all optional). An absent or empty
+/// `api_key` keeps the stored key, `null` clears it; the env key is never
+/// written. Errors are (code, message).
+pub fn apply_set(
+    cfg: &mut crate::config::AgentConfig,
+    params: &serde_json::Value,
+) -> Result<(), (&'static str, String)> {
+    let j = &mut cfg.jev;
+    if let Some(v) = params.get("enabled") {
+        j.enabled = v
+            .as_bool()
+            .ok_or(("bad_enabled", "enabled must be true or false".to_string()))?;
+    }
+    if let Some(v) = params.get("endpoint") {
+        let e = v.as_str().unwrap_or("").trim();
+        if !valid_endpoint(e) {
+            return Err((
+                "bad_endpoint",
+                "use https://, or http:// to this machine".into(),
+            ));
+        }
+        j.endpoint = e.to_string();
+    }
+    match params.get("api_key") {
+        None => {}
+        Some(serde_json::Value::Null) => j.api_key.clear(),
+        Some(serde_json::Value::String(k)) if k.trim().is_empty() => {}
+        Some(serde_json::Value::String(k)) => j.api_key = k.trim().to_string(),
+        Some(_) => return Err(("bad_key", "api_key must be a string or null".into())),
+    }
+    if let Some(v) = params.get("timeout_ms") {
+        match v.as_u64() {
+            Some(ms) if (100..=10_000).contains(&ms) => j.timeout_ms = ms,
+            _ => return Err(("bad_timeout", "between 100 and 10000 ms".into())),
+        }
+    }
+    if let Some(v) = params.get("points") {
+        let obj = v
+            .as_object()
+            .ok_or(("bad_points", "points must be an object".to_string()))?;
+        for (k, v) in obj {
+            let on = v
+                .as_bool()
+                .ok_or(("bad_points", format!("{k} must be true or false")))?;
+            match k.as_str() {
+                "tools" => j.points.tools = on,
+                "skills" => j.points.skills = on,
+                "visibility" => j.points.visibility = on,
+                "rebuild" => j.points.rebuild = on,
+                "permissions" => j.points.permissions = on,
+                _ => {
+                    return Err((
+                        "bad_points",
+                        format!("unknown point {k}; expected one of {}", POINTS.join(", ")),
+                    ))
+                }
+            }
+        }
+    }
+    if let Some(v) = params.get("sensitive_domains") {
+        let list = v.as_array().ok_or((
+            "bad_domains",
+            "sensitive_domains must be a list".to_string(),
+        ))?;
+        let mut out: Vec<String> = Vec::new();
+        for d in list {
+            let d = d
+                .as_str()
+                .ok_or(("bad_domains", "each domain must be a string".to_string()))?;
+            let n = super::privacy::normalise_domain(d);
+            if !n.is_empty() && !out.contains(&n) {
+                out.push(n);
+            }
+        }
+        j.sensitive_domains = out;
+    }
+    Ok(())
+}
+
+/// `jev.get`.
+pub fn handle_get(
+    params: &serde_json::Value,
+    shared_config: &SharedAgentConfig,
+) -> serde_json::Value {
+    let id = crate::local::rpc::request_id(params);
+    let cfg = shared_config
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let env = std::env::var(crate::config::JEV_KEY_ENV).ok();
+    ok_response(&id, "jev.get", get_data(&cfg, env.as_deref()))
+}
+
+/// `jev.set`: validate, save `config.toml`, swap the running config.
+pub fn handle_set(
+    params: &serde_json::Value,
+    shared_config: &SharedAgentConfig,
+) -> serde_json::Value {
+    let id = crate::local::rpc::request_id(params);
+    let cmd = "jev.set";
+    let Ok(path) = crate::config::AgentConfig::default_config_path() else {
+        return err_response(
+            &id,
+            cmd,
+            "config_error",
+            "could not resolve the config file path",
+        );
+    };
+    let mut cfg = match crate::config::AgentConfig::load_from_path(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            return err_response(
+                &id,
+                cmd,
+                "config_error",
+                format!("failed to load config: {e}"),
+            )
+        }
+    };
+    if let Err((code, message)) = apply_set(&mut cfg, params) {
+        return err_response(&id, cmd, code, message);
+    }
+    if let Err(e) = cfg.save_to_path(&path) {
+        return err_response(
+            &id,
+            cmd,
+            "config_error",
+            format!("failed to save config: {e}"),
+        );
+    }
+    *shared_config.write().unwrap_or_else(|e| e.into_inner()) = std::sync::Arc::new(cfg.clone());
+    let env = std::env::var(crate::config::JEV_KEY_ENV).ok();
+    ok_response(&id, cmd, get_data(&cfg, env.as_deref()))
+}
 
 /// Twice the median latency, rounded up to 100 ms, never below the spec's
 /// default of 800 ms.
@@ -24,11 +228,30 @@ pub async fn handle_test(
     shared_config: &SharedAgentConfig,
 ) -> serde_json::Value {
     let request_id = crate::local::rpc::request_id(params);
-    let jev = shared_config
+    let mut jev = shared_config
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .jev
         .clone();
+    // The page tests what is typed, before saving or turning Jev on; the
+    // test changes nothing saved.
+    if let Some(e) = params
+        .get("endpoint")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        jev.endpoint = e.to_string();
+    }
+    if let Some(k) = params
+        .get("api_key")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        jev.api_key = k.to_string();
+    }
+    jev.enabled = true;
     let client = match JevClient::from_config(&jev) {
         Ok(c) => c,
         Err(_) => {
@@ -82,6 +305,122 @@ pub async fn handle_test(
 
 #[cfg(test)]
 mod tests {
+    use crate::config::AgentConfig;
+    use serde_json::json;
+
+    fn cfg_with_key(key: &str) -> AgentConfig {
+        let mut c = AgentConfig::default();
+        c.jev.api_key = key.into();
+        c
+    }
+
+    #[test]
+    fn get_masks_the_key_and_lists_the_builtin_sites() {
+        let d = get_data(&cfg_with_key("sk-1234567890abcd"), None);
+        assert_eq!(d["has_api_key"], true);
+        assert_eq!(d["api_key"], "sk-...abcd");
+        assert!(!d.to_string().contains("1234567890"));
+        assert!(d["builtin_sensitive_domains"].as_array().unwrap().len() > 10);
+        assert!(!d["intranet_suffixes"].as_array().unwrap().is_empty());
+        assert_eq!(d["points"]["permissions"], false);
+        assert_eq!(d["enabled"], false);
+    }
+
+    #[test]
+    fn get_reports_an_env_key_without_revealing_it() {
+        let d = get_data(&cfg_with_key(""), Some("sk-from-env-9999"));
+        assert_eq!(
+            (d["has_api_key"].as_bool(), d["key_from_env"].as_bool()),
+            (Some(false), Some(true))
+        );
+        assert!(!d.to_string().contains("9999"));
+    }
+
+    #[test]
+    fn get_reports_the_provider_scope() {
+        let mut c = AgentConfig::default();
+        c.llm.provider = Some("anthropic".into());
+        assert_eq!(get_data(&c, None)["scope"], "applies");
+        c.llm.provider = Some("claude-code".into());
+        assert_eq!(get_data(&c, None)["scope"], "acp");
+        c.llm.provider = Some("local".into());
+        assert_eq!(get_data(&c, None)["scope"], "local");
+    }
+
+    #[test]
+    fn set_applies_and_validates() {
+        let mut c = AgentConfig::default();
+        apply_set(
+            &mut c,
+            &json!({"enabled": true, "timeout_ms": 1200,
+                "points": {"permissions": true, "tools": false},
+                "sensitive_domains": ["*.Bank.Example/", "", "bank.example"]}),
+        )
+        .unwrap();
+        assert!(c.jev.enabled);
+        assert_eq!(c.jev.timeout_ms, 1200);
+        assert!(c.jev.points.permissions && !c.jev.points.tools && c.jev.points.skills);
+        assert_eq!(c.jev.sensitive_domains, vec!["bank.example".to_string()]);
+        assert_eq!(
+            apply_set(&mut c, &json!({"timeout_ms": 50})).unwrap_err().0,
+            "bad_timeout"
+        );
+        assert_eq!(
+            apply_set(&mut c, &json!({"endpoint": "http://jev.example.com/v1"}))
+                .unwrap_err()
+                .0,
+            "bad_endpoint"
+        );
+        assert_eq!(
+            apply_set(&mut c, &json!({"points": {"nonsense": true}}))
+                .unwrap_err()
+                .0,
+            "bad_points"
+        );
+        apply_set(&mut c, &json!({"endpoint": "http://127.0.0.1:9000/v1"})).unwrap();
+        assert_eq!(c.jev.endpoint, "http://127.0.0.1:9000/v1");
+    }
+
+    #[test]
+    fn an_absent_key_keeps_the_stored_one() {
+        let mut c = cfg_with_key("sk-keep");
+        apply_set(&mut c, &json!({"timeout_ms": 900})).unwrap();
+        apply_set(&mut c, &json!({"api_key": ""})).unwrap();
+        assert_eq!(c.jev.api_key, "sk-keep");
+        apply_set(&mut c, &json!({"api_key": "sk-new"})).unwrap();
+        assert_eq!(c.jev.api_key, "sk-new");
+        apply_set(&mut c, &json!({"api_key": null})).unwrap();
+        assert_eq!(c.jev.api_key, "");
+    }
+
+    #[test]
+    fn set_never_writes_the_env_key() {
+        let mut c = cfg_with_key("");
+        apply_set(&mut c, &json!({"enabled": true})).unwrap();
+        assert_eq!(c.jev.api_key, "");
+    }
+
+    #[tokio::test]
+    async fn test_uses_unsaved_endpoint_and_key() {
+        // Saved config: Jev disabled, no key. The test params carry both.
+        let (url, bodies) = crate::jev::test_support::answering(
+            json!({"answers": {"ping": {"noul": 0.9}}, "usage": {"input_tokens": 1, "output_tokens": 1}}),
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let shared: crate::server::SharedAgentConfig = std::sync::Arc::new(std::sync::RwLock::new(
+            std::sync::Arc::new(AgentConfig::default()),
+        ));
+        let r = handle_test(
+            &json!({"request_id": "r1", "endpoint": url, "api_key": "k"}),
+            &shared,
+        )
+        .await;
+        assert_eq!(r["payload"]["success"], true, "{r}");
+        assert_eq!(bodies.lock().unwrap().len(), 3);
+        assert!(!shared.read().unwrap().jev.enabled, "a test saves nothing");
+    }
+
     use super::*;
 
     /// Opt-in live check against the real System One endpoint. Needs

@@ -9159,6 +9159,8 @@ async fn handle_chat_message(
                     crate::local::rpc::handle_set_config(&params, shared_config).await
                 }
                 "jev.test" => crate::jev::rpc::handle_test(&params, shared_config).await,
+                "jev.get" => crate::jev::rpc::handle_get(&params, shared_config),
+                "jev.set" => crate::jev::rpc::handle_set(&params, shared_config),
                 "usage.export_calls" => {
                     crate::jev::export::handle_export(&params, &services.database)
                 }
