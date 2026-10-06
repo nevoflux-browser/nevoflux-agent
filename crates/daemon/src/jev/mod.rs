@@ -17,4 +17,5 @@ pub(crate) mod test_support;
 pub mod tools;
 pub mod turn;
 pub mod visibility;
+pub mod wait;
 pub mod wire;

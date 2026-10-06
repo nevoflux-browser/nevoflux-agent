@@ -736,17 +736,27 @@ impl DaemonHostFunctions {
             self.turn_stats.clone(),
         );
         let runtime = self.runtime.clone();
-        tokio::task::block_in_place(|| {
-            runtime.block_on(crate::jev::permission::assess(
-                &cfg,
-                &db,
-                &session_id,
-                stats,
-                tool_name,
-                args_summary,
-                page_url.as_deref(),
-            ))
+        self.timed_jev("permissions", || {
+            tokio::task::block_in_place(|| {
+                runtime.block_on(crate::jev::permission::assess(
+                    &cfg,
+                    &db,
+                    &session_id,
+                    stats,
+                    tool_name,
+                    args_summary,
+                    page_url.as_deref(),
+                ))
+            })
         })
+    }
+
+    /// Run `f`, logging how long the loop blocked on Jev in it (spec §6).
+    fn timed_jev<T>(&self, site: &'static str, f: impl FnOnce() -> T) -> T {
+        let started = std::time::Instant::now();
+        let out = f();
+        crate::jev::wait::log(self.event_writer().as_ref(), site, started.elapsed());
+        out
     }
 
     /// A call Jev flagged: the user is asked Allow/Deny — never "always",
@@ -2463,10 +2473,12 @@ impl HostFunctions for DaemonHostFunctions {
             "polluted"
         };
         let runtime = self.runtime.clone();
-        tokio::task::block_in_place(|| {
-            runtime.block_on(crate::jev::rebuild::mid_turn_rebuild(
-                &env, h, current, reason,
-            ))
+        self.timed_jev("rebuild", || {
+            tokio::task::block_in_place(|| {
+                runtime.block_on(crate::jev::rebuild::mid_turn_rebuild(
+                    &env, h, current, reason,
+                ))
+            })
         })
     }
 
@@ -2496,10 +2508,12 @@ impl HostFunctions for DaemonHostFunctions {
             crate::jev::tools::choice_question(req.candidates),
         );
         let runtime = self.runtime.clone();
-        let verdict = tokio::task::block_in_place(|| {
-            runtime.block_on(crate::jev::oracle::DecisionOracle::ask(
-                &oracle, &ctx, state, questions,
-            ))
+        let verdict = self.timed_jev("act", || {
+            tokio::task::block_in_place(|| {
+                runtime.block_on(crate::jev::oracle::DecisionOracle::ask(
+                    &oracle, &ctx, state, questions,
+                ))
+            })
         });
         match verdict {
             crate::jev::oracle::Verdict::Answered(r) => {
@@ -2583,9 +2597,11 @@ impl HostFunctions for DaemonHostFunctions {
         }
         let wait = std::time::Duration::from_millis(self.config.jev.timeout_ms);
         let runtime = self.runtime.clone();
-        tokio::task::block_in_place(|| {
-            runtime.block_on(async {
-                let _ = tokio::time::timeout(wait, futures::future::join_all(handles)).await;
+        self.timed_jev("signals", || {
+            tokio::task::block_in_place(|| {
+                runtime.block_on(async {
+                    let _ = tokio::time::timeout(wait, futures::future::join_all(handles)).await;
+                })
             })
         });
     }
@@ -2595,6 +2611,9 @@ impl HostFunctions for DaemonHostFunctions {
         req: &nevoflux_builtin_wasm::RenderRequest<'_>,
     ) -> Option<nevoflux_builtin_wasm::Rendered> {
         let store = |id: &str, content: &str| self.spill_tool_result(id, content).is_some();
+        // With visibility on, the tab probe and the grade are time the loop
+        // waits on Jev; with it off, rendering is deterministic.
+        let started = self.visibility_active().then(std::time::Instant::now);
         // A browser result is judged by the tab the browser says it is on now;
         // the last navigate URL goes stale after a click or a redirect.
         let page_urls = if req.content.len() > crate::jev::visibility::SMALL
@@ -2623,7 +2642,16 @@ impl HostFunctions for DaemonHostFunctions {
             store: &store,
         };
         let runtime = self.runtime.clone();
-        tokio::task::block_in_place(|| runtime.block_on(crate::jev::render::render(&env, req)))
+        let out =
+            tokio::task::block_in_place(|| runtime.block_on(crate::jev::render::render(&env, req)));
+        if let Some(started) = started {
+            crate::jev::wait::log(
+                self.event_writer().as_ref(),
+                "visibility",
+                started.elapsed(),
+            );
+        }
+        out
     }
 
     fn tool_recall(&self, chunk_id: &str, offset: u64) -> HostResult<String> {
@@ -10004,6 +10032,45 @@ mod tests {
         assert!(host
             .check_tool_permission("run_command", "rm -rf ~/Downloads")
             .is_err());
+    }
+
+    fn jev_waits(db: &nevoflux_storage::Database, session: &str) -> Vec<(String, u64)> {
+        nevoflux_storage::repositories::SessionEventRepository::new(db)
+            .list(session)
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| match e.payload {
+                nevoflux_protocol::session_event::SessionEventPayload::JevWait { site, ms } => {
+                    Some((site, ms))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn settling_slow_signals_logs_the_wait() {
+        use nevoflux_builtin_wasm::HostFunctions;
+        let (url, _) = crate::jev::test_support::answering(
+            signals_answer(),
+            std::time::Duration::from_millis(300),
+        )
+        .await;
+        let (host, db) = signals_host(&url, 2000, true);
+        ask_once(&host);
+        host.settle_signals();
+        let w = jev_waits(&db, "sig-1");
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert_eq!(w[0].0, "signals");
+        assert!(w[0].1 >= 200, "{w:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nothing_to_settle_logs_no_wait() {
+        use nevoflux_builtin_wasm::HostFunctions;
+        let (host, db) = signals_host("http://127.0.0.1:1", 2000, false);
+        host.settle_signals();
+        assert!(jev_waits(&db, "sig-1").is_empty());
     }
 
     fn ask_once(host: &super::DaemonHostFunctions) {

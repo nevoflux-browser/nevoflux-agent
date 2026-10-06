@@ -385,6 +385,16 @@ pub enum SessionEventPayload {
         /// Nobody could confirm, so the call was refused.
         unattended: bool,
     },
+    /// Time the agent loop blocked on Jev (spec §6 latency gate): the
+    /// turn-start choice, a rebuild, `act`, settling step signals, a graded
+    /// result, a permission check.
+    #[serde(rename = "jev/wait")]
+    JevWait {
+        /// Where the loop waited.
+        site: String,
+        /// Milliseconds.
+        ms: u64,
+    },
 }
 
 impl SessionEventPayload {
@@ -418,6 +428,7 @@ impl SessionEventPayload {
             Self::ToolsSelect { .. } => "tools/select",
             Self::SkillInject { .. } => "skills/inject",
             Self::PermissionJev { .. } => "permission/jev",
+            Self::JevWait { .. } => "jev/wait",
         }
     }
 }
@@ -549,6 +560,19 @@ mod tests {
         assert_eq!(p.type_str(), "context/correction");
         let back: SessionEventPayload = serde_json::from_value(v).unwrap();
         assert_eq!(back, p);
+    }
+
+    #[test]
+    fn jev_wait_wire_shape() {
+        let p = SessionEventPayload::JevWait {
+            site: "signals".into(),
+            ms: 312,
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["type"], "jev/wait");
+        assert_eq!(v["site"], "signals");
+        assert_eq!(p.type_str(), "jev/wait");
+        assert_eq!(serde_json::from_value::<SessionEventPayload>(v).unwrap(), p);
     }
 
     #[test]

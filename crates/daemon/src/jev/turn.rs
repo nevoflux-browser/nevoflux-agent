@@ -389,6 +389,7 @@ pub async fn start_turn(
             ..Default::default()
         };
     }
+    let started = Instant::now();
     let ts = turn_start(
         cfg,
         database,
@@ -400,6 +401,14 @@ pub async fn start_turn(
         skills,
     )
     .await;
+    super::wait::log(
+        Some(&SessionEventWriter::new(
+            database.clone(),
+            session_id.to_string(),
+        )),
+        "turn_start",
+        started.elapsed(),
+    );
     let history = if use_log {
         super::rebuild::prefer_log(ts.history, text)
     } else {
