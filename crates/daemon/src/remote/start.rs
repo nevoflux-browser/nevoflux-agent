@@ -169,12 +169,6 @@ pub fn stored_account_token() -> Option<String> {
     TokenSource::stored().current()
 }
 
-/// Retire the stored account token after the account service said its session
-/// is over. Does nothing for a `NEVOFLUX_SERVICE_TOKEN` (headless) token.
-pub fn retire_stored_token() -> Option<std::path::PathBuf> {
-    TokenSource::stored().retire_expired()
-}
-
 /// Where the account token comes from, read afresh every time it is needed.
 ///
 /// Read per use rather than captured once, because a token captured when a
@@ -226,8 +220,10 @@ impl TokenSource {
     /// sidebar offers to sign in again. Returns where it went.
     ///
     /// An env token is left alone — it is not this process's to retire, and
-    /// the operator who injected it has to replace it.
-    pub fn retire_expired(&self) -> Option<std::path::PathBuf> {
+    /// the operator who injected it has to replace it. So is a file that no
+    /// longer holds `presented` — the token the 401 answered: a sign-in that
+    /// landed while the mint was in flight must not be thrown away.
+    pub fn retire_expired(&self, presented: &str) -> Option<std::path::PathBuf> {
         if self.env_in_use() {
             tracing::warn!(
                 target: "remote",
@@ -235,7 +231,11 @@ impl TokenSource {
             );
             return None;
         }
-        match super::account::retire_expired_token(&self.path, chrono::Local::now().date_naive()) {
+        match super::account::retire_expired_token(
+            &self.path,
+            chrono::Local::now().date_naive(),
+            presented,
+        ) {
             Ok(Some(moved)) => {
                 let name = moved
                     .file_name()
@@ -275,7 +275,7 @@ async fn preflight(base: &str, tokens: &TokenSource) -> Result<(), OpenError> {
         // An expired session is a sign-in problem, and is reported as one so
         // the sidebar offers to sign in rather than showing a mint failure.
         Err(super::account::MintError::SessionExpired) => {
-            tokens.retire_expired();
+            tokens.retire_expired(&account_token);
             Err(OpenError::NotLoggedIn)
         }
         Err(super::account::MintError::Other(m)) => Err(OpenError::JwtMint(m)),
@@ -298,14 +298,25 @@ pub async fn account_logged_in(base: &str, path: &std::path::Path) -> bool {
     if token.trim().is_empty() {
         return false;
     }
-    match super::account::mint_do_jwt(base, &token).await {
-        Err(super::account::MintError::SessionExpired) => {
-            tokens.retire_expired();
+    // Bounded on its own, below the mint's client timeout: a status the sidebar
+    // waits on must come back, and no answer counts like offline.
+    match tokio::time::timeout(
+        ACCOUNT_STATUS_TIMEOUT,
+        super::account::mint_do_jwt(base, &token),
+    )
+    .await
+    {
+        Ok(Err(super::account::MintError::SessionExpired)) => {
+            tokens.retire_expired(&token);
             false
         }
-        Ok(_) | Err(super::account::MintError::Other(_)) => true,
+        Ok(Ok(_)) | Ok(Err(super::account::MintError::Other(_))) | Err(_) => true,
     }
 }
+
+/// How long `account.status` waits for the account service before answering
+/// from the file alone.
+const ACCOUNT_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Open a channel using the account token stored in the daemon's data dir.
 pub async fn open_channel(
@@ -1026,7 +1037,9 @@ mod tests {
     fn a_file_token_is_retired_on_expiry() {
         let dir = tempfile::tempdir().unwrap();
         let tokens = file_token(&dir, "OLD");
-        let moved = tokens.retire_expired().expect("the file token is retired");
+        let moved = tokens
+            .retire_expired("OLD")
+            .expect("the file token is retired");
         assert!(moved
             .file_name()
             .unwrap()
@@ -1046,7 +1059,7 @@ mod tests {
         let path = dir.path().join("account-token");
         std::fs::write(&path, "FILE").unwrap();
         let tokens = TokenSource::new(&path, Some("ENV".into()));
-        assert_eq!(tokens.retire_expired(), None);
+        assert_eq!(tokens.retire_expired("FILE"), None);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "FILE");
         assert!(retired_in(&dir).is_empty());
     }
@@ -1059,7 +1072,7 @@ mod tests {
         let path = dir.path().join("account-token");
         std::fs::write(&path, "FILE").unwrap();
         let tokens = TokenSource::new(&path, Some("  ".into()));
-        assert!(tokens.retire_expired().is_some());
+        assert!(tokens.retire_expired("FILE").is_some());
         assert!(!path.exists());
     }
 
@@ -1106,6 +1119,32 @@ mod tests {
         assert!(account_logged_in(&srv.base, &path).await);
         assert!(account_logged_in("http://127.0.0.1:1", &path).await);
         assert!(path.exists(), "kept");
+    }
+
+    #[tokio::test]
+    async fn a_stalled_account_service_still_answers_logged_in_promptly() {
+        // account.status used to answer at once from the file alone. Asking
+        // the service must not turn a blackholed network into a status that
+        // never comes back; no answer is treated like offline.
+        let srv = crate::remote::account::test_server::AccountServer::stalled().await;
+        let dir = tempfile::tempdir().unwrap();
+        file_token(&dir, "TOK");
+        let path = dir.path().join("account-token");
+        let started = std::time::Instant::now();
+        let logged_in = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            account_logged_in(&srv.base, &path),
+        )
+        .await
+        .expect("account.status must answer within its own timeout");
+        assert!(logged_in);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(7),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "TOK", "kept");
+        assert!(retired_in(&dir).is_empty());
     }
 
     #[tokio::test]

@@ -239,7 +239,14 @@ pub async fn mint_do_jwt(
     base_url: &str,
     account_token: &str,
 ) -> std::result::Result<String, MintError> {
-    let resp = reqwest::Client::new()
+    // A timeout is `Other`, never `SessionExpired`: no answer says nothing
+    // about the session.
+    let client = reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .map_err(|e| MintError::Other(format!("mint jwt client: {e}")))?;
+    let resp = client
         .get(format!("{base_url}{JWT_TOKEN_PATH}"))
         .bearer_auth(account_token)
         .send()
@@ -270,11 +277,22 @@ pub async fn mint_do_jwt(
 /// retirement the same day) rather than deleted: it is the only evidence of
 /// which session expired, and a token retired by mistake can be put back by
 /// hand. Returns the new path, or `None` when there was no token to retire.
+///
+/// Only the token that was refused is retired: `presented` is the token the
+/// 401 answered, and a file that no longer holds it (a sign-in wrote a fresh
+/// one while the mint was in flight) is left alone.
 pub fn retire_expired_token(
     path: &std::path::Path,
     today: chrono::NaiveDate,
+    presented: &str,
 ) -> std::io::Result<Option<std::path::PathBuf>> {
-    if !path.exists() {
+    let current = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if current.trim() != presented.trim() {
+        // A newer token is in place; it is not the one that expired.
         return Ok(None);
     }
     let name = path
@@ -282,19 +300,48 @@ pub fn retire_expired_token(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "account-token".into());
     let stem = format!("{name}.expired-{}", today.format("%Y%m%d"));
-    let mut target = path.with_file_name(&stem);
-    let mut n = 2u32;
-    while target.exists() {
-        target = path.with_file_name(format!("{stem}-{n}"));
-        n += 1;
-    }
-    match std::fs::rename(path, &target) {
-        Ok(()) => Ok(Some(target)),
-        // Gone between the check and the rename: somebody else retired it.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
+    let mut n = 1u32;
+    loop {
+        let target = if n == 1 {
+            path.with_file_name(&stem)
+        } else {
+            path.with_file_name(format!("{stem}-{n}"))
+        };
+        // Claim the name before moving onto it. `rename` replaces an existing
+        // destination, so a probe-then-rename would let two retirers pick the
+        // same name and the second overwrite the first's retired token.
+        // `create_new` is atomic: exactly one of them gets each name.
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+        {
+            Ok(placeholder) => {
+                drop(placeholder);
+                return match std::fs::rename(path, &target) {
+                    Ok(()) => Ok(Some(target)),
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&target);
+                        // Gone since it was read: somebody else retired it.
+                        if e.kind() == std::io::ErrorKind::NotFound {
+                            Ok(None)
+                        } else {
+                            Err(e)
+                        }
+                    }
+                };
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => n += 1,
+            Err(e) => return Err(e),
+        }
     }
 }
+
+/// Bounds on one call to the account service. A request with none waits out
+/// the OS connect timeout on a blackholed network, or forever on a server that
+/// accepts and never answers.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// `POST /api/devices/claim` with the account token — claim `device_id`.
 pub async fn claim_device(
@@ -458,7 +505,7 @@ mod tests {
         let path = dir.path().join("account-token");
         std::fs::write(&path, "OLD").unwrap();
 
-        let moved = retire_expired_token(&path, day(2026, 10, 7)).unwrap();
+        let moved = retire_expired_token(&path, day(2026, 10, 7), "OLD").unwrap();
         let expected = dir.path().join("account-token.expired-20261007");
         assert_eq!(moved.as_deref(), Some(expected.as_path()));
         assert!(!path.exists(), "the live token is gone");
@@ -474,9 +521,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("account-token");
         std::fs::write(&path, "FIRST").unwrap();
-        retire_expired_token(&path, day(2026, 10, 7)).unwrap();
+        retire_expired_token(&path, day(2026, 10, 7), "FIRST").unwrap();
         std::fs::write(&path, "SECOND").unwrap();
-        let moved = retire_expired_token(&path, day(2026, 10, 7)).unwrap();
+        let moved = retire_expired_token(&path, day(2026, 10, 7), "SECOND").unwrap();
         assert_eq!(
             moved.as_deref(),
             Some(
@@ -486,7 +533,7 @@ mod tests {
             )
         );
         std::fs::write(&path, "THIRD").unwrap();
-        let moved = retire_expired_token(&path, day(2026, 10, 7)).unwrap();
+        let moved = retire_expired_token(&path, day(2026, 10, 7), "THIRD").unwrap();
         assert_eq!(
             moved.as_deref(),
             Some(
@@ -510,8 +557,81 @@ mod tests {
     fn retiring_a_missing_token_is_a_no_op() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("account-token");
-        assert_eq!(retire_expired_token(&path, day(2026, 10, 7)).unwrap(), None);
+        assert_eq!(
+            retire_expired_token(&path, day(2026, 10, 7), "X").unwrap(),
+            None
+        );
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_fresh_token_written_during_the_mint_is_not_retired() {
+        // The 401 answered OLD. By the time it arrived, a sign-in had already
+        // written NEW. Retiring "whatever is in the file" would throw away the
+        // sign-in that just fixed things.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("account-token");
+        std::fs::write(&path, "OLD").unwrap();
+        std::fs::write(&path, "NEW").unwrap();
+        assert_eq!(
+            retire_expired_token(&path, day(2026, 10, 7), "OLD").unwrap(),
+            None
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "NEW");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn an_existing_retired_file_is_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("account-token");
+        let earlier = dir.path().join("account-token.expired-20261007");
+        std::fs::write(&earlier, "EARLIER").unwrap();
+        std::fs::write(&path, "OLD").unwrap();
+        let moved = retire_expired_token(&path, day(2026, 10, 7), "OLD").unwrap();
+        assert_eq!(
+            moved.as_deref(),
+            Some(
+                dir.path()
+                    .join("account-token.expired-20261007-2")
+                    .as_path()
+            )
+        );
+        assert_eq!(std::fs::read_to_string(&earlier).unwrap(), "EARLIER");
+        assert_eq!(std::fs::read_to_string(moved.unwrap()).unwrap(), "OLD");
+    }
+
+    #[test]
+    fn the_presented_token_matches_regardless_of_surrounding_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("account-token");
+        std::fs::write(&path, "OLD").unwrap();
+        assert!(retire_expired_token(&path, day(2026, 10, 7), "  OLD\n")
+            .unwrap()
+            .is_some());
+        // ...and the other way round: a file with a trailing newline.
+        std::fs::write(&path, "OLD2\r\n").unwrap();
+        assert!(retire_expired_token(&path, day(2026, 10, 7), "OLD2")
+            .unwrap()
+            .is_some());
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn a_stalled_account_service_times_out_as_other() {
+        // Never SessionExpired: a service that does not answer says nothing
+        // about the session.
+        let srv = test_server::AccountServer::stalled().await;
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            mint_do_jwt(&srv.base, "tok"),
+        )
+        .await
+        .expect("the mint must be bounded by its own client timeout");
+        match outcome {
+            Err(MintError::Other(_)) => {}
+            other => panic!("expected Other, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -614,6 +734,24 @@ pub(crate) mod test_server {
 
     impl AccountServer {
         pub async fn start(status: u16, body: &'static str) -> Self {
+            Self::start_after(status, body, None).await
+        }
+
+        /// A server that accepts the request and never answers it.
+        pub async fn stalled() -> Self {
+            Self::start_after(
+                200,
+                r#"{"token":"j"}"#,
+                Some(std::time::Duration::from_secs(600)),
+            )
+            .await
+        }
+
+        async fn start_after(
+            status: u16,
+            body: &'static str,
+            delay: Option<std::time::Duration>,
+        ) -> Self {
             let hits = Arc::new(AtomicUsize::new(0));
             let counter = hits.clone();
             let app = axum::Router::new().route(
@@ -622,6 +760,9 @@ pub(crate) mod test_server {
                     let counter = counter.clone();
                     async move {
                         counter.fetch_add(1, Ordering::SeqCst);
+                        if let Some(d) = delay {
+                            tokio::time::sleep(d).await;
+                        }
                         (
                             axum::http::StatusCode::from_u16(status).unwrap(),
                             [(axum::http::header::CONTENT_TYPE, "application/json")],

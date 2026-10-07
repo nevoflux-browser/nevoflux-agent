@@ -255,7 +255,7 @@ async fn next_jwt(
     match super::account::mint_do_jwt(account_base, &account_token).await {
         Ok(jwt) => Some(jwt),
         Err(super::account::MintError::SessionExpired) => {
-            tokens.retire_expired();
+            tokens.retire_expired(&account_token);
             None
         }
         Err(super::account::MintError::Other(e)) => {
