@@ -160,6 +160,7 @@ pub struct TurnStart {
 async fn ask_nouls(
     cfg: &crate::config::AgentConfig,
     writer: Option<Arc<SessionEventWriter>>,
+    stats: Option<Arc<crate::turn_stats::TurnStats>>,
     query: &str,
     questions: BTreeMap<String, Question>,
 ) -> Option<BTreeMap<String, f64>> {
@@ -167,7 +168,7 @@ async fn ask_nouls(
         return Some(BTreeMap::new());
     }
     let c = client::shared(&cfg.jev).ok()?;
-    let oracle = JevOracle::new(c, cfg.jev.sensitive_domains.clone(), writer, None);
+    let oracle = JevOracle::new(c, cfg.jev.sensitive_domains.clone(), writer, stats);
     let ctx = OracleContext::no_page(
         "tools",
         Duration::from_millis(cfg.jev.timeout_ms) * TOOLS_TIMEOUT_FACTOR,
@@ -206,6 +207,34 @@ pub async fn turn_start(
     table: Vec<TableTurn>,
     catalog: Option<&[ToolDefinition]>,
     skills: Option<&[SkillSummary]>,
+) -> TurnStart {
+    turn_start_counted(
+        cfg,
+        database,
+        session_id,
+        query,
+        max_messages,
+        table,
+        catalog,
+        skills,
+        None,
+    )
+    .await
+}
+
+/// [`turn_start`], counting its Jev spend and fallbacks in the turn's
+/// `stats` (the G2 effective cost prices them).
+#[allow(clippy::too_many_arguments)]
+pub async fn turn_start_counted(
+    cfg: &crate::config::AgentConfig,
+    database: &Arc<nevoflux_storage::Database>,
+    session_id: &str,
+    query: &str,
+    max_messages: usize,
+    table: Vec<TableTurn>,
+    catalog: Option<&[ToolDefinition]>,
+    skills: Option<&[SkillSummary]>,
+    stats: Option<Arc<crate::turn_stats::TurnStats>>,
 ) -> TurnStart {
     let Ok(events) =
         nevoflux_storage::repositories::SessionEventRepository::new(database).list(session_id)
@@ -258,7 +287,14 @@ pub async fn turn_start(
     }
     // Each subset counts only when Jev answered most of it (§5.8): a
     // partial answer for skills does not sink the tools, and vice versa.
-    let answers = ask_nouls(cfg, Some(writer.clone()), query, questions_all).await;
+    let answers = ask_nouls(
+        cfg,
+        Some(writer.clone()),
+        stats.clone(),
+        query,
+        questions_all,
+    )
+    .await;
     let (tool_p, skill_p) = match &answers {
         Some(p) => {
             let (t, k) = super::skills::split(p);
@@ -296,7 +332,7 @@ pub async fn turn_start(
             events,
             query,
             writer: Some(writer.clone()),
-            stats: None,
+            stats: stats.clone(),
             opts: history_opts(cfg, max_messages, table),
             now_ms,
             forced,
@@ -379,6 +415,7 @@ pub async fn start_turn(
     catalog: Option<&[ToolDefinition]>,
     skills: Option<&[SkillSummary]>,
     use_log: bool,
+    stats: Option<Arc<crate::turn_stats::TurnStats>>,
 ) -> StartedTurn {
     let use_log = use_log && rebuild_point_on(cfg);
     let catalog = catalog.filter(|_| tools_point_on(cfg));
@@ -390,7 +427,7 @@ pub async fn start_turn(
         };
     }
     let started = Instant::now();
-    let ts = turn_start(
+    let ts = turn_start_counted(
         cfg,
         database,
         session_id,
@@ -399,6 +436,7 @@ pub async fn start_turn(
         table,
         catalog,
         skills,
+        stats,
     )
     .await;
     super::wait::log(
@@ -523,6 +561,41 @@ mod tests {
         );
         ev.insert(4, json!({"type": "tool/result", "id": "t1", "content": content, "is_error": false, "duration_ms": 1}));
         ev
+    }
+
+    /// The turn-start requests are Jev spend like any other: priced in the
+    /// turn's usage (G2 effective cost), fallbacks counted.
+    #[tokio::test]
+    async fn the_turn_start_spend_is_counted_in_the_turn() {
+        let counted = |c: &crate::config::AgentConfig, db: &Arc<nevoflux_storage::Database>| {
+            let stats = crate::turn_stats::TurnStats::new();
+            let (c, db, s) = (c.clone(), db.clone(), stats.clone());
+            async move {
+                turn_start_counted(
+                    &c,
+                    &db,
+                    "s1",
+                    "which flight is cheapest?",
+                    50,
+                    vec![],
+                    Some(&catalog()),
+                    None,
+                    Some(s),
+                )
+                .await;
+                stats.record(crate::turn_stats::CallStats {
+                    reported_input: Some(1),
+                    ..Default::default()
+                });
+                stats.snapshot().unwrap().jev.expect("a jev bucket")
+            }
+        };
+        let (url, _) = answering(answer(), Duration::ZERO).await;
+        let j = counted(&cfg(&url, 2000), &db_with(earlier_turn())).await;
+        assert!(j.calls >= 1 && j.input >= 100, "{j:?}");
+        let (slow, _) = answering(answer(), Duration::from_millis(3000)).await;
+        let j = counted(&cfg(&slow, 100), &db_with(earlier_turn())).await;
+        assert!(j.fallbacks >= 1, "{j:?}");
     }
 
     #[tokio::test]
@@ -668,6 +741,7 @@ mod tests {
             Some(&catalog()),
             None,
             true,
+            None,
         )
         .await;
         let (h, tools) = (st.history, st.tools);

@@ -15,12 +15,15 @@ import pathlib
 import statistics
 import sys
 
-from eval.harness.calibrate import (DEFAULT_WEIGHTS, effective_cost, percentile, step_waits,
-                                    summarize)
+from eval.harness.calibrate import (DEFAULT_WEIGHTS, MISSING, effective_cost, percentile,
+                                    step_waits, summarize)
 
 RHO = 0.25          # ADR J11
 LATENCY_MS = 250    # spec §6: P50 added per step, over all steps
 ZH = "-zh-"
+# Scores are means of 0/1 trials, so a gain of exactly δ comes out a hair
+# under it in floating point; thresholds compare with this slack.
+EPS = 1e-9
 
 
 def _latest(rows):
@@ -63,10 +66,24 @@ def gate(off, on, notools=None, *, rho=RHO, x=None, latency_ms=LATENCY_MS,
     if len(set(reps.values())) > 1:
         problems.append(f"arms ran different k: {reps}")
 
-    sums = {k: summarize(v) for k, v in arms.items()}
-    for k, s in sums.items():
+    full = {k: summarize(v) for k, v in arms.items()}
+    for k, s in full.items():
         if s["missing_rate"] > 0.10:
             problems.append(f"{k}: {s['missing_rate']:.0%} of trials missing (> 10%)")
+
+    # Compare like with like: only (rep, task) pairs completed in every arm.
+    # A missing trial is infrastructure, not a failure, and must not move
+    # the score, the cost or the latency of one arm only.
+    done = [{(r["rep"], r["task_id"]) for r in v if r["status"] not in MISSING}
+            for v in arms.values()]
+    common = set.intersection(*done) if done else set()
+    left_out = set.union(*done) - common if done else set()
+    if left_out:
+        warnings.append(f"{len(left_out)} (rep, task) pairs not completed in every arm "
+                        "were left out of the comparison")
+    arms = {k: [r for r in v if (r["rep"], r["task_id"]) in common] for k, v in arms.items()}
+    sums = {k: summarize(v) for k, v in arms.items()}
+    for k, s in sums.items():
         if s["cost"]["estimated_share"] > 0.10:
             warnings.append(f"{k}: {s['cost']['estimated_share']:.0%} of turns have "
                             "estimated usage (low confidence)")
@@ -96,10 +113,11 @@ def gate(off, on, notools=None, *, rho=RHO, x=None, latency_ms=LATENCY_MS,
         warnings.append("no Chinese tasks: the Chinese-subset gate is not evaluated")
         regressed = False
     else:
-        regressed = zh_on < zh_off - delta
+        regressed = zh_on < zh_off - delta - EPS
 
-    quality = score["diff"] >= delta and cost["change"] <= rho
-    efficiency = None if x is None else (score["diff"] >= -delta and cost["change"] <= -x / 100)
+    quality = score["diff"] >= delta - EPS and cost["change"] <= rho + EPS
+    efficiency = None if x is None else (score["diff"] >= -delta - EPS
+                                         and cost["change"] <= -x / 100 + EPS)
     lat_ok = latency["p50"] is None or latency["p50"] <= latency_ms
     valid = not problems
 
@@ -110,7 +128,7 @@ def gate(off, on, notools=None, *, rho=RHO, x=None, latency_ms=LATENCY_MS,
         change = (c_on / c_b - 1) if c_b else 0.0
         # §8.2: no gain of δ and dearer → split tool assembly out.
         tools = {"score_diff": diff, "cost_change": change,
-                 "decision": "split" if diff < delta and change > 0 else "keep"}
+                 "decision": "split" if diff < delta - EPS and change > 0 else "keep"}
 
     return {
         "valid": valid, "problems": problems, "warnings": warnings, "delta": delta,

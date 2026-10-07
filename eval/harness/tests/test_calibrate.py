@@ -189,6 +189,47 @@ class JevSummaryTest(unittest.TestCase):
         ])
         self.assertEqual(step_waits({"session_jsonl": log}), [900])
 
+    def test_a_later_turns_start_wait_goes_to_that_turns_first_step(self):
+        from eval.harness.calibrate import step_waits
+        log = "\n".join([
+            ev(type="jev/wait", site="turn_start", ms=700),
+            ev(type="turn/start", turn=1),
+            ev(type="step/start", step=1, turn=1),
+            ev(type="jev/wait", site="signals", ms=20),
+            ev(type="turn/end", turn=1),
+            ev(type="jev/wait", site="turn_start", ms=900),   # logged before turn/start
+            ev(type="turn/start", turn=2),
+            ev(type="step/start", step=1, turn=2),
+            ev(type="turn/end", turn=2),
+        ])
+        self.assertEqual(step_waits({"session_jsonl": log}), [720, 900])
+
+    def test_a_turn_start_wait_with_no_step_is_its_own_step_before_the_next_turn(self):
+        from eval.harness.calibrate import step_waits
+        log = "\n".join([
+            ev(type="jev/wait", site="turn_start", ms=900),
+            ev(type="turn/start", turn=1),
+            ev(type="turn/end", turn=1),
+            ev(type="turn/start", turn=2),
+            ev(type="step/start", step=1, turn=2),
+            ev(type="turn/end", turn=2),
+        ])
+        self.assertEqual(step_waits({"session_jsonl": log}), [900, 0])
+
+    def test_a_wait_after_a_nested_subagent_turn_goes_to_the_parents_step(self):
+        from eval.harness.calibrate import step_waits
+        log = "\n".join([
+            ev(type="turn/start", turn=1),
+            ev(type="step/start", step=1, turn=1),
+            ev(type="turn/start", turn=1),                     # subagent, inside the parent's step
+            ev(type="step/start", step=1, turn=1),
+            ev(type="turn/end", turn=1),
+            ev(type="jev/wait", site="signals", ms=50),        # the parent's step 1
+            ev(type="step/start", step=2, turn=1),
+            ev(type="turn/end", turn=1),
+        ])
+        self.assertEqual(step_waits({"session_jsonl": log}), [50, 0, 0])
+
     def test_summary_reports_cost_and_wait_percentiles(self):
         log = "\n".join([
             ev(type="turn/start", turn=1),

@@ -40,26 +40,40 @@ def effective_cost(row, weights=DEFAULT_WEIGHTS) -> float:
 
 def step_waits(row) -> list:
     """Milliseconds the loop blocked on Jev (`jev/wait`), per step (spec §6:
-    over all steps, a quiet step is 0). A wait goes to the step it happened
-    in; one before a turn's first step (the turn-start choice) goes to that
-    step; one with no step after it counts as a step of its own."""
-    steps, cur, pending = [], None, 0
+    over all steps, a quiet step is 0).
+
+    A wait goes to the current step of the innermost open turn. The daemon
+    logs the turn-start wait before the turn's `turn/start`, so a wait with no
+    current step is held for the next step; if that turn ends without a step,
+    it becomes a step of its own. A subagent's turn opens inside its parent's
+    step; when it ends, the parent's step is current again.
+    """
+    steps, open_turns, pending = [], [], 0
     for line in (row.get("session_jsonl") or "").splitlines():
         if not line.strip():
             continue
         e = json.loads(line)
         t = e.get("type")
         if t == "turn/start":
-            cur = None
+            open_turns.append(None)
         elif t == "step/start":
             steps.append(pending)
             pending = 0
-            cur = len(steps) - 1
+            if not open_turns:
+                open_turns.append(None)
+            open_turns[-1] = len(steps) - 1
         elif t == "jev/wait":
+            cur = open_turns[-1] if open_turns else None
             if cur is None:
                 pending += e.get("ms", 0)
             else:
                 steps[cur] += e.get("ms", 0)
+        elif t == "turn/end":
+            if open_turns and open_turns[-1] is None and pending:
+                steps.append(pending)
+                pending = 0
+            if open_turns:
+                open_turns.pop()
     if pending:
         steps.append(pending)
     return steps

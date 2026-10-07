@@ -347,6 +347,7 @@ async fn run_one_turn(
         catalog.as_deref(),
         skills.as_deref(),
         use_log,
+        Some(turn_stats.clone()),
     )
     .await;
     let (history, jev_tools, jev_skill) = (started.history, started.tools, started.skill);

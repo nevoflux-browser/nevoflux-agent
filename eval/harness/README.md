@@ -479,7 +479,9 @@ and gives the verdict:
   costs more, otherwise `keep`.
 
 δ = max(2·sd of the off arm's per-rep scores, 1/number of tasks): on a steady
-baseline a tie is not a gain. The verdict is **INVALID** (exit 2) when the
+baseline a tie is not a gain. Thresholds compare with a 1e-9 slack, so a
+gain of exactly δ counts. Scores, cost and latency use only the (rep, task)
+pairs completed in every arm; anything left out is listed as a warning. The verdict is **INVALID** (exit 2) when the
 arms ran different tasks or k, an arm misses > 10% of its trials, or a Jev
 arm shows Jev never answered (no calls, or > 50% fallbacks). More than 10%
 estimated usage is a low-confidence warning.
@@ -501,11 +503,12 @@ step; a step without one is 0 ms.
 `jev-flights-followup`, `jev-zh-shop-cheapest`, k=1): the off arm logged no
 `jev/wait`; each Jev arm logged `turn_start` 4×, `signals` 3×, `visibility`
 1×. Waits: turn start 595–925 ms, signals 262–729 ms, visibility 479–815 ms;
-P50 over the 16 steps 0 ms, P90 1191 ms. The fake model's tools return
+P50 over the 16 steps 0 ms, P90 925 ms. The fake model's tools return
 instantly, so the signals waits here are not masked the way real tool time
 would mask them. Verdict FAIL (score tie at 0.333, cost +593% — the fake
 model reports almost no tokens, so Jev's dominate). It proves the plumbing,
-not Jev.
+not Jev. The dry run's binary did not yet count the turn-start Jev requests
+in the turn's usage (fixed after review), so its Jev cost is an undercount.
 
 **The real run** (needs quota; about 95M tokens on Kimi k3, roughly 11
 five-hour windows; 180 trials without the tools arm). Rebuild release from

@@ -122,6 +122,45 @@ class GateTest(unittest.TestCase):
         self.assertIn("G2: INVALID", md)
 
 
+class GateThresholdTest(unittest.TestCase):
+    def test_a_gain_of_exactly_delta_passes_the_quality_path(self):
+        tasks = [f"jev-t{i:02d}" for i in range(30)]
+        for n in range(1, 29):
+            off = [trial(r, t, i < n) for r in range(3) for i, t in enumerate(tasks)]
+            on = [trial(r, t, i < n + 1, jev_calls=1, jev_in=10)
+                  for r in range(3) for i, t in enumerate(tasks)]
+            v = gate(off, on)
+            self.assertTrue(v["paths"]["quality"], (n, v["score"], v["delta"]))
+
+    def test_one_chinese_trial_flip_at_delta_is_not_a_regression(self):
+        # 20 + 10 zh tasks, k = 3, a steady baseline: δ is the 1/30 floor, and
+        # one zh trial is 1/30 of the zh score — exactly δ, not a regression.
+        tasks = [f"jev-t{i:02d}" for i in range(20)] + [f"jev-zh-t{i:02d}" for i in range(10)]
+        zh = [t for t in tasks if "-zh-" in t]
+        for m in range(1, len(zh) + 1):
+            off = [trial(r, t, "-zh-" not in t or t in zh[:m]) for r in range(3) for t in tasks]
+            on = [trial(r, t, "-zh-" not in t or t in zh[:m] and not (r == 0 and t == zh[0]),
+                        jev_calls=1)
+                  for r in range(3) for t in tasks]
+            v = gate(off, on)
+            self.assertAlmostEqual(v["delta"], 1 / 30)
+            self.assertFalse(v["zh"]["regressed"], (m, v["zh"]))
+
+
+class GateMissingTest(unittest.TestCase):
+    def test_trials_missing_in_one_arm_are_left_out_of_every_arm(self):
+        off = arm(TASKS[:3])
+        on = arm(TASKS[:4], jev=True)
+        lost = next(r for r in on if r["rep"] == 0 and r["task_id"] == "jev-a")
+        lost["status"], lost["pass"] = "provider_error", False
+        v = gate(off, on)
+        self.assertTrue(v["valid"], v["problems"])
+        # Without (rep 0, jev-a) in either arm: off 0.567, on 0.783.
+        self.assertAlmostEqual(v["score"]["diff"], 0.2167, places=3)
+        self.assertTrue(v["paths"]["quality"])
+        self.assertTrue(any("left out" in w for w in v["warnings"]), v["warnings"])
+
+
 class GateCliTest(unittest.TestCase):
     def test_cli_writes_the_report_and_exits_by_verdict(self):
         import pathlib

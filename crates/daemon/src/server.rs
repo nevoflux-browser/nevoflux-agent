@@ -6047,6 +6047,7 @@ async fn load_session_history(
     active_soul: Option<&AgentRoleDefinition>,
     catalog: Option<Vec<nevoflux_builtin_wasm::ToolDefinition>>,
     skills: Option<Vec<nevoflux_builtin_wasm::SkillSummary>>,
+    stats: Option<Arc<crate::turn_stats::TurnStats>>,
 ) -> crate::jev::turn::StartedTurn {
     // Fetch max_messages + 1 so we can pop the current user message and still
     // have max_messages of history.
@@ -6085,6 +6086,7 @@ async fn load_session_history(
                         catalog.as_deref(),
                         skills.as_deref(),
                         true,
+                        stats,
                     )
                     .await
                 }
@@ -6960,6 +6962,7 @@ async fn handle_chat_message_streaming(
             active_soul.as_deref(),
             skill_context.is_some(),
         ),
+        Some(turn_stats.clone()),
     )
     .await;
     let (history, jev_tools, jev_skill) = (started.history, started.tools, started.skill);
@@ -7586,6 +7589,7 @@ async fn handle_chat_message_streaming(
                             active_soul.as_deref(),
                             None,
                             None,
+                            Some(rerun_turn_stats.clone()),
                         )
                         .await
                         .history;
@@ -8849,6 +8853,7 @@ async fn handle_chat_message(
                     active_soul.as_deref(),
                     skill_context.is_some(),
                 ),
+                Some(turn_stats.clone()),
             )
             .await;
             let (history, jev_tools, jev_skill) = (started.history, started.tools, started.skill);
