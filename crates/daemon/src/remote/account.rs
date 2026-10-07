@@ -217,21 +217,83 @@ pub async fn poll_device_token(
     Ok(parse_token_poll(&body))
 }
 
+/// Why a relay JWT could not be minted.
+///
+/// Split in two because the two need opposite answers. An expired session will
+/// never mint again, however often it is retried — the person has to sign in.
+/// Anything else (no network, a 5xx, a malformed reply) may well clear up on
+/// its own, and the token that produced it is still the right one to keep.
+#[derive(Debug, thiserror::Error)]
+pub enum MintError {
+    /// HTTP 401: the account session behind the token is over (better-auth
+    /// sessions expire after about a week).
+    #[error("the nevoflux.app session has expired")]
+    SessionExpired,
+    /// Everything else, with what actually happened.
+    #[error("{0}")]
+    Other(String),
+}
+
 /// `GET /api/auth/token` with the account token — mint the DO-admission JWT.
-pub async fn mint_do_jwt(base_url: &str, account_token: &str) -> Result<String> {
+pub async fn mint_do_jwt(
+    base_url: &str,
+    account_token: &str,
+) -> std::result::Result<String, MintError> {
     let resp = reqwest::Client::new()
         .get(format!("{base_url}{JWT_TOKEN_PATH}"))
         .bearer_auth(account_token)
         .send()
         .await
-        .map_err(|e| DaemonError::InternalError(format!("mint jwt request: {}", because(&e))))?;
+        .map_err(|e| MintError::Other(format!("mint jwt request: {}", because(&e))))?;
+    let status = resp.status();
+    // Checked before the body: a 401 carries no JWT, and reporting it as the
+    // parse failure that follows ("no JWT in set-auth-jwt header…") hid the one
+    // fact that mattered — the person has to sign in again.
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(MintError::SessionExpired);
+    }
+    if !status.is_success() {
+        return Err(MintError::Other(format!("mint jwt failed: HTTP {status}")));
+    }
     let header_jwt = resp
         .headers()
         .get("set-auth-jwt")
         .and_then(|v| v.to_str().ok())
         .map(String::from);
     let body: Value = resp.json().await.unwrap_or_else(|_| json!({}));
-    parse_jwt_resp(header_jwt.as_deref(), &body)
+    parse_jwt_resp(header_jwt.as_deref(), &body).map_err(|e| MintError::Other(e.to_string()))
+}
+
+/// Move an expired account token out of the way, keeping it.
+///
+/// Renamed to `<name>.expired-YYYYMMDD` (then `-2`, `-3`, … for a second
+/// retirement the same day) rather than deleted: it is the only evidence of
+/// which session expired, and a token retired by mistake can be put back by
+/// hand. Returns the new path, or `None` when there was no token to retire.
+pub fn retire_expired_token(
+    path: &std::path::Path,
+    today: chrono::NaiveDate,
+) -> std::io::Result<Option<std::path::PathBuf>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "account-token".into());
+    let stem = format!("{name}.expired-{}", today.format("%Y%m%d"));
+    let mut target = path.with_file_name(&stem);
+    let mut n = 2u32;
+    while target.exists() {
+        target = path.with_file_name(format!("{stem}-{n}"));
+        n += 1;
+    }
+    match std::fs::rename(path, &target) {
+        Ok(()) => Ok(Some(target)),
+        // Gone between the check and the rename: somebody else retired it.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// `POST /api/devices/claim` with the account token — claim `device_id`.
@@ -386,6 +448,118 @@ mod tests {
         assert!(!is_logged_in(&store));
     }
 
+    fn day(y: i32, m: u32, d: u32) -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    #[test]
+    fn an_expired_token_is_renamed_with_the_date_not_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("account-token");
+        std::fs::write(&path, "OLD").unwrap();
+
+        let moved = retire_expired_token(&path, day(2026, 10, 7)).unwrap();
+        let expected = dir.path().join("account-token.expired-20261007");
+        assert_eq!(moved.as_deref(), Some(expected.as_path()));
+        assert!(!path.exists(), "the live token is gone");
+        assert_eq!(
+            std::fs::read_to_string(&expected).unwrap(),
+            "OLD",
+            "retired, never deleted"
+        );
+    }
+
+    #[test]
+    fn a_second_retirement_the_same_day_gets_a_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("account-token");
+        std::fs::write(&path, "FIRST").unwrap();
+        retire_expired_token(&path, day(2026, 10, 7)).unwrap();
+        std::fs::write(&path, "SECOND").unwrap();
+        let moved = retire_expired_token(&path, day(2026, 10, 7)).unwrap();
+        assert_eq!(
+            moved.as_deref(),
+            Some(
+                dir.path()
+                    .join("account-token.expired-20261007-2")
+                    .as_path()
+            )
+        );
+        std::fs::write(&path, "THIRD").unwrap();
+        let moved = retire_expired_token(&path, day(2026, 10, 7)).unwrap();
+        assert_eq!(
+            moved.as_deref(),
+            Some(
+                dir.path()
+                    .join("account-token.expired-20261007-3")
+                    .as_path()
+            )
+        );
+        // Every earlier one is still there, untouched.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("account-token.expired-20261007")).unwrap(),
+            "FIRST"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("account-token.expired-20261007-2")).unwrap(),
+            "SECOND"
+        );
+    }
+
+    #[test]
+    fn retiring_a_missing_token_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("account-token");
+        assert_eq!(retire_expired_token(&path, day(2026, 10, 7)).unwrap(), None);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_401_is_an_expired_session() {
+        let srv = test_server::AccountServer::start(
+            401,
+            r#"{"message":"Unauthorized","code":"UNAUTHORIZED"}"#,
+        )
+        .await;
+        match mint_do_jwt(&srv.base, "tok").await {
+            Err(MintError::SessionExpired) => {}
+            other => panic!("expected SessionExpired, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_200_with_a_token_mints() {
+        let srv = test_server::AccountServer::start(200, r#"{"token":"j"}"#).await;
+        assert_eq!(mint_do_jwt(&srv.base, "tok").await.unwrap(), "j");
+        assert_eq!(srv.hits(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_500_is_not_an_expired_session() {
+        let srv = test_server::AccountServer::start(500, "{}").await;
+        match mint_do_jwt(&srv.base, "tok").await {
+            Err(MintError::Other(_)) => {}
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_200_without_a_jwt_is_not_an_expired_session() {
+        let srv = test_server::AccountServer::start(200, "{}").await;
+        match mint_do_jwt(&srv.base, "tok").await {
+            Err(MintError::Other(m)) => assert!(m.contains("no JWT"), "{m}"),
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_account_service_is_not_an_expired_session() {
+        match mint_do_jwt("http://127.0.0.1:1", "tok").await {
+            Err(MintError::Other(_)) => {}
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
     #[test]
     fn a_network_error_says_what_actually_happened() {
         // `reqwest` reports "error sending request for url" and keeps the real
@@ -422,5 +596,53 @@ mod tests {
         // A layer that merely repeats the one below adds nothing.
         let doubled = Layer("dns error", Some(Box::new(Layer("dns error", None))));
         assert_eq!(because(&doubled), "dns error");
+    }
+}
+
+/// A stand-in for nevoflux.app's `GET /api/auth/token`, shared by the remote
+/// module's tests: answers every mint with one fixed status and body, and
+/// counts how often it was asked.
+#[cfg(test)]
+pub(crate) mod test_server {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    pub(crate) struct AccountServer {
+        pub base: String,
+        hits: Arc<AtomicUsize>,
+    }
+
+    impl AccountServer {
+        pub async fn start(status: u16, body: &'static str) -> Self {
+            let hits = Arc::new(AtomicUsize::new(0));
+            let counter = hits.clone();
+            let app = axum::Router::new().route(
+                super::JWT_TOKEN_PATH,
+                axum::routing::get(move || {
+                    let counter = counter.clone();
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        (
+                            axum::http::StatusCode::from_u16(status).unwrap(),
+                            [(axum::http::header::CONTENT_TYPE, "application/json")],
+                            body,
+                        )
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            Self {
+                base: format!("http://{addr}"),
+                hits,
+            }
+        }
+
+        pub fn hits(&self) -> usize {
+            self.hits.load(Ordering::SeqCst)
+        }
     }
 }

@@ -9329,18 +9329,20 @@ async fn handle_chat_message(
                 // The account token is held daemon-side (crate::remote::account);
                 // these commands never return it to the sidebar — only status.
                 "account.status" => {
-                    let store = crate::remote::account::FileTokenStore::new(
-                        crate::paths::resolve_from_daemon()
-                            .data_dir
-                            .join("account-token"),
-                    );
+                    // Validated, not just found: an expired session is retired
+                    // here so the sidebar offers sign-in instead of failing later.
+                    let is_logged_in = crate::remote::start::account_logged_in(
+                        &crate::remote::start::account_base(),
+                        &crate::remote::start::account_token_path(),
+                    )
+                    .await;
                     serde_json::json!({
                         "type": "system_response",
                         "payload": {
                             "request_id": request_id,
                             "command": "account.status",
                             "success": true,
-                            "data": { "is_logged_in": crate::remote::account::is_logged_in(&store) }
+                            "data": { "is_logged_in": is_logged_in }
                         }
                     })
                 }
@@ -9449,6 +9451,9 @@ async fn handle_chat_message(
                     match crate::remote::start::control_deps() {
                         None => fail("NOT_READY", "the daemon is still starting".into()),
                         Some(deps) => match crate::remote::start::pair_device(deps).await {
+                            Err(e @ crate::remote::start::OpenError::NotLoggedIn) => {
+                                fail("NOT_LOGGED_IN", e.to_string())
+                            }
                             Err(e) => fail("PAIR_FAILED", e.to_string()),
                             Ok((pairing, code)) => serde_json::json!({
                                 "type": "system_response",
@@ -9487,6 +9492,9 @@ async fn handle_chat_message(
                     match crate::remote::start::control_deps() {
                         None => fail("NOT_READY", "the daemon is still starting".into()),
                         Some(deps) => match crate::remote::start::pair_agent(deps).await {
+                            Err(e @ crate::remote::start::OpenError::NotLoggedIn) => {
+                                fail("NOT_LOGGED_IN", e.to_string())
+                            }
                             Err(e) => fail("PAIR_FAILED", e.to_string()),
                             Ok((pairing, code)) => {
                                 let relay = crate::remote::start::relay_base();

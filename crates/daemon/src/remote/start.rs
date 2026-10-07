@@ -166,13 +166,145 @@ fn resolve_token(env_token: Option<String>, file_token: Option<String>) -> Optio
 /// the headless service checks this before launching a browser, rather than
 /// discovering it after.
 pub fn stored_account_token() -> Option<String> {
-    use super::account::TokenStore;
-    let env_token = std::env::var(SERVICE_TOKEN_ENV).ok();
-    let file_token = match super::account::FileTokenStore::new(account_token_path()).load() {
-        Ok(Some(t)) => Some(t),
-        _ => None,
+    TokenSource::stored().current()
+}
+
+/// Retire the stored account token after the account service said its session
+/// is over. Does nothing for a `NEVOFLUX_SERVICE_TOKEN` (headless) token.
+pub fn retire_stored_token() -> Option<std::path::PathBuf> {
+    TokenSource::stored().retire_expired()
+}
+
+/// Where the account token comes from, read afresh every time it is needed.
+///
+/// Read per use rather than captured once, because a token captured when a
+/// channel opened is the one that expires a week later: every dialling loop
+/// then re-minted with it forever, and signing in again fixed nothing until
+/// the daemon restarted. Carries the file's path rather than reaching for
+/// [`account_token_path`] itself so that tests can point it at a temporary
+/// directory — retiring a token renames a file, and a test must never rename
+/// the real one.
+#[derive(Clone, Debug)]
+pub struct TokenSource {
+    path: std::path::PathBuf,
+    env_token: Option<String>,
+}
+
+impl TokenSource {
+    /// The daemon's own: `NEVOFLUX_SERVICE_TOKEN`, then `account-token`.
+    pub fn stored() -> Self {
+        Self::new(account_token_path(), std::env::var(SERVICE_TOKEN_ENV).ok())
+    }
+
+    /// A token file at `path`, overridden by `env_token` when that is set.
+    pub fn new(path: impl Into<std::path::PathBuf>, env_token: Option<String>) -> Self {
+        Self {
+            path: path.into(),
+            env_token,
+        }
+    }
+
+    /// The token to use right now, if there is one.
+    pub fn current(&self) -> Option<String> {
+        use super::account::TokenStore;
+        let file_token = match super::account::FileTokenStore::new(&self.path).load() {
+            Ok(Some(t)) => Some(t),
+            _ => None,
+        };
+        resolve_token(self.env_token.clone(), file_token)
+    }
+
+    /// True when the token in use is the env override, not the file.
+    fn env_in_use(&self) -> bool {
+        self.env_token
+            .as_deref()
+            .is_some_and(|t| !t.trim().is_empty())
+    }
+
+    /// The account service said the session behind the current token is
+    /// over: move the file aside so nothing keeps presenting it, and so the
+    /// sidebar offers to sign in again. Returns where it went.
+    ///
+    /// An env token is left alone — it is not this process's to retire, and
+    /// the operator who injected it has to replace it.
+    pub fn retire_expired(&self) -> Option<std::path::PathBuf> {
+        if self.env_in_use() {
+            tracing::warn!(
+                target: "remote",
+                "account session expired; {SERVICE_TOKEN_ENV} has to be replaced"
+            );
+            return None;
+        }
+        match super::account::retire_expired_token(&self.path, chrono::Local::now().date_naive()) {
+            Ok(Some(moved)) => {
+                let name = moved
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                tracing::warn!(
+                    target: "remote",
+                    "account session expired; token retired to {name}; sign in again"
+                );
+                Some(moved)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                tracing::error!(
+                    target: "remote",
+                    "account session expired, and the token could not be retired: {e}"
+                );
+                None
+            }
+        }
+    }
+}
+
+/// The account origin. One place, like [`relay_base`].
+pub fn account_base() -> String {
+    std::env::var("NEVOFLUX_ACCOUNT_URL").unwrap_or_else(|_| "https://nevoflux.app".to_string())
+}
+
+/// Prove the credentials mint before anything is registered or shown.
+///
+/// A channel that can never connect is worse than a clear failure, because by
+/// then the pairing code has already been put in front of someone.
+async fn preflight(base: &str, tokens: &TokenSource) -> Result<(), OpenError> {
+    let account_token = tokens.current().ok_or(OpenError::NotLoggedIn)?;
+    match super::account::mint_do_jwt(base, &account_token).await {
+        Ok(_) => Ok(()),
+        // An expired session is a sign-in problem, and is reported as one so
+        // the sidebar offers to sign in rather than showing a mint failure.
+        Err(super::account::MintError::SessionExpired) => {
+            tokens.retire_expired();
+            Err(OpenError::NotLoggedIn)
+        }
+        Err(super::account::MintError::Other(m)) => Err(OpenError::JwtMint(m)),
+    }
+}
+
+/// What `account.status` reports: whether there is a file token whose session
+/// is still alive.
+///
+/// Asks the account service once. Only a definite "expired" counts against
+/// the token — and retires it, so the next look agrees without asking again.
+/// Offline or a 5xx says nothing about the session, so it still counts as
+/// signed in rather than sending somebody through a login they do not need.
+pub async fn account_logged_in(base: &str, path: &std::path::Path) -> bool {
+    // The file alone: this is what the sidebar's sign-in reads and writes.
+    let tokens = TokenSource::new(path, None);
+    let Some(token) = tokens.current() else {
+        return false;
     };
-    resolve_token(env_token, file_token)
+    if token.trim().is_empty() {
+        return false;
+    }
+    match super::account::mint_do_jwt(base, &token).await {
+        Err(super::account::MintError::SessionExpired) => {
+            tokens.retire_expired();
+            false
+        }
+        Ok(_) | Err(super::account::MintError::Other(_)) => true,
+    }
 }
 
 /// Open a channel using the account token stored in the daemon's data dir.
@@ -181,29 +313,23 @@ pub async fn open_channel(
     registry: &Arc<Mutex<GatewayRegistry>>,
     msg_tx: &mpsc::Sender<(Vec<u8>, nevoflux_protocol::ProxyEnvelope)>,
 ) -> Result<ChannelHandle, OpenError> {
-    open_channel_with_token(req, stored_account_token(), registry, msg_tx).await
+    open_channel_with_token(req, TokenSource::stored(), account_base(), registry, msg_tx).await
 }
 
-/// The sequence itself, with the account token passed in so it is testable.
+/// The sequence itself, with the token source and account origin passed in so
+/// it is testable.
 ///
 /// Returns a [`ChannelHandle`]. The headless service keeps it to push the
 /// occasional notice of its own; the system command needs only that the channel
 /// is now findable by id, because closing it happens somewhere else entirely.
 pub async fn open_channel_with_token(
     req: ChannelRequest,
-    account_token: Option<String>,
+    tokens: TokenSource,
+    base: String,
     registry: &Arc<Mutex<GatewayRegistry>>,
     msg_tx: &mpsc::Sender<(Vec<u8>, nevoflux_protocol::ProxyEnvelope)>,
 ) -> Result<ChannelHandle, OpenError> {
-    let account_token = account_token.ok_or(OpenError::NotLoggedIn)?;
-    let base = std::env::var("NEVOFLUX_ACCOUNT_URL")
-        .unwrap_or_else(|_| "https://nevoflux.app".to_string());
-    // Prove the credentials mint before anything is registered or shown. A
-    // channel that can never connect is worse than a clear failure, because by
-    // then the pairing code has already been put in front of someone.
-    super::account::mint_do_jwt(&base, &account_token)
-        .await
-        .map_err(|e| OpenError::JwtMint(e.to_string()))?;
+    preflight(&base, &tokens).await?;
 
     let key = super::crypto::derive_channel_key(&req.pairing_code, &req.channel_id).ok();
     let sink = Arc::new(super::ws::WsSink::new());
@@ -239,9 +365,10 @@ pub async fn open_channel_with_token(
     let relay = std::env::var("NEVOFLUX_RELAY_URL")
         .unwrap_or_else(|_| "wss://relay.nevoflux.app".to_string());
     // The JWT is re-minted per connect attempt inside the loop, so hand it the
-    // account credentials rather than a token that expires in 15 minutes.
+    // account credentials rather than a token that expires in 15 minutes —
+    // and the token's source rather than the token, which expires too.
     let ch = req.channel_id.clone();
-    let (acct_base, acct_token) = (base, account_token);
+    let (acct_base, acct_token) = (base, tokens);
     let reg = registry.clone();
     let gw = gateway.clone();
     // One token for both sockets: they are two halves of one channel, and a
@@ -323,24 +450,21 @@ pub async fn open_control_channel(
     req: ControlRequest,
     registry: &Arc<Mutex<GatewayRegistry>>,
 ) -> Result<ChannelHandle, OpenError> {
-    open_control_channel_with_token(req, stored_account_token(), registry).await
+    open_control_channel_with_token(req, TokenSource::stored(), account_base(), registry).await
 }
 
-/// The sequence itself, with the account token passed in so it is testable.
+/// The sequence itself, with the token source and account origin passed in so
+/// it is testable.
 pub async fn open_control_channel_with_token(
     req: ControlRequest,
-    account_token: Option<String>,
+    tokens: TokenSource,
+    base: String,
     registry: &Arc<Mutex<GatewayRegistry>>,
 ) -> Result<ChannelHandle, OpenError> {
-    let account_token = account_token.ok_or(OpenError::NotLoggedIn)?;
-    let base = std::env::var("NEVOFLUX_ACCOUNT_URL")
-        .unwrap_or_else(|_| "https://nevoflux.app".to_string());
     // Prove the credentials mint before anything is registered, exactly as the
     // data channel does: a channel that can never connect is worse than a clear
     // failure, because by then somebody is relying on being told things.
-    super::account::mint_do_jwt(&base, &account_token)
-        .await
-        .map_err(|e| OpenError::JwtMint(e.to_string()))?;
+    preflight(&base, &tokens).await?;
 
     let channel_id = req.pairing.control_channel_id.clone();
     let sink = Arc::new(super::ws::WsSink::new());
@@ -378,17 +502,8 @@ pub async fn open_control_channel_with_token(
             cancel.clone(),
         );
         tokio::spawn(async move {
-            super::ws::run_control_socket(
-                &relay,
-                &ch,
-                base,
-                account_token,
-                sink,
-                gw,
-                commands,
-                cancel,
-            )
-            .await;
+            super::ws::run_control_socket(&relay, &ch, base, tokens, sink, gw, commands, cancel)
+                .await;
         });
     }
 
@@ -458,14 +573,23 @@ pub async fn open_mcp_channel(
     backend: Arc<dyn super::mcp_tools::AgentToolBackend>,
     registry: &Arc<Mutex<GatewayRegistry>>,
 ) -> Result<ChannelHandle, OpenError> {
-    open_mcp_channel_with_token(pairing, backend, stored_account_token(), registry).await
+    open_mcp_channel_with_token(
+        pairing,
+        backend,
+        TokenSource::stored(),
+        account_base(),
+        registry,
+    )
+    .await
 }
 
-/// The sequence itself, with the account token passed in so it is testable.
+/// The sequence itself, with the token source and account origin passed in so
+/// it is testable.
 pub async fn open_mcp_channel_with_token(
     pairing: &super::pairing::Pairing,
     backend: Arc<dyn super::mcp_tools::AgentToolBackend>,
-    account_token: Option<String>,
+    tokens: TokenSource,
+    base: String,
     registry: &Arc<Mutex<GatewayRegistry>>,
 ) -> Result<ChannelHandle, OpenError> {
     // An agent channel has no plaintext mode (design §5.1): without a key
@@ -473,12 +597,7 @@ pub async fn open_mcp_channel_with_token(
     let key = pairing
         .control_key()
         .ok_or_else(|| OpenError::JwtMint("the agent pairing has no usable key".into()))?;
-    let account_token = account_token.ok_or(OpenError::NotLoggedIn)?;
-    let base = std::env::var("NEVOFLUX_ACCOUNT_URL")
-        .unwrap_or_else(|_| "https://nevoflux.app".to_string());
-    super::account::mint_do_jwt(&base, &account_token)
-        .await
-        .map_err(|e| OpenError::JwtMint(e.to_string()))?;
+    preflight(&base, &tokens).await?;
 
     let channel_id = pairing.control_channel_id.clone();
     let sink = Arc::new(super::ws::WsSink::new());
@@ -505,7 +624,7 @@ pub async fn open_mcp_channel_with_token(
             cancel.clone(),
         );
         tokio::spawn(async move {
-            super::ws::run_mcp_socket(&relay, &ch, base, account_token, sink, gw, cancel).await;
+            super::ws::run_mcp_socket(&relay, &ch, base, tokens, sink, gw, cancel).await;
         });
     }
     if let Some(previous) = channels().lock().await.insert(channel_id, handle.clone()) {
@@ -627,9 +746,11 @@ async fn open_data_channel(
     deps: &ControlDeps,
     pairing: &super::pairing::Pairing,
 ) -> Result<Arc<PortalGateway>, OpenError> {
-    let account_token = stored_account_token().ok_or(OpenError::NotLoggedIn)?;
-    let base = std::env::var("NEVOFLUX_ACCOUNT_URL")
-        .unwrap_or_else(|_| "https://nevoflux.app".to_string());
+    let account_token = TokenSource::stored();
+    if account_token.current().is_none() {
+        return Err(OpenError::NotLoggedIn);
+    }
+    let base = account_base();
     let channel_id = pairing.data_channel_id.clone();
 
     let sink = Arc::new(super::ws::WsSink::new());
@@ -860,14 +981,213 @@ mod tests {
         handle.close().await;
     }
 
+    /// A token source over an empty temporary directory: no file, no env.
+    fn no_token(dir: &tempfile::TempDir) -> TokenSource {
+        TokenSource::new(dir.path().join("account-token"), None)
+    }
+
+    /// A token source whose file holds `token`.
+    fn file_token(dir: &tempfile::TempDir, token: &str) -> TokenSource {
+        let path = dir.path().join("account-token");
+        std::fs::write(&path, token).unwrap();
+        TokenSource::new(path, None)
+    }
+
+    /// A token source that only ever yields `token`, through the env slot, so
+    /// nothing on disk can be retired by a test that uses it.
+    fn fixed_token(dir: &tempfile::TempDir, token: &str) -> TokenSource {
+        TokenSource::new(dir.path().join("account-token"), Some(token.into()))
+    }
+
+    /// The files in `dir` whose names start with `account-token.expired-`.
+    fn retired_in(dir: &tempfile::TempDir) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("account-token.expired-"))
+            .map(|n| {
+                let body = std::fs::read_to_string(dir.path().join(&n)).unwrap();
+                (n, body)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn not_logged_in_reads_exactly_log_in_first() {
+        // The sidebar matches this text to offer sign-in. Changing it silently
+        // turns an expired login back into an unexplained failure.
+        assert_eq!(OpenError::NotLoggedIn.to_string(), "log in first");
+    }
+
+    #[test]
+    fn a_file_token_is_retired_on_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let tokens = file_token(&dir, "OLD");
+        let moved = tokens.retire_expired().expect("the file token is retired");
+        assert!(moved
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("account-token.expired-"));
+        assert_eq!(tokens.current(), None, "nothing left to present");
+        assert_eq!(retired_in(&dir).len(), 1);
+        assert_eq!(retired_in(&dir)[0].1, "OLD", "kept, not deleted");
+    }
+
+    #[test]
+    fn an_env_token_is_never_retired() {
+        // Headless: the operator injected the secret, and the file (if any) is
+        // not the token in use. Renaming it would change nothing that is wrong
+        // and lose something that is not.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("account-token");
+        std::fs::write(&path, "FILE").unwrap();
+        let tokens = TokenSource::new(&path, Some("ENV".into()));
+        assert_eq!(tokens.retire_expired(), None);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "FILE");
+        assert!(retired_in(&dir).is_empty());
+    }
+
+    #[test]
+    fn a_blank_env_does_not_shield_the_file_from_retirement() {
+        // A blank env is unset (see `resolve_token`), so the file is the token
+        // in use, and it is the file that expired.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("account-token");
+        std::fs::write(&path, "FILE").unwrap();
+        let tokens = TokenSource::new(&path, Some("  ".into()));
+        assert!(tokens.retire_expired().is_some());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn the_source_is_read_on_every_use() {
+        // What a re-login has to reach: a loop holding the source sees the new
+        // token without being restarted.
+        let dir = tempfile::tempdir().unwrap();
+        let tokens = no_token(&dir);
+        assert_eq!(tokens.current(), None);
+        std::fs::write(dir.path().join("account-token"), "NEW").unwrap();
+        assert_eq!(tokens.current().as_deref(), Some("NEW"));
+    }
+
+    #[tokio::test]
+    async fn an_expired_session_is_not_logged_in_and_retires_the_token() {
+        let srv = crate::remote::account::test_server::AccountServer::start(401, "{}").await;
+        let dir = tempfile::tempdir().unwrap();
+        file_token(&dir, "OLD");
+        assert!(!account_logged_in(&srv.base, &dir.path().join("account-token")).await);
+        assert_eq!(retired_in(&dir).len(), 1);
+        assert!(!dir.path().join("account-token").exists());
+    }
+
+    #[tokio::test]
+    async fn a_live_session_is_logged_in() {
+        let srv =
+            crate::remote::account::test_server::AccountServer::start(200, r#"{"token":"j"}"#)
+                .await;
+        let dir = tempfile::tempdir().unwrap();
+        file_token(&dir, "TOK");
+        assert!(account_logged_in(&srv.base, &dir.path().join("account-token")).await);
+        assert_eq!(srv.hits(), 1, "validated, not just found");
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_account_service_still_counts_as_logged_in() {
+        // Offline or a 5xx says nothing about the session; sending someone
+        // through a login they do not need is the wrong answer to a bad network.
+        let srv = crate::remote::account::test_server::AccountServer::start(500, "{}").await;
+        let dir = tempfile::tempdir().unwrap();
+        file_token(&dir, "TOK");
+        let path = dir.path().join("account-token");
+        assert!(account_logged_in(&srv.base, &path).await);
+        assert!(account_logged_in("http://127.0.0.1:1", &path).await);
+        assert!(path.exists(), "kept");
+    }
+
+    #[tokio::test]
+    async fn no_token_file_is_not_logged_in_without_asking() {
+        let srv =
+            crate::remote::account::test_server::AccountServer::start(200, r#"{"token":"j"}"#)
+                .await;
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!account_logged_in(&srv.base, &dir.path().join("account-token")).await);
+        assert_eq!(srv.hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_expired_session_refuses_the_open_as_not_logged_in() {
+        // The pre-flight is the first thing to meet an expired session. It
+        // used to report the parse failure behind the 401 — "no JWT in
+        // set-auth-jwt header or token body" — which pointed nowhere; the
+        // sidebar needs "log in first" to offer sign-in.
+        let srv = crate::remote::account::test_server::AccountServer::start(401, "{}").await;
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(Mutex::new(GatewayRegistry::new()));
+        let pairing = crate::remote::pairing::mint_agent("A-BCDE-FGHJ-KMNP").unwrap();
+        let outcome = open_mcp_channel_with_token(
+            &pairing,
+            Arc::new(crate::remote::mcp_tools::UnavailableBackend),
+            file_token(&dir, "OLD"),
+            srv.base.clone(),
+            &registry,
+        )
+        .await;
+        assert!(matches!(err_of(outcome), OpenError::NotLoggedIn));
+        assert_eq!(
+            retired_in(&dir)
+                .iter()
+                .map(|r| r.1.as_str())
+                .collect::<Vec<_>>(),
+            vec!["OLD"],
+            "the expired token is retired, not deleted"
+        );
+        assert!(registry.lock().await.is_empty(), "nothing registered");
+        assert!(!open_channels().await.contains(&pairing.control_channel_id));
+    }
+
+    #[tokio::test]
+    async fn an_expired_session_refuses_a_data_channel_too() {
+        let srv = crate::remote::account::test_server::AccountServer::start(401, "{}").await;
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(Mutex::new(GatewayRegistry::new()));
+        let (tx, _rx) = mpsc::channel(8);
+        let err = err_of(
+            open_channel_with_token(
+                req(),
+                file_token(&dir, "OLD"),
+                srv.base.clone(),
+                &registry,
+                &tx,
+            )
+            .await,
+        );
+        assert!(matches!(err, OpenError::NotLoggedIn));
+        assert_eq!(retired_in(&dir).len(), 1);
+        assert!(registry.lock().await.is_empty());
+    }
+
     #[tokio::test]
     async fn refuses_when_not_logged_in() {
         // No account token ⇒ nothing to mint a relay JWT from. Both callers
         // must fail the same way rather than opening a channel that can never
         // connect — and nothing may be left registered behind the failure.
+        let dir = tempfile::tempdir().unwrap();
         let registry = Arc::new(Mutex::new(GatewayRegistry::new()));
         let (tx, _rx) = mpsc::channel(8);
-        let err = err_of(open_channel_with_token(req(), None, &registry, &tx).await);
+        let err = err_of(
+            open_channel_with_token(
+                req(),
+                no_token(&dir),
+                "http://127.0.0.1:1".into(),
+                &registry,
+                &tx,
+            )
+            .await,
+        );
         assert!(matches!(err, OpenError::NotLoggedIn));
         assert!(
             registry.lock().await.is_empty(),
@@ -880,24 +1200,37 @@ mod tests {
         // Port 1 refuses immediately, standing in for an account host that is
         // unreachable. This message is what a container operator sees, so it
         // has to name the failure rather than just "could not open".
-        std::env::set_var("NEVOFLUX_ACCOUNT_URL", "http://127.0.0.1:1");
+        let dir = tempfile::tempdir().unwrap();
         let registry = Arc::new(Mutex::new(GatewayRegistry::new()));
         let (tx, _rx) = mpsc::channel(8);
-        let err =
-            err_of(open_channel_with_token(req(), Some("token".into()), &registry, &tx).await);
-        std::env::remove_var("NEVOFLUX_ACCOUNT_URL");
+        let err = err_of(
+            open_channel_with_token(
+                req(),
+                file_token(&dir, "token"),
+                "http://127.0.0.1:1".into(),
+                &registry,
+                &tx,
+            )
+            .await,
+        );
         assert!(matches!(err, OpenError::JwtMint(_)));
         assert!(registry.lock().await.is_empty());
+        assert!(
+            retired_in(&dir).is_empty(),
+            "an unreachable service says nothing about the session"
+        );
     }
 
     #[tokio::test]
     async fn an_agent_channel_refuses_when_not_logged_in() {
+        let dir = tempfile::tempdir().unwrap();
         let registry = Arc::new(Mutex::new(crate::remote::gateway::GatewayRegistry::new()));
         let pairing = crate::remote::pairing::mint_agent("A-BCDE-FGHJ-KMNP").unwrap();
         let outcome = open_mcp_channel_with_token(
             &pairing,
             Arc::new(crate::remote::mcp_tools::UnavailableBackend),
-            None,
+            no_token(&dir),
+            "http://127.0.0.1:1".into(),
             &registry,
         )
         .await;
@@ -1053,6 +1386,7 @@ mod tests {
     async fn an_agent_channel_without_a_key_is_refused_before_anything_is_registered() {
         // A token is supplied, so the refusal can only be the missing key: the
         // channel has no plaintext mode to fall back to.
+        let dir = tempfile::tempdir().unwrap();
         let registry = Arc::new(Mutex::new(GatewayRegistry::new()));
         let pairing = crate::remote::pairing::Pairing {
             control_key: "zz".repeat(32),
@@ -1061,7 +1395,8 @@ mod tests {
         let outcome = open_mcp_channel_with_token(
             &pairing,
             Arc::new(crate::remote::mcp_tools::UnavailableBackend),
-            Some("token".into()),
+            fixed_token(&dir, "token"),
+            "http://127.0.0.1:1".into(),
             &registry,
         )
         .await;

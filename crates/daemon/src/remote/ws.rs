@@ -226,6 +226,45 @@ impl ReconnectPolicy {
     }
 }
 
+/// The relay JWT for one connect attempt, or `None` to back off and retry.
+///
+/// The account token is read from `tokens` here, on every attempt, not once
+/// when the channel opened: a token captured then is the one that expires a
+/// week later, and a loop holding it re-presented it forever, so signing in
+/// again fixed nothing short of restarting the daemon.
+///
+/// No token means nobody is signed in (or the last one expired and was
+/// retired): there is nothing to mint with, so the account service is not
+/// asked, and the loop waits for sign-in at its usual backoff. An expired
+/// session retires the token (an env token is left alone) and waits the same
+/// way, rather than presenting it again to collect another 401.
+async fn next_jwt(
+    account_base: &str,
+    tokens: &super::start::TokenSource,
+    waiting: &mut bool,
+    what: &str,
+) -> Option<String> {
+    let Some(account_token) = tokens.current() else {
+        if !*waiting {
+            tracing::info!(target: "remote", "{what}: not signed in to nevoflux.app; waiting for sign-in");
+            *waiting = true;
+        }
+        return None;
+    };
+    *waiting = false;
+    match super::account::mint_do_jwt(account_base, &account_token).await {
+        Ok(jwt) => Some(jwt),
+        Err(super::account::MintError::SessionExpired) => {
+            tokens.retire_expired();
+            None
+        }
+        Err(super::account::MintError::Other(e)) => {
+            tracing::warn!(target: "remote", "mint {what} JWT failed: {e}");
+            None
+        }
+    }
+}
+
 /// Connect to the relay and serve the portal `gateway`, reconnecting with
 /// exponential backoff. `relay_base` is e.g. `wss://relay.nevoflux.app`.
 ///
@@ -254,7 +293,7 @@ pub async fn run_gateway(
     relay_base: &str,
     channel_id: &str,
     account_base: String,
-    account_token: String,
+    tokens: super::start::TokenSource,
     injector: Arc<dyn Injector>,
     sink: Arc<WsSink>,
     gateway: Arc<PortalGateway>,
@@ -265,15 +304,13 @@ pub async fn run_gateway(
 
     let dial = async {
         let mut policy = ReconnectPolicy::new();
+        // Logged once per outage, not once per attempt.
+        let mut waiting = false;
         loop {
             // Re-mint per attempt; a cached JWT expires after 15 minutes.
-            let token = match super::account::mint_do_jwt(&account_base, &account_token).await {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::warn!(target: "remote", "mint relay JWT failed: {e}");
-                    back_off(&mut policy, &registry, &gateway_id).await;
-                    continue;
-                }
+            let Some(token) = next_jwt(&account_base, &tokens, &mut waiting, "relay").await else {
+                back_off(&mut policy, &registry, &gateway_id).await;
+                continue;
             };
             // channel_id (alphanumeric+dash) and the JWT (base64url + dots) are URL-safe.
             let url = format!("{relay_base}/?c={channel_id}&t={token}");
@@ -416,7 +453,7 @@ pub async fn run_control_socket(
     relay_base: &str,
     channel_id: &str,
     account_base: String,
-    account_token: String,
+    tokens: super::start::TokenSource,
     sink: Arc<WsSink>,
     gateway: Arc<super::control_gateway::ControlGateway>,
     on_command: Arc<dyn ControlCommandSink>,
@@ -424,14 +461,13 @@ pub async fn run_control_socket(
 ) {
     let dial = async {
         let mut policy = ReconnectPolicy::new();
+        // Logged once per outage, not once per attempt.
+        let mut waiting = false;
         loop {
-            let token = match super::account::mint_do_jwt(&account_base, &account_token).await {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::warn!(target: "remote", "mint control relay JWT failed: {e}");
-                    tokio::time::sleep(policy.on_failure().wait).await;
-                    continue;
-                }
+            let Some(token) = next_jwt(&account_base, &tokens, &mut waiting, "control relay").await
+            else {
+                tokio::time::sleep(policy.on_failure().wait).await;
+                continue;
             };
             let url = format!("{relay_base}/?c={channel_id}&t={token}");
 
@@ -543,21 +579,20 @@ pub async fn run_mcp_socket(
     relay_base: &str,
     channel_id: &str,
     account_base: String,
-    account_token: String,
+    tokens: super::start::TokenSource,
     sink: Arc<WsSink>,
     gateway: Arc<super::mcp_gateway::McpGateway>,
     cancel: CancellationToken,
 ) {
     let dial = async {
         let mut policy = ReconnectPolicy::new();
+        // Logged once per outage, not once per attempt.
+        let mut waiting = false;
         loop {
-            let token = match super::account::mint_do_jwt(&account_base, &account_token).await {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::warn!(target: "remote", "mint agent relay JWT failed: {e}");
-                    tokio::time::sleep(policy.on_failure().wait).await;
-                    continue;
-                }
+            let Some(token) = next_jwt(&account_base, &tokens, &mut waiting, "agent relay").await
+            else {
+                tokio::time::sleep(policy.on_failure().wait).await;
+                continue;
             };
             let url = format!("{relay_base}/?c={channel_id}&t={token}");
 
@@ -662,7 +697,7 @@ pub async fn run_media_socket(
     relay_base: &str,
     channel_id: &str,
     account_base: String,
-    account_token: String,
+    tokens: super::start::TokenSource,
     sink: Arc<WsSink>,
     cancel: CancellationToken,
 ) {
@@ -670,14 +705,13 @@ pub async fn run_media_socket(
 
     let dial = async {
         let mut policy = ReconnectPolicy::new();
+        // Logged once per outage, not once per attempt.
+        let mut waiting = false;
         loop {
-            let token = match super::account::mint_do_jwt(&account_base, &account_token).await {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::warn!(target: "remote", "mint media relay JWT failed: {e}");
-                    tokio::time::sleep(policy.on_failure().wait).await;
-                    continue;
-                }
+            let Some(token) = next_jwt(&account_base, &tokens, &mut waiting, "media relay").await
+            else {
+                tokio::time::sleep(policy.on_failure().wait).await;
+                continue;
             };
             let url = format!("{relay_base}/?c={channel}&t={token}");
 
@@ -987,6 +1021,194 @@ mod tests {
 
     // --- ⑤ channel shutdown ------------------------------------------------
 
+    /// A token source that always yields `"token"`, through the env slot, so
+    /// a loop that is told the session expired has nothing on disk to retire.
+    fn fixed_token() -> super::super::start::TokenSource {
+        super::super::start::TokenSource::new(
+            std::env::temp_dir().join("nf-ws-test-no-such-account-token"),
+            Some("token".into()),
+        )
+    }
+
+    // --- expired login ------------------------------------------------------
+
+    /// Let a loop run, then cancel it and require that it actually ends.
+    async fn run_then_cancel(task: tokio::task::JoinHandle<()>, cancel: CancellationToken) {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("cancelling must end the loop")
+            .expect("the task must finish without panicking");
+    }
+
+    #[tokio::test]
+    async fn the_mcp_loop_waits_for_sign_in_instead_of_minting() {
+        // Signed out (or retired after expiry): there is nothing to mint with,
+        // so the account service must not be asked — and the loop must still
+        // be there, waiting, for when somebody signs in again.
+        use crate::remote::mcp_gateway::McpGateway;
+        use crate::remote::mcp_tools::UnavailableBackend;
+        let srv =
+            super::super::account::test_server::AccountServer::start(200, r#"{"token":"j"}"#).await;
+        let dir = tempfile::tempdir().unwrap();
+        let sink = Arc::new(WsSink::new());
+        let gw = Arc::new(McpGateway::new(
+            [0u8; 32],
+            sink.clone(),
+            Arc::new(UnavailableBackend),
+            "c-wait",
+        ));
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_mcp_socket(
+            "ws://127.0.0.1:1",
+            "c-wait",
+            srv.base.clone(),
+            super::super::start::TokenSource::new(dir.path().join("account-token"), None),
+            sink,
+            gw,
+            cancel.clone(),
+        ));
+        run_then_cancel(task, cancel).await;
+        assert_eq!(srv.hits(), 0, "no token, no mint");
+    }
+
+    #[tokio::test]
+    async fn the_media_loop_waits_for_sign_in_instead_of_minting() {
+        let srv =
+            super::super::account::test_server::AccountServer::start(200, r#"{"token":"j"}"#).await;
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_media_socket(
+            "ws://127.0.0.1:1",
+            "chan-wait-media",
+            srv.base.clone(),
+            super::super::start::TokenSource::new(dir.path().join("account-token"), None),
+            Arc::new(WsSink::new()),
+            cancel.clone(),
+        ));
+        run_then_cancel(task, cancel).await;
+        assert_eq!(srv.hits(), 0, "no token, no mint");
+    }
+
+    #[tokio::test]
+    async fn the_chat_loop_waits_for_sign_in_instead_of_minting() {
+        let srv =
+            super::super::account::test_server::AccountServer::start(200, r#"{"token":"j"}"#).await;
+        let dir = tempfile::tempdir().unwrap();
+        let (sink, gw) = closable("sess-wait-chat", "chan-wait-chat");
+        let registry = Arc::new(Mutex::new(super::super::gateway::GatewayRegistry::new()));
+        registry.lock().await.register(gw.clone());
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let injector: Arc<dyn Injector> =
+            Arc::new(super::super::inject::ChannelInjector::new(tx, "p"));
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_gateway(
+            "ws://127.0.0.1:1",
+            "chan-wait-chat",
+            srv.base.clone(),
+            super::super::start::TokenSource::new(dir.path().join("account-token"), None),
+            injector,
+            sink,
+            gw,
+            registry.clone(),
+            cancel.clone(),
+        ));
+        run_then_cancel(task, cancel).await;
+        assert_eq!(srv.hits(), 0, "no token, no mint");
+        assert!(registry.lock().await.is_empty());
+        super::super::push::forget("sess-wait-chat");
+    }
+
+    #[tokio::test]
+    async fn the_control_loop_waits_for_sign_in_instead_of_minting() {
+        struct Ignore;
+        #[async_trait]
+        impl ControlCommandSink for Ignore {
+            async fn handle(&self, _: super::super::control_gateway::ControlCommand) {}
+        }
+        struct NoSessions;
+        #[async_trait]
+        impl super::super::control_gateway::SessionSource for NoSessions {
+            async fn page(&self, _: u32) -> Vec<super::super::session_list::StoredSession> {
+                Vec::new()
+            }
+            async fn by_ids(&self, _: &[String]) -> Vec<super::super::session_list::StoredSession> {
+                Vec::new()
+            }
+        }
+        let srv =
+            super::super::account::test_server::AccountServer::start(200, r#"{"token":"j"}"#).await;
+        let dir = tempfile::tempdir().unwrap();
+        let sink = Arc::new(WsSink::new());
+        let gateway = Arc::new(super::super::control_gateway::ControlGateway::new(
+            None,
+            sink.clone(),
+            Arc::new(super::super::runtime_state::RuntimeTracker::new()),
+            Arc::new(NoSessions),
+            "chan-wait-control",
+        ));
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_control_socket(
+            "ws://127.0.0.1:1",
+            "chan-wait-control",
+            srv.base.clone(),
+            super::super::start::TokenSource::new(dir.path().join("account-token"), None),
+            sink,
+            gateway,
+            Arc::new(Ignore),
+            cancel.clone(),
+        ));
+        run_then_cancel(task, cancel).await;
+        assert_eq!(srv.hits(), 0, "no token, no mint");
+    }
+
+    #[tokio::test]
+    async fn a_loop_told_the_session_expired_retires_the_token_and_stops_asking() {
+        // A token captured at open time used to be re-presented forever, a 401
+        // every attempt. Now the first 401 retires it, and with nothing left to
+        // present the loop waits for sign-in rather than asking again.
+        use crate::remote::mcp_gateway::McpGateway;
+        use crate::remote::mcp_tools::UnavailableBackend;
+        let srv = super::super::account::test_server::AccountServer::start(401, "{}").await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("account-token");
+        std::fs::write(&path, "OLD").unwrap();
+        let sink = Arc::new(WsSink::new());
+        let gw = Arc::new(McpGateway::new(
+            [0u8; 32],
+            sink.clone(),
+            Arc::new(UnavailableBackend),
+            "c-expired",
+        ));
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_mcp_socket(
+            "ws://127.0.0.1:1",
+            "c-expired",
+            srv.base.clone(),
+            super::super::start::TokenSource::new(&path, None),
+            sink,
+            gw,
+            cancel.clone(),
+        ));
+        // Long enough for several attempts at the base backoff.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("cancelling must end the loop")
+            .unwrap();
+        assert!(!path.exists(), "the expired token is out of the way");
+        let retired: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("account-token.expired-"))
+            .collect();
+        assert_eq!(retired.len(), 1, "{retired:?}");
+        assert_eq!(srv.hits(), 1, "asked once, not every attempt");
+    }
+
     /// A gateway whose channel never had to reach the network.
     fn closable(session: &str, channel: &str) -> (Arc<WsSink>, Arc<PortalGateway>) {
         let sink = Arc::new(WsSink::new());
@@ -1019,7 +1241,7 @@ mod tests {
             "ws://127.0.0.1:1", // nothing listens
             "chan-cancel-loop",
             "http://127.0.0.1:1".into(), // and the mint refuses at once
-            "token".into(),
+            fixed_token(),
             injector,
             sink,
             gw,
@@ -1064,7 +1286,7 @@ mod tests {
                 "ws://127.0.0.1:1",
                 "chan-cancel-early",
                 "http://127.0.0.1:1".into(),
-                "token".into(),
+                fixed_token(),
                 injector,
                 sink,
                 gw,
@@ -1113,7 +1335,7 @@ mod tests {
             "ws://127.0.0.1:1",
             "chan-cancel-control",
             "http://127.0.0.1:1".into(),
-            "token".into(),
+            fixed_token(),
             sink,
             gateway,
             Arc::new(Ignore),
@@ -1136,7 +1358,7 @@ mod tests {
             "ws://127.0.0.1:1",
             "chan-cancel-media",
             "http://127.0.0.1:1".into(),
-            "token".into(),
+            fixed_token(),
             sink,
             cancel.clone(),
         ));
@@ -1168,7 +1390,7 @@ mod tests {
                     "ws://127.0.0.1:1",
                     "c-1",
                     "http://127.0.0.1:1".into(),
-                    "tok".into(),
+                    fixed_token(),
                     s,
                     g,
                     c,
