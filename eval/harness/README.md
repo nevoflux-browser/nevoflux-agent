@@ -463,6 +463,69 @@ unchanged. Two parts:
 tests cover both gates (flagged, low risk, Jev down, read-only, point off,
 unattended).
 
+## G2 gate, 2026-10-06
+
+G2 (spec §6) compares the Jev A/B set (`tasks/jev`, 30 tasks, 10 Chinese) in
+three arms: Jev off, Jev on, and Jev on with `jev.points.tools=false` (the
+§8.2 tool-assembly comparison). `gate.py` reads the three results directories
+and gives the verdict:
+
+- **quality path** — score ≥ +δ and effective cost ≤ +ρ (ρ = 25%, ADR J11);
+- **efficiency path** — score ≥ −δ and cost ≤ −X%; X is not set yet, so it
+  is "not evaluable" unless `--x` is passed;
+- **hard gates** — the P50 Jev wait per step ≤ 250 ms over all steps, and
+  the Chinese subset (`-zh-` ids) not below Jev off − δ;
+- **§8.2** — `split` when Jev on beats Jev-without-tools by less than δ and
+  costs more, otherwise `keep`.
+
+δ = max(2·sd of the off arm's per-rep scores, 1/number of tasks): on a steady
+baseline a tie is not a gain. The verdict is **INVALID** (exit 2) when the
+arms ran different tasks or k, an arm misses > 10% of its trials, or a Jev
+arm shows Jev never answered (no calls, or > 50% fallbacks). More than 10%
+estimated usage is a low-confidence warning.
+
+**Effective cost C** (v1.4 §10.4, `calibrate.effective_cost`), in equivalent
+input tokens: uncached input 1, cache write 1.25, cache read 0.1, output 5,
+Jev input 1 and output 5 (TypeSafe's price is unknown; pricing Jev like the
+main model counts against it). Override with `--weights jev_input=0.2,...`.
+
+**Jev wait** (`jev/wait{site, ms}` in the session log) is the time the loop
+was blocked on Jev — not request time, since most requests overlap tool
+execution. Sites: `turn_start` (tools, skills and history at the turn's
+start), `rebuild` (mid-turn), `act`, `signals` (settling the step's signals),
+`visibility` (the tab probe and the grade), `permissions`. A wait counts
+against the step it happened in; the turn-start wait against the turn's first
+step; a step without one is 0 ms.
+
+**Dry run** (fake model, real TypeSafe, `jev-flights-cheapest`,
+`jev-flights-followup`, `jev-zh-shop-cheapest`, k=1): the off arm logged no
+`jev/wait`; each Jev arm logged `turn_start` 4×, `signals` 3×, `visibility`
+1×. Waits: turn start 595–925 ms, signals 262–729 ms, visibility 479–815 ms;
+P50 over the 16 steps 0 ms, P90 1191 ms. The fake model's tools return
+instantly, so the signals waits here are not masked the way real tool time
+would mask them. Verdict FAIL (score tie at 0.333, cost +593% — the fake
+model reports almost no tokens, so Jev's dominate). It proves the plumbing,
+not Jev.
+
+**The real run** (needs quota; about 95M tokens on Kimi k3, roughly 11
+five-hour windows; 180 trials without the tools arm). Rebuild release from
+`main` first; run each arm in the usual resume-across-quota loop (re-running
+the same command resumes):
+
+```bash
+K="$(tr -d '\r\n' < …/spikes/s4/.key)"
+COMMON=(--tasks eval/harness/tasks/jev --k 3 --set llm.provider=anthropic --site-host localtest.me)
+python -m eval.harness.run "${COMMON[@]}" --set jev.enabled=false --out eval/results/g2-off
+NEVOFLUX_API_KEY_TYPESAFE="$K" python -m eval.harness.run "${COMMON[@]}" --set jev.enabled=true --out eval/results/g2-on
+NEVOFLUX_API_KEY_TYPESAFE="$K" python -m eval.harness.run "${COMMON[@]}" --set jev.enabled=true \
+  --set jev.points.tools=false --out eval/results/g2-notools
+python -m eval.harness.gate --off eval/results/g2-off --on eval/results/g2-on \
+  --on-notools eval/results/g2-notools --out eval/results/g2/report.md
+```
+
+The A/B set has only been run against the fake model during development, so
+it serves as the held-out set.
+
 ## Known gaps
 
 - Agent-loop tasks have no deadline on the daemon side: `wall_clock_secs`
