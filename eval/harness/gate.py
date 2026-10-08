@@ -52,11 +52,15 @@ def _cost(rows, weights):
 
 
 def gate(off, on, notools=None, *, rho=RHO, x=None, latency_ms=LATENCY_MS,
-         weights=DEFAULT_WEIGHTS):
-    """The G2 verdict for trial rows of each arm (see the module docs)."""
+         weights=DEFAULT_WEIGHTS, exclude=()):
+    """The G2 verdict for trial rows of each arm (see the module docs).
+    `exclude` names tasks left out of every arm before any check — tasks a
+    provider refuses outright measure the provider, not the model."""
+    exclude = set(exclude)
     arms = {"off": _latest(off), "on": _latest(on)}
     if notools is not None:
         arms["notools"] = _latest(notools)
+    arms = {k: [r for r in v if r["task_id"] not in exclude] for k, v in arms.items()}
     problems, warnings = [], []
 
     tasks = {k: frozenset(r["task_id"] for r in v) for k, v in arms.items()}
@@ -132,6 +136,7 @@ def gate(off, on, notools=None, *, rho=RHO, x=None, latency_ms=LATENCY_MS,
 
     return {
         "valid": valid, "problems": problems, "warnings": warnings, "delta": delta,
+        "excluded": sorted(exclude),
         "rho": rho, "x": x, "latency_ms": latency_ms,
         "score": score, "cost": cost, "latency": latency,
         "zh": {"off": zh_off, "on": zh_on, "regressed": regressed},
@@ -154,6 +159,8 @@ def render(v) -> str:
     """The verdict as a Markdown report."""
     title = "INVALID" if not v["valid"] else ("PASS" if v["pass"] else "FAIL")
     out = [f"# G2: {title}", ""]
+    if v.get("excluded"):
+        out += [f"Excluded tasks: {', '.join(v['excluded'])}", ""]
     if v["problems"]:
         out += ["**Problems** (the verdict is not usable):", ""]
         out += [f"- {p}" for p in v["problems"]] + [""]
@@ -211,10 +218,12 @@ def main(argv=None) -> int:
     ap.add_argument("--on-notools", help="Jev-on, tools point off (§8.2)")
     ap.add_argument("--x", type=float, help="efficiency path: required cost cut, percent")
     ap.add_argument("--weights", help="effective cost weights, k=v,... over the defaults")
+    ap.add_argument("--exclude", default="", help="task ids left out of every arm, comma-separated")
     ap.add_argument("--out", help="write the report here and the verdict to <out>.json")
     a = ap.parse_args(argv)
     v = gate(_read(a.off), _read(a.on), _read(a.on_notools) if a.on_notools else None,
-             x=a.x, weights=_weights(a.weights))
+             x=a.x, weights=_weights(a.weights),
+             exclude=[t for t in a.exclude.split(",") if t])
     md = render(v)
     # UTF-8 bytes: the Windows console's cp1252 cannot encode δ / ρ / ✓.
     out_stream = getattr(sys.stdout, "buffer", None)
