@@ -1,6 +1,6 @@
 import unittest
 
-from eval.harness.run import latest_rows, plan_trials, should_stop
+from eval.harness.run import _summary, latest_rows, plan_trials, should_stop
 from eval.harness.taskspec import TaskSpec
 
 
@@ -27,6 +27,17 @@ class ResumeTest(unittest.TestCase):
         latest = latest_rows(rows)
         self.assertEqual(len(latest), 2)
         self.assertTrue(all(r["status"] == "succeeded" for r in latest))
+
+
+class SummaryTest(unittest.TestCase):
+    def test_a_resume_with_only_counts_only_the_selected_tasks(self):
+        # Rows of a task left out by --only (an earlier full run) must not make
+        # the run look incomplete or full of provider errors.
+        rows = [row(0, "a", "succeeded", True), row(0, "x", "provider_error"),
+                row(1, "a", "succeeded", True), row(1, "x", "provider_error")]
+        s = _summary(rows, [spec("a")], 2)
+        self.assertEqual((s["trials"], s["expected_trials"]), (2, 2))
+        self.assertEqual(s["provider_errors"], 0)
 
 
 class StopTest(unittest.TestCase):

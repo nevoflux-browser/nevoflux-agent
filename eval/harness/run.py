@@ -62,8 +62,11 @@ def should_stop(statuses, n=STOP_AFTER):
 
 
 def _summary(rows, specs, k):
-    rows = latest_rows(rows)
     ids = [s.id for s in specs]
+    # Only this run's tasks and reps: a resume with --only must not count the
+    # rows of tasks it left out.
+    wanted = set(ids)
+    rows = [r for r in latest_rows(rows) if r["task_id"] in wanted and r["rep"] < k]
     per_task = {i: statistics.mean(r["pass"] for r in rows if r["task_id"] == i)
                 for i in ids if any(r["task_id"] == i for r in rows)}
     per_rep = [statistics.mean(r["pass"] for r in rows if r["rep"] == rep)
