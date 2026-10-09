@@ -1,0 +1,25 @@
+{
+ "id": "jev2-en-cause-1",
+ "set": "jev2-uncalibrated",
+ "lang": "en",
+ "site": "ops",
+ "task": "Open {base}/incidents/INC-0103.html and find the confirmed root cause of this incident (the log may also show an earlier, unconfirmed guess). End your reply with a final line in the form 'ANSWER: <the confirmed cause, copied exactly>'.",
+ "followups": [],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "ANSWER[:：]\\s*message\\ queue\\ consumer\\ stuck\\ on\\ a\\ poison\\ message",
+   "turn": -1
+  }
+ ],
+ "tags": [
+  "jev2",
+  "cause"
+ ],
+ "timeout_secs": 300,
+ "answer": "message queue consumer stuck on a poison message",
+ "params": {
+  "kind": "cause",
+  "incident": "INC-0103"
+ }
+}

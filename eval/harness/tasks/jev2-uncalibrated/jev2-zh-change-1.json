@@ -1,0 +1,37 @@
+{
+ "id": "jev2-zh-change-1",
+ "set": "jev2-uncalibrated",
+ "lang": "zh",
+ "site": "ops-zh",
+ "task": "根据从 {base}/incidents/page-1.html 开始的全部故障列表页，“通知”服务有多少条处理中的 SEV1 故障？回复的最后一行写成“ANSWER: <数字>”。",
+ "followups": [
+  {
+   "message": "抱歉，我说的是“库存”服务，而且请把 SEV1 和 SEV2 一起算（仍然只算处理中的）。回复的最后一行写成“ANSWER: <数字>”。"
+  }
+ ],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "ANSWER[:：]\\s*1(?![\\d.])",
+   "turn": 0
+  },
+  {
+   "type": "output_regex",
+   "pattern": "ANSWER[:：]\\s*2(?![\\d.])",
+   "turn": 1
+  }
+ ],
+ "tags": [
+  "jev2",
+  "change",
+  "multi",
+  "long"
+ ],
+ "timeout_secs": 900,
+ "answer": "2",
+ "params": {
+  "kind": "change",
+  "s1": "通知",
+  "s2": "库存"
+ }
+}

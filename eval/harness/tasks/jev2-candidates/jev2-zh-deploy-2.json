@@ -1,0 +1,26 @@
+{
+ "id": "jev2-zh-deploy-2",
+ "set": "jev2-candidates",
+ "lang": "zh",
+ "site": "ops-zh",
+ "task": "故障 INC-0200（{base}/incidents/INC-0200.html）影响了“推荐”服务。根据 {base}/changes/page-1.html 的变更记录（按时间倒序，共好几页），故障开始之前最后一次发布的“推荐”版本是哪个？回复的最后一行写成“ANSWER: <版本号>”。",
+ "followups": [],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "ANSWER[:：]\\s*v3\\.3\\.2(?![\\d.])",
+   "turn": -1
+  }
+ ],
+ "tags": [
+  "jev2",
+  "deploy",
+  "long"
+ ],
+ "timeout_secs": 900,
+ "answer": "v3.3.2",
+ "params": {
+  "kind": "deploy",
+  "incident": "INC-0200"
+ }
+}

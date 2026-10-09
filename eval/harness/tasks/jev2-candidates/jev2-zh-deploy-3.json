@@ -1,0 +1,26 @@
+{
+ "id": "jev2-zh-deploy-3",
+ "set": "jev2-candidates",
+ "lang": "zh",
+ "site": "ops-zh",
+ "task": "故障 INC-0236（{base}/incidents/INC-0236.html）影响了“库存”服务。根据 {base}/changes/page-1.html 的变更记录（按时间倒序，共好几页），故障开始之前最后一次发布的“库存”版本是哪个？回复的最后一行写成“ANSWER: <版本号>”。",
+ "followups": [],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "ANSWER[:：]\\s*v4\\.3\\.13(?![\\d.])",
+   "turn": -1
+  }
+ ],
+ "tags": [
+  "jev2",
+  "deploy",
+  "long"
+ ],
+ "timeout_secs": 900,
+ "answer": "v4.3.13",
+ "params": {
+  "kind": "deploy",
+  "incident": "INC-0236"
+ }
+}

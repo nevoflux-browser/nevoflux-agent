@@ -589,6 +589,56 @@ A 112 KB valid body sent 6 times did not reproduce it, so it is not yet known
 whether the daemon or the transport is at fault. Logging the body on such a
 400 is the next step.
 
+## jev2 (uncalibrated — do not use for G2), 2026-10-09
+
+An attempt at a harder Jev A/B set. **It missed its target, so it must not be
+used for G2:** the Jev-off baseline was 0.944, so the quality path (≥ +δ) is
+impossible on it, as on `tasks/jev`.
+
+**Contents:**
+- **Synthetic ops portal.** `sites/ops` (en) and `sites/ops-zh` (zh) are
+  generated from a seed by `sites/ops/data.py` + `build.py`:
+  - 240 incidents over 12 list pages;
+  - incident pages with 8–25 KB logs that hide the confirmed root cause
+    after a preliminary one;
+  - a services catalogue, people and on-call pages, a paginated changelog;
+  - a report form that beacons what was filed.
+
+  The pages are **not committed**. `run.py` builds them on demand
+  (`ensure_generated_sites`) and rebuilds them when the sources change.
+- **42 candidates.** `tasks/jev2-candidates/` holds 7 kinds × en/zh × 3:
+  - count across pages;
+  - confirmed cause;
+  - three-hop join;
+  - mid-session change;
+  - a back-reference to the first turn;
+  - last deploy before;
+  - aggregate-then-file-a-report.
+
+  `_make.py` generates them, and a test recomputes every answer from the data.
+- **The selected 30.** `select_tasks.py` holds the selection rule;
+  `tasks/jev2-uncalibrated/` holds the 30 it picked.
+
+**Calibration** (DeepSeek `deepseek-flash`, Jev off):
+- The pilot over all candidates (k=2) scored 0.893.
+- The selection picked 30 at a pilot mean of 0.850.
+- The fresh baseline on those 30 (k=3) scored **0.944** (per-rep 0.967 / 0.967 / 0.900;
+  zh 0.900, en 0.967). Each trial cost about 0.16 RMB.
+
+The pilot's failures did not repeat: DeepSeek's misses here are random
+slips, not difficulty.
+
+**Why no set like this can show Jev's quality effect.** Across every eval run
+so far, the context per call stayed far below the window (median ~35k
+tokens, max under 60k), with no context compaction at all. Jev is built for
+context pressure: long sessions whose context fills up. These tasks never
+create it. NevoFlux is not a coding agent, and such sessions are uncommon,
+so Jev work is paused and Jev stays off by default.
+
+A future context-pressure benchmark should be built around sessions that
+approach the context window. The ops portal and the
+answers-computed-from-data approach are its starting point.
+
 ## Known gaps
 
 - Agent-loop tasks have no deadline on the daemon side: `wall_clock_secs`

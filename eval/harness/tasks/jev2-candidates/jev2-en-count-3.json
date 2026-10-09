@@ -1,0 +1,26 @@
+{
+ "id": "jev2-en-count-3",
+ "set": "jev2-candidates",
+ "lang": "en",
+ "site": "ops",
+ "task": "The incident list at {base}/incidents/page-1.html continues over several pages. How many incidents for the auth service with severity SEV1 or SEV2 were opened in September 2026 and are not archived? Check every page. End your reply with a final line in the form 'ANSWER: <number>'.",
+ "followups": [],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "ANSWER[:：]\\s*3(?![\\d.])",
+   "turn": -1
+  }
+ ],
+ "tags": [
+  "jev2",
+  "count",
+  "long"
+ ],
+ "timeout_secs": 900,
+ "answer": "3",
+ "params": {
+  "kind": "count",
+  "service": "auth"
+ }
+}

@@ -1,0 +1,37 @@
+{
+ "id": "jev2-en-change-3",
+ "set": "jev2-uncalibrated",
+ "lang": "en",
+ "site": "ops",
+ "task": "Using all pages of the incident list starting at {base}/incidents/page-1.html, how many open SEV1 incidents does the billing service have? End your reply with a final line in the form 'ANSWER: <number>'.",
+ "followups": [
+  {
+   "message": "Sorry, I meant the checkout service, and please count SEV1 and SEV2 together (still only open incidents). End your reply with a final line in the form 'ANSWER: <number>'."
+  }
+ ],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "ANSWER[:：]\\s*1(?![\\d.])",
+   "turn": 0
+  },
+  {
+   "type": "output_regex",
+   "pattern": "ANSWER[:：]\\s*2(?![\\d.])",
+   "turn": 1
+  }
+ ],
+ "tags": [
+  "jev2",
+  "change",
+  "multi",
+  "long"
+ ],
+ "timeout_secs": 900,
+ "answer": "2",
+ "params": {
+  "kind": "change",
+  "s1": "billing",
+  "s2": "checkout"
+ }
+}

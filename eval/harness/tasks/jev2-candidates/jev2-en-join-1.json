@@ -1,0 +1,43 @@
+{
+ "id": "jev2-en-join-1",
+ "set": "jev2-candidates",
+ "lang": "en",
+ "site": "ops",
+ "task": "Open {base}/incidents/INC-0228.html. Which service did this incident affect, and when did it open?",
+ "followups": [
+  {
+   "message": "Which team owns that service? The service list is at {base}/services.html."
+  },
+  {
+   "message": "Who was on call for that team in the week the incident opened? The rota is on {base}/people.html (weeks start on Monday). End your reply with a final line in the form 'ANSWER: <name>'."
+  }
+ ],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "auth",
+   "turn": 0
+  },
+  {
+   "type": "output_regex",
+   "pattern": "Ember",
+   "turn": 1
+  },
+  {
+   "type": "output_regex",
+   "pattern": "ANSWER[:：]\\s*Avery\\ Quill(?!\\w)",
+   "turn": 2
+  }
+ ],
+ "tags": [
+  "jev2",
+  "join",
+  "multi"
+ ],
+ "timeout_secs": 600,
+ "answer": "Avery Quill",
+ "params": {
+  "kind": "join",
+  "incident": "INC-0228"
+ }
+}

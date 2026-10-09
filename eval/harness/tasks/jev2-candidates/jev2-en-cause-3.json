@@ -1,0 +1,25 @@
+{
+ "id": "jev2-en-cause-3",
+ "set": "jev2-candidates",
+ "lang": "en",
+ "site": "ops",
+ "task": "Open {base}/incidents/INC-0098.html and find the confirmed root cause of this incident (the log may also show an earlier, unconfirmed guess). End your reply with a final line in the form 'ANSWER: <the confirmed cause, copied exactly>'.",
+ "followups": [],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "ANSWER[:：]\\s*network\\ partition\\ between\\ availability\\ zones",
+   "turn": -1
+  }
+ ],
+ "tags": [
+  "jev2",
+  "cause"
+ ],
+ "timeout_secs": 300,
+ "answer": "network partition between availability zones",
+ "params": {
+  "kind": "cause",
+  "incident": "INC-0098"
+ }
+}

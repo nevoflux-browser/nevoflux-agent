@@ -1,0 +1,56 @@
+{
+ "id": "jev2-zh-backref-3",
+ "set": "jev2-candidates",
+ "lang": "zh",
+ "site": "ops-zh",
+ "task": "{base}/incidents/INC-0053.html 这次故障已确认的根本原因是什么？",
+ "followups": [
+  {
+   "message": "{base}/incidents/INC-0093.html 这次故障已确认的根本原因是什么？"
+  },
+  {
+   "message": "{base}/incidents/INC-0194.html 这次故障已确认的根本原因是什么？"
+  },
+  {
+   "message": "回到这次对话里我们看的第一个故障：从开始到解决一共过了多少个整小时？回复的最后一行写成“ANSWER: <整小时数>”。"
+  }
+ ],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "数据库迁移锁住了订单表",
+   "turn": 0
+  },
+  {
+   "type": "output_regex",
+   "pattern": "DNS\\ 记录指向已下线的主机",
+   "turn": 1
+  },
+  {
+   "type": "output_regex",
+   "pattern": "移动客户端引发重试风暴",
+   "turn": 2
+  },
+  {
+   "type": "output_regex",
+   "pattern": "ANSWER[:：]\\s*68(?![\\d.])",
+   "turn": 3
+  }
+ ],
+ "tags": [
+  "jev2",
+  "backref",
+  "multi",
+  "long"
+ ],
+ "timeout_secs": 900,
+ "answer": "68",
+ "params": {
+  "kind": "backref",
+  "incident": "INC-0053",
+  "others": [
+   "INC-0093",
+   "INC-0194"
+  ]
+ }
+}

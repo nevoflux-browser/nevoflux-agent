@@ -1,0 +1,26 @@
+{
+ "id": "jev2-en-deploy-3",
+ "set": "jev2-uncalibrated",
+ "lang": "en",
+ "site": "ops",
+ "task": "Incident INC-0182 ({base}/incidents/INC-0182.html) hit the recommendations service. Using the changelog at {base}/changes/page-1.html (newest first, several pages), what was the last version of recommendations deployed before the incident opened? End your reply with a final line in the form 'ANSWER: <version>'.",
+ "followups": [],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "ANSWER[:：]\\s*v2\\.6\\.17(?![\\d.])",
+   "turn": -1
+  }
+ ],
+ "tags": [
+  "jev2",
+  "deploy",
+  "long"
+ ],
+ "timeout_secs": 900,
+ "answer": "v2.6.17",
+ "params": {
+  "kind": "deploy",
+  "incident": "INC-0182"
+ }
+}

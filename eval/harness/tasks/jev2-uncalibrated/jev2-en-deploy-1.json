@@ -1,0 +1,26 @@
+{
+ "id": "jev2-en-deploy-1",
+ "set": "jev2-uncalibrated",
+ "lang": "en",
+ "site": "ops",
+ "task": "Incident INC-0073 ({base}/incidents/INC-0073.html) hit the catalog service. Using the changelog at {base}/changes/page-1.html (newest first, several pages), what was the last version of catalog deployed before the incident opened? End your reply with a final line in the form 'ANSWER: <version>'.",
+ "followups": [],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "ANSWER[:：]\\s*v3\\.0\\.3(?![\\d.])",
+   "turn": -1
+  }
+ ],
+ "tags": [
+  "jev2",
+  "deploy",
+  "long"
+ ],
+ "timeout_secs": 900,
+ "answer": "v3.0.3",
+ "params": {
+  "kind": "deploy",
+  "incident": "INC-0073"
+ }
+}

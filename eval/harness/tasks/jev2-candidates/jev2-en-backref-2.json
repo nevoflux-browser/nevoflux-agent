@@ -1,0 +1,56 @@
+{
+ "id": "jev2-en-backref-2",
+ "set": "jev2-candidates",
+ "lang": "en",
+ "site": "ops",
+ "task": "What is the confirmed root cause of the incident at {base}/incidents/INC-0239.html?",
+ "followups": [
+  {
+   "message": "What is the confirmed root cause of the incident at {base}/incidents/INC-0135.html?"
+  },
+  {
+   "message": "What is the confirmed root cause of the incident at {base}/incidents/INC-0138.html?"
+  },
+  {
+   "message": "Going back to the first incident we looked at in this conversation: how many whole hours passed between when it opened and when it was resolved? End your reply with a final line in the form 'ANSWER: <whole hours>'."
+  }
+ ],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "feature\\ flag\\ enabled\\ for\\ all\\ regions\\ at\\ once",
+   "turn": 0
+  },
+  {
+   "type": "output_regex",
+   "pattern": "stale\\ CDN\\ cache\\ after\\ a\\ purge\\ failure",
+   "turn": 1
+  },
+  {
+   "type": "output_regex",
+   "pattern": "feature\\ flag\\ enabled\\ for\\ all\\ regions\\ at\\ once",
+   "turn": 2
+  },
+  {
+   "type": "output_regex",
+   "pattern": "ANSWER[:：]\\s*19(?![\\d.])",
+   "turn": 3
+  }
+ ],
+ "tags": [
+  "jev2",
+  "backref",
+  "multi",
+  "long"
+ ],
+ "timeout_secs": 900,
+ "answer": "19",
+ "params": {
+  "kind": "backref",
+  "incident": "INC-0239",
+  "others": [
+   "INC-0135",
+   "INC-0138"
+  ]
+ }
+}

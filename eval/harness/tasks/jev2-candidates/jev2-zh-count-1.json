@@ -1,0 +1,26 @@
+{
+ "id": "jev2-zh-count-1",
+ "set": "jev2-candidates",
+ "lang": "zh",
+ "site": "ops-zh",
+ "task": "{base}/incidents/page-1.html 的故障列表分好几页。“搜索”服务在 2026 年 9 月开始、未归档、严重级别为 SEV1 或 SEV2 的故障一共有多少条？请检查每一页。回复的最后一行写成“ANSWER: <数字>”。",
+ "followups": [],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "ANSWER[:：]\\s*4(?![\\d.])",
+   "turn": -1
+  }
+ ],
+ "tags": [
+  "jev2",
+  "count",
+  "long"
+ ],
+ "timeout_secs": 900,
+ "answer": "4",
+ "params": {
+  "kind": "count",
+  "service": "搜索"
+ }
+}

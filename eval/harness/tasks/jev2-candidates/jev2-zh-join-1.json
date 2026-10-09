@@ -1,0 +1,43 @@
+{
+ "id": "jev2-zh-join-1",
+ "set": "jev2-candidates",
+ "lang": "zh",
+ "site": "ops-zh",
+ "task": "打开 {base}/incidents/INC-0026.html。这次故障影响了哪个服务？是什么时候开始的？",
+ "followups": [
+  {
+   "message": "这个服务归哪个团队负责？服务目录在 {base}/services.html。"
+  },
+  {
+   "message": "故障开始的那一周，这个团队的值班人是谁？值班表在 {base}/people.html（每周从周一算起）。回复的最后一行写成“ANSWER: <姓名>”。"
+  }
+ ],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "账单",
+   "turn": 0
+  },
+  {
+   "type": "output_regex",
+   "pattern": "曜石组",
+   "turn": 1
+  },
+  {
+   "type": "output_regex",
+   "pattern": "ANSWER[:：]\\s*沈雨桐(?!\\w)",
+   "turn": 2
+  }
+ ],
+ "tags": [
+  "jev2",
+  "join",
+  "multi"
+ ],
+ "timeout_secs": 600,
+ "answer": "沈雨桐",
+ "params": {
+  "kind": "join",
+  "incident": "INC-0026"
+ }
+}

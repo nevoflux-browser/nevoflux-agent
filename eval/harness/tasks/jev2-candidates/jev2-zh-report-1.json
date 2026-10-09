@@ -1,0 +1,30 @@
+{
+ "id": "jev2-zh-report-1",
+ "set": "jev2-candidates",
+ "lang": "zh",
+ "site": "ops-zh",
+ "task": "根据从 {base}/incidents/page-1.html 开始的全部故障列表页，找出处理中的 SEV1 故障最多的服务，然后在 {base}/report.html 提交一份报告，填写这个服务和它处理中的 SEV1 故障数量（故障编号留空）。",
+ "followups": [],
+ "checks": [
+  {
+   "type": "event",
+   "kind": "report",
+   "where": {
+    "service": "网关",
+    "count": "2"
+   }
+  }
+ ],
+ "tags": [
+  "jev2",
+  "report",
+  "long",
+  "write"
+ ],
+ "timeout_secs": 900,
+ "answer": "网关=2",
+ "params": {
+  "kind": "report",
+  "severity": 1
+ }
+}

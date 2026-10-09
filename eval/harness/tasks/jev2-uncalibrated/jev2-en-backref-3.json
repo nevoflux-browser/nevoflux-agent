@@ -1,0 +1,56 @@
+{
+ "id": "jev2-en-backref-3",
+ "set": "jev2-uncalibrated",
+ "lang": "en",
+ "site": "ops",
+ "task": "What is the confirmed root cause of the incident at {base}/incidents/INC-0127.html?",
+ "followups": [
+  {
+   "message": "What is the confirmed root cause of the incident at {base}/incidents/INC-0055.html?"
+  },
+  {
+   "message": "What is the confirmed root cause of the incident at {base}/incidents/INC-0010.html?"
+  },
+  {
+   "message": "Going back to the first incident we looked at in this conversation: how many whole hours passed between when it opened and when it was resolved? End your reply with a final line in the form 'ANSWER: <whole hours>'."
+  }
+ ],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "expired\\ OAuth\\ signing\\ key",
+   "turn": 0
+  },
+  {
+   "type": "output_regex",
+   "pattern": "expired\\ OAuth\\ signing\\ key",
+   "turn": 1
+  },
+  {
+   "type": "output_regex",
+   "pattern": "connection\\ pool\\ exhausted\\ after\\ a\\ config\\ rollback",
+   "turn": 2
+  },
+  {
+   "type": "output_regex",
+   "pattern": "ANSWER[:：]\\s*2(?![\\d.])",
+   "turn": 3
+  }
+ ],
+ "tags": [
+  "jev2",
+  "backref",
+  "multi",
+  "long"
+ ],
+ "timeout_secs": 900,
+ "answer": "2",
+ "params": {
+  "kind": "backref",
+  "incident": "INC-0127",
+  "others": [
+   "INC-0055",
+   "INC-0010"
+  ]
+ }
+}

@@ -42,6 +42,17 @@ def _parse_set(items):
     return out
 
 
+def ensure_generated_sites():
+    """Generated sites (the jev2 ops portal) are not committed; build them
+    when missing or stale before the server starts."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("ops_build", HERE / "sites" / "ops" / "build.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    if mod.ensure():
+        print("built the ops portal sites (sites/ops, sites/ops-zh)", flush=True)
+
+
 def latest_rows(rows):
     """One row per (rep, task): the last one written wins."""
     latest = {}
@@ -149,6 +160,7 @@ def main(argv=None):
         }, ensure_ascii=False) + "\n")
     print(f"{len(todo)} trials to run ({len(done)} rows already in {trials_file})", flush=True)
 
+    ensure_generated_sites()
     site = SiteServer(HERE / "sites")
     site.start()
     rows, statuses, stopped = list(done), [], False

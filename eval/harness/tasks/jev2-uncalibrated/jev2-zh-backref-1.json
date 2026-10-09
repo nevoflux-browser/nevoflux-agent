@@ -1,0 +1,56 @@
+{
+ "id": "jev2-zh-backref-1",
+ "set": "jev2-uncalibrated",
+ "lang": "zh",
+ "site": "ops-zh",
+ "task": "{base}/incidents/INC-0145.html 这次故障已确认的根本原因是什么？",
+ "followups": [
+  {
+   "message": "{base}/incidents/INC-0204.html 这次故障已确认的根本原因是什么？"
+  },
+  {
+   "message": "{base}/incidents/INC-0114.html 这次故障已确认的根本原因是什么？"
+  },
+  {
+   "message": "回到这次对话里我们看的第一个故障：从开始到解决一共过了多少个整小时？回复的最后一行写成“ANSWER: <整小时数>”。"
+  }
+ ],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "主数据库副本磁盘写满",
+   "turn": 0
+  },
+  {
+   "type": "output_regex",
+   "pattern": "消息队列消费者卡在异常消息上",
+   "turn": 1
+  },
+  {
+   "type": "output_regex",
+   "pattern": "消息队列消费者卡在异常消息上",
+   "turn": 2
+  },
+  {
+   "type": "output_regex",
+   "pattern": "ANSWER[:：]\\s*38(?![\\d.])",
+   "turn": 3
+  }
+ ],
+ "tags": [
+  "jev2",
+  "backref",
+  "multi",
+  "long"
+ ],
+ "timeout_secs": 900,
+ "answer": "38",
+ "params": {
+  "kind": "backref",
+  "incident": "INC-0145",
+  "others": [
+   "INC-0204",
+   "INC-0114"
+  ]
+ }
+}

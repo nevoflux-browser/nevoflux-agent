@@ -1,0 +1,56 @@
+{
+ "id": "jev2-zh-backref-2",
+ "set": "jev2-candidates",
+ "lang": "zh",
+ "site": "ops-zh",
+ "task": "{base}/incidents/INC-0083.html 这次故障已确认的根本原因是什么？",
+ "followups": [
+  {
+   "message": "{base}/incidents/INC-0075.html 这次故障已确认的根本原因是什么？"
+  },
+  {
+   "message": "{base}/incidents/INC-0109.html 这次故障已确认的根本原因是什么？"
+  },
+  {
+   "message": "回到这次对话里我们看的第一个故障：从开始到解决一共过了多少个整小时？回复的最后一行写成“ANSWER: <整小时数>”。"
+  }
+ ],
+ "checks": [
+  {
+   "type": "output_regex",
+   "pattern": "OAuth\\ 签名密钥过期",
+   "turn": 0
+  },
+  {
+   "type": "output_regex",
+   "pattern": "CDN\\ 清除失败导致缓存过期",
+   "turn": 1
+  },
+  {
+   "type": "output_regex",
+   "pattern": "主数据库副本磁盘写满",
+   "turn": 2
+  },
+  {
+   "type": "output_regex",
+   "pattern": "ANSWER[:：]\\s*67(?![\\d.])",
+   "turn": 3
+  }
+ ],
+ "tags": [
+  "jev2",
+  "backref",
+  "multi",
+  "long"
+ ],
+ "timeout_secs": 900,
+ "answer": "67",
+ "params": {
+  "kind": "backref",
+  "incident": "INC-0083",
+  "others": [
+   "INC-0075",
+   "INC-0109"
+  ]
+ }
+}

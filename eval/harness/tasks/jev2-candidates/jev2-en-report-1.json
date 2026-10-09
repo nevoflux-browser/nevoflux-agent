@@ -1,0 +1,30 @@
+{
+ "id": "jev2-en-report-1",
+ "set": "jev2-candidates",
+ "lang": "en",
+ "site": "ops",
+ "task": "Using every page of the incident list starting at {base}/incidents/page-1.html, find the service with the most open SEV1 incidents. Then file a report at {base}/report.html with that service and the number of its open SEV1 incidents (leave the incident field empty).",
+ "followups": [],
+ "checks": [
+  {
+   "type": "event",
+   "kind": "report",
+   "where": {
+    "service": "reviews",
+    "count": "3"
+   }
+  }
+ ],
+ "tags": [
+  "jev2",
+  "report",
+  "long",
+  "write"
+ ],
+ "timeout_secs": 900,
+ "answer": "reviews=3",
+ "params": {
+  "kind": "report",
+  "severity": 1
+ }
+}
