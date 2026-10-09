@@ -529,6 +529,66 @@ python -m eval.harness.gate --off eval/results/g2-off --on eval/results/g2-on \
 The A/B set has only been run against the fake model during development, so
 it serves as the held-out set.
 
+## G2 result, 2026-10-08: FAIL (DeepSeek); tool assembly split out
+
+Decisions were recorded in `eval/results/g2-decisions.md` before any Jev-on
+result was read: X = 15%, weights from the provider's prices, and the tasks
+excluded below.
+
+**Kimi k3 (abandoned after the off arm).** The off arm scored 0.967
+(87/90, δ = 0.067), so the quality path could not pass (needs ≥ 1.033), and
+the 5-hour quota allowed 5–37 trials per window. The g2-off data is kept.
+
+**DeepSeek (`deepseek-flash`, 28 tasks × k = 3, `localtest.me`).**
+- `jev-zh-wiki-shanghai` and `jev-zh-wiki-irrelevant` are excluded: DeepSeek's
+  moderation rejects those pages every time ("Content Exists Risk").
+- DeepSeek API errors count as missing and are re-run (`trial.py` now
+  recognises "<Provider> stream HTTP <code>"). Once those were removed, the
+  off arm scored 84/84.
+
+| | Jev off | Jev on | Jev on, tools off |
+|---|---|---|---|
+| Score | 1.000 | 0.988 | — |
+| Calls / trial | 9.5 | 10.1 | 10.1 |
+| Input tokens / trial | 322k | 264k (−18%) | 344k |
+| Uncached (full price) | 12.2k | **34.0k** | 16.3k |
+| Jev input | 0 | 30.7k | 22.2k |
+| Effective cost / trial | 26.3k | **51.3k (+95%)** | 35.0k (+33%) |
+
+Weights: cache hit 0.02, output 4, Jev input 0.15, Jev output 0.
+
+Verdict:
+- **Quality path fails**: the baseline is perfect, so there is no room above it.
+- **Efficiency path fails**: cost rises 95% against a required 15% cut.
+- **Latency passes**: P50 0 ms / P90 674 ms over 816 steps.
+- **Chinese subset**: no regression.
+- **§8.2: split.** Tool assembly scores the same (+0.000) at +47% cost.
+- 10–14% of turns carried estimated usage (a low-confidence warning); the
+  gap is far larger than that error.
+
+**Why tool assembly costs more.** It does shorten the prefix (−18% input), but
+a per-task tool set means the prefix is no longer shared across sessions, so
+each turn's first call is written at full price. Uncached input nearly
+triples. DeepSeek's cache hit costs 1/50 of a miss, so the shorter reads save
+almost nothing.
+
+Jev's own requests add another 13–17% of the off arm's cost.
+
+**Consequences:**
+- **`jev.points.tools` now defaults to off.** Tool assembly moves out (P2b)
+  until the tool set is stable enough to share a cached prefix: fixed per
+  session, and in a stable order.
+- **Jev stays off by default** (`jev.enabled = false`). On this set its
+  quality gain cannot be measured: both models score at the ceiling. Showing
+  one needs a harder A/B set, with a baseline of about 70–85%.
+
+**Seen during the run.** DeepSeek occasionally rejects our long request bodies
+as malformed JSON (400 "EOF while parsing a string" / "expected `,` or `}`",
+columns 81k–142k, inside the static tool list). That is about 1 call in 500.
+A 112 KB valid body sent 6 times did not reproduce it, so it is not yet known
+whether the daemon or the transport is at fault. Logging the body on such a
+400 is the next step.
+
 ## Known gaps
 
 - Agent-loop tasks have no deadline on the daemon side: `wall_clock_secs`

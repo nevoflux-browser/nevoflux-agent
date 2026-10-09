@@ -503,6 +503,8 @@ mod tests {
         c.jev.api_key = "k".into();
         c.jev.timeout_ms = timeout_ms;
         c.jev.tools_k = 1;
+        // These tests are about tool assembly, which is off by default.
+        c.jev.points.tools = true;
         c
     }
     fn db_with(events: Vec<serde_json::Value>) -> Arc<nevoflux_storage::Database> {
