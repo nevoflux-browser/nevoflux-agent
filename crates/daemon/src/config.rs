@@ -1786,6 +1786,10 @@ impl JevConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct JevPoints {
+    /// Tool assembly (J4a), off by default: G2 (2026-10-08, DeepSeek) found
+    /// that a per-task tool set breaks cross-session prefix caching — +47%
+    /// effective cost for no score gain — so §8.2 moves it out (P2b) until
+    /// the set is stable enough to share a cached prefix.
     pub tools: bool,
     pub skills: bool,
     pub visibility: bool,
@@ -1797,7 +1801,7 @@ pub struct JevPoints {
 impl Default for JevPoints {
     fn default() -> Self {
         Self {
-            tools: true,
+            tools: false,
             skills: true,
             visibility: true,
             rebuild: true,
@@ -2249,8 +2253,10 @@ mod tests {
         assert_eq!(j.endpoint, "https://api.typesafe.ai/v1/systemone");
         assert_eq!(j.timeout_ms, 800);
         assert_eq!(j.model, "jev-latest");
-        assert!(j.points.tools && j.points.skills && j.points.visibility && j.points.rebuild);
-        assert!(!j.points.permissions);
+        assert!(j.points.skills && j.points.visibility && j.points.rebuild);
+        // G2 (2026-10-08, DeepSeek): tool assembly broke cross-session prefix
+        // caching (+47% effective cost, no score gain) — §8.2 splits it out.
+        assert!(!j.points.tools && !j.points.permissions);
         assert!(j.sensitive_domains.is_empty());
     }
 
@@ -2282,7 +2288,10 @@ permissions = true
         assert!(cfg.jev.enabled);
         assert_eq!(cfg.jev.timeout_ms, 1200);
         assert!(cfg.jev.points.permissions);
-        assert!(cfg.jev.points.tools, "unset points keep their defaults");
+        assert!(
+            !cfg.jev.points.tools && cfg.jev.points.rebuild,
+            "unset points keep their defaults"
+        );
     }
 
     #[test]

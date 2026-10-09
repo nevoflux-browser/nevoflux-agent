@@ -28,8 +28,11 @@ class TrialConfig:
 
 
 # rig's providers say "ProviderError"; the daemon's raw HTTP paths (all
-# Anthropic-wire traffic since P0) say "Internal error: <Provider>-raw …".
-_PROVIDER_ERROR = re.compile(r"^\s*\[Error: (ProviderError|Internal error: \w+-raw\b)")
+# Anthropic-wire traffic since P0) say "Internal error: <Provider>-raw …", and
+# its OpenAI-wire streams (DeepSeek, OpenAI, …) "Internal error: <Provider>
+# stream HTTP <code> …".
+_PROVIDER_ERROR = re.compile(
+    r"^\s*\[Error: (ProviderError|Internal error: (\w+-raw\b|\w+ stream HTTP \d{3}\b))")
 
 
 def classify_status(last: dict, timed_out: bool) -> str:

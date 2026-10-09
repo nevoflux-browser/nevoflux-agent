@@ -58,6 +58,21 @@ class RenderTest(unittest.TestCase):
 
 
 class StatusTest(unittest.TestCase):
+    def test_a_streaming_provider_http_error_is_a_provider_error(self):
+        # DeepSeek / OpenAI-wire streams report "<Provider> stream HTTP <code>".
+        from eval.harness.trial import classify_status
+        for out in [
+            '[Error: Internal error: DeepSeek stream HTTP 400 Bad Request: {"error":{"message":"Content Exists Risk"}}]',
+            "[Error: Internal error: DeepSeek stream HTTP 400 Bad Request: Failed to parse the request body as JSON]",
+            "[Error: Internal error: OpenAI stream HTTP 503 Service Unavailable]",
+        ]:
+            self.assertEqual(classify_status({"status": "succeeded", "output": out}, timed_out=False),
+                             "provider_error", out)
+        self.assertEqual(
+            classify_status({"status": "succeeded", "output": "The stream HTTP API returned 400. ANSWER: x"},
+                            timed_out=False),
+            "succeeded")
+
     def test_provider_error_output_is_not_an_agent_result(self):
         from eval.harness.trial import classify_status
         last = {"status": "succeeded",

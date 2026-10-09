@@ -161,6 +161,31 @@ class GateMissingTest(unittest.TestCase):
         self.assertTrue(any("left out" in w for w in v["warnings"]), v["warnings"])
 
 
+class GateExcludeTest(unittest.TestCase):
+    def test_excluded_tasks_leave_every_arm_before_the_checks(self):
+        off = arm(TASKS[:3]) + [trial(r, "jev-zh-x", False) for r in range(3)]
+        on = arm(TASKS, jev=True)                 # never ran jev-zh-x
+        self.assertFalse(gate(off, on)["valid"])  # different task sets
+        v = gate(off, on, exclude={"jev-zh-x"})
+        self.assertTrue(v["valid"], v["problems"])
+        self.assertAlmostEqual(v["score"]["off"], 0.6)
+
+    def test_cli_takes_a_comma_separated_exclude_list(self):
+        import pathlib
+        import tempfile
+        from eval.harness.gate import main
+        with tempfile.TemporaryDirectory() as d:
+            root = pathlib.Path(d)
+            off = arm(TASKS[:3]) + [trial(r, "jev-zh-x", False) for r in range(3)]
+            for name, rows in (("off", off), ("on", arm(TASKS, jev=True, inp=1100))):
+                (root / name).mkdir()
+                (root / name / "trials.jsonl").write_bytes(
+                    "\n".join(json.dumps(r) for r in rows).encode("utf-8"))
+            code = main(["--off", str(root / "off"), "--on", str(root / "on"),
+                         "--exclude", "jev-zh-x,jev-none"])
+            self.assertEqual(code, 0)
+
+
 class GateCliTest(unittest.TestCase):
     def test_cli_writes_the_report_and_exits_by_verdict(self):
         import pathlib
