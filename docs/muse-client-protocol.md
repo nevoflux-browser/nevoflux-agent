@@ -114,7 +114,7 @@ Example requests: `fixtures/muse/mcp_messages.json`.
 ### 5.1 Tiers
 
 Every agent pairing has its own execution tier, `read-only` when paired. The
-person changes it in the NevoFlux sidebar with `/agent-tier <name> <tier>`;
+person changes it in the NevoFlux sidebar with `/agent-tier <id> <tier>`, where `<id>` is the agent's short id shown by `/devices`;
 nothing on this channel can. A tier change applies from the next call. The tier is a ceiling: a call above it fails at
 once with `tier_denied` and nobody is asked.
 
