@@ -132,16 +132,26 @@ You work in tabs of your own. Without `tab_id`, `browser_navigate` opens a tab
 for you in the background the first time and reuses it afterwards;
 `new_tab: true` opens another. Every other tool without `tab_id` (except `browser_get_tabs`, which
 lists all tabs) acts in your most recently opened tab, or fails with `no_agent_tab` if you have none. With
-`tab_id` any tab can be read or acted on, within your tier.
+`tab_id` any tab can be read or acted on, within your tier — but the id must
+come from your own `browser_navigate` or from a `browser_get_tabs` result in
+the current browser session. Any other id (one from before a browser restart
+or reconnect, or one you guessed) fails with `tab_closed` and nothing is sent;
+call `browser_get_tabs` first to act in one of the person's tabs.
 `browser_get_tabs` marks each tab `owned: true` (yours) or `owned: false` (the
 person's). `browser_activate_tab` requires `tab_id` and changes what the
 person sees; without one it fails with `tool_failed` (`tab_id is required`),
 not `no_agent_tab`. A `tab_id` that is not a positive integer, on any tool,
 also fails with `tool_failed`.
 
-Your tabs are forgotten when the browser disconnects or restarts (tab ids are
-reused after a restart); navigate again to get a new one. A tab that was
-closed answers `tab_closed` once and is then forgotten.
+`browser_navigate` only opens `http://` and `https://` URLs (any letter case)
+and `about:blank`. Anything else — `file:`, `about:` pages, `nevoflux:`,
+`javascript:`, `data:`, or a URL with leading whitespace — fails with
+`tool_failed` (`only http and https URLs can be opened`) and nothing is sent.
+
+Your tabs, and the ids `browser_get_tabs` showed you, are forgotten when the
+browser disconnects or restarts (tab ids are reused after a restart); navigate
+again to get a new one. A tab that was closed answers `tab_closed` and is then
+forgotten.
 
 ### 5.3 Errors
 
@@ -162,8 +172,8 @@ with `isError: true`:
 | `approval_timeout` | nobody answered within 60 s | |
 | `browser_unavailable` | the desktop browser is not connected | |
 | `no_agent_tab` | no tab of yours and no `tab_id` | |
-| `tab_closed` | the tab is gone | `tab_id` |
-| `tool_failed` | the call was malformed (for example a bad `tab_id`), or the browser failed it or did not answer within 150 s; `detail` says which | `detail` |
+| `tab_closed` | the tab is gone, or the `tab_id` is not one you opened or were shown by `browser_get_tabs` in the current browser session | `tab_id` |
+| `tool_failed` | the call was malformed (for example a bad `tab_id`, or a URL that is not http/https/`about:blank`), or the browser failed it, or did not answer within 150 s — in that last case the action may still have happened (`detail`: `the browser did not answer within 150 s; the action may still have happened`); `detail` says which | `detail` |
 
 Branch on `code` and the extra fields; `message` is for people. Every case is
 in `fixtures/muse/tool_errors.json` exactly as the head sends it.
@@ -209,6 +219,16 @@ than the head processes (more than 32 unprocessed), further requests are
 dropped without a response, and their counters are spent, so sending the same
 frame again is refused as a replay. Do not pipeline more than a handful of
 requests, and use your own per-request timeout.
+
+Known limits of this version:
+
+- Site rules match the URL a `browser_navigate` goes to, not the page a
+  click, fill or type lands on. A rule that asks before acting on a site
+  guards your navigates there, not your later clicks in a tab already on it.
+- If you cancel a `tools/call` (`notifications/cancelled`), the person's audit
+  shows the call but no result for it.
+- If a headless NevoFlux browser is registered with the same daemon, it
+  answers agent calls instead of the person's desktop browser.
 
 ## 6. Versioning
 
