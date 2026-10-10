@@ -19,6 +19,7 @@
 //! 6. **one audit line** — tool, outcome, duration; never arguments or
 //!    results, which can hold what was typed.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -104,6 +105,88 @@ impl TierSource for StoredTier {
 #[async_trait]
 pub trait Judge: Send + Sync {
     async fn judge(&self, name: &str, arguments: &Value, services: &HostServices) -> Judgement;
+}
+
+/// The daemon's own judgement (spec §2.2 step 4): Jev first — the same
+/// `should_assess` / `assess` / `RISK_P` the native gate uses — then the
+/// site/pack pipeline the MCP dispatcher runs. Every question is collected;
+/// any refusal wins.
+pub struct PipelineJudge {
+    packs_dir: PathBuf,
+}
+
+impl PipelineJudge {
+    /// Judge against the packs installed for this daemon.
+    pub fn installed() -> Self {
+        Self::at(crate::paths::resolve_from_daemon().packs_dir())
+    }
+
+    pub fn at(packs_dir: PathBuf) -> Self {
+        Self { packs_dir }
+    }
+}
+
+#[async_trait]
+impl Judge for PipelineJudge {
+    async fn judge(&self, name: &str, arguments: &Value, services: &HostServices) -> Judgement {
+        let mut jev = Vec::new();
+        // The tier already lets this call through without asking, which is
+        // exactly the case Jev exists for (`would_auto = true`).
+        if crate::jev::permission::should_assess(name, true) {
+            if let Some(cfg) = services.agent_config.as_deref() {
+                let risk = crate::jev::permission::assess(
+                    cfg,
+                    &services.database,
+                    &services.session_id,
+                    None,
+                    name,
+                    &arguments.to_string(),
+                    None,
+                )
+                .await;
+                if let Some(p) = risk.filter(|p| *p >= crate::jev::permission::RISK_P) {
+                    SessionEventWriter::new(services.database.clone(), services.session_id.clone())
+                        .append(SessionEventPayload::PermissionJev {
+                            tool: name.to_string(),
+                            p,
+                            unattended: false,
+                        });
+                    jev.push(AskPrompt {
+                        stage: "jev",
+                        prompt: format!("Jev rates this action as risky ({p:.2})."),
+                    });
+                }
+            }
+        }
+        let gate = crate::wasm::mcp_tool_executor::judge_mcp_call(
+            name,
+            arguments,
+            services,
+            &self.packs_dir,
+        );
+        match gate {
+            Judgement::Deny(denial) => Judgement::Deny(denial),
+            Judgement::Ask {
+                mut prompts,
+                arguments,
+            } => {
+                jev.append(&mut prompts);
+                Judgement::Ask {
+                    prompts: jev,
+                    arguments,
+                }
+            }
+            Judgement::Allow if !jev.is_empty() => Judgement::Ask {
+                prompts: jev,
+                arguments: None,
+            },
+            Judgement::Rewrite { arguments } if !jev.is_empty() => Judgement::Ask {
+                prompts: jev,
+                arguments: Some(arguments),
+            },
+            other => other,
+        }
+    }
 }
 
 /// The daemon's services for one call, or `None` before startup finished.
@@ -1460,5 +1543,272 @@ mod tests {
         assert_eq!(out["isError"], false);
         assert!(r.tabs.owned_ids(CHANNEL, SIDEBAR).is_empty());
         assert!(r.tabs.owned_ids(CHANNEL, "proxy-sidebar-2").is_empty());
+    }
+
+    fn ask(prompt: &str) -> Judgement {
+        Judgement::Ask {
+            prompts: vec![AskPrompt {
+                stage: "site_policy",
+                prompt: prompt.into(),
+            }],
+            arguments: None,
+        }
+    }
+
+    async fn call_with(r: &Rig, a: &Scripted, tool: &str, args: Value) -> Value {
+        serde_json::to_value(&r.backend.call(tool, args, a).await.unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_approved_question_runs_and_the_person_saw_what_and_where() {
+        let r = rig_with(
+            ExecutionTier::ReadOnly,
+            ask("ask.example wants a person to confirm"),
+            |s| s,
+        );
+        let a = approver(Approval::Approved);
+        let out = call_with(
+            &r,
+            &a,
+            "browser_navigate",
+            json!({ "url": "https://muse.example/" }),
+        )
+        .await;
+        assert_eq!(out["isError"], false);
+        let asked = a.asked.lock().unwrap().clone();
+        assert_eq!(asked.len(), 1);
+        assert!(
+            asked[0].contains("Navigate to: https://muse.example/"),
+            "{}",
+            asked[0]
+        );
+        assert!(
+            asked[0].contains("Tab: a new tab of the agent's"),
+            "{}",
+            asked[0]
+        );
+        assert!(
+            asked[0].contains("ask.example wants a person to confirm"),
+            "{}",
+            asked[0]
+        );
+        assert_eq!(sent(&r).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn every_answer_but_yes_stops_the_call() {
+        for (answer, code, reason) in [
+            (Approval::Declined, "approval_denied", Some("declined")),
+            (
+                Approval::Unsupported,
+                "approval_denied",
+                Some("client_cannot_approve"),
+            ),
+            (Approval::Failed, "approval_denied", Some("approval_failed")),
+            (Approval::TimedOut, "approval_timeout", None),
+        ] {
+            let r = rig_with(ExecutionTier::BrowserAuto, ask("why"), |s| s);
+            let a = approver(answer);
+            let out = call_with(
+                &r,
+                &a,
+                "browser_click",
+                json!({ "selector": "#go", "tab_id": 1 }),
+            )
+            .await;
+            assert_eq!(error(&out)["code"], code, "{answer:?}");
+            assert_eq!(error(&out)["reason"].as_str(), reason, "{answer:?}");
+            assert!(sent(&r).is_empty(), "{answer:?}: nothing ran");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rule_that_refuses_is_final_and_nobody_is_asked() {
+        let denial = nevoflux_builtin_wasm::ToolDenial {
+            code: "POLICY_DENIED".into(),
+            message: "no automation on banking sites".into(),
+            rule: None,
+            pack: Some("bank-guard".into()),
+        };
+        let r = rig_with(ExecutionTier::BrowserAuto, Judgement::Deny(denial), |s| s);
+        let a = approver(Approval::Approved);
+        let out = call_with(
+            &r,
+            &a,
+            "browser_click",
+            json!({ "selector": "#pay", "tab_id": 1 }),
+        )
+        .await;
+        assert_eq!(error(&out)["code"], "approval_denied");
+        assert_eq!(error(&out)["reason"], "rule");
+        assert!(error(&out)["message"]
+            .as_str()
+            .unwrap()
+            .contains("no automation on banking sites"));
+        assert!(a.asked.lock().unwrap().is_empty());
+        assert!(sent(&r).is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_tier_is_checked_before_any_rule() {
+        let r = rig_with(ExecutionTier::ReadOnly, ask("why"), |s| s);
+        let a = approver(Approval::Approved);
+        let out = call_with(
+            &r,
+            &a,
+            "browser_click",
+            json!({ "selector": "#go", "tab_id": 1 }),
+        )
+        .await;
+        assert_eq!(error(&out)["code"], "tier_denied");
+        assert!(a.asked.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn what_runs_after_an_approval_is_what_was_judged() {
+        // The agent names tab 1; the rule moves the call to tab 5, the
+        // agent's own, and to another URL. The person is asked about the
+        // rule's version, and that is the version that runs.
+        let judged = json!({ "url": "https://safe.example/", "tab_id": 5 });
+        let r = rig_with(
+            ExecutionTier::ReadOnly,
+            Judgement::Ask {
+                prompts: vec![AskPrompt {
+                    stage: "site_policy",
+                    prompt: "rewritten".into(),
+                }],
+                arguments: Some(judged.clone()),
+            },
+            |s| s,
+        );
+        r.tabs
+            .record_opened(CHANNEL, SIDEBAR, 5, Some("https://safe.example/".into()));
+        let a = approver(Approval::Approved);
+        let out = call_with(
+            &r,
+            &a,
+            "browser_navigate",
+            json!({ "url": "https://muse.example/", "tab_id": 1 }),
+        )
+        .await;
+        assert_eq!(out["isError"], false);
+        assert_eq!(sent(&r).len(), 1);
+        assert_eq!(sent(&r)[0].params["url"], "https://safe.example/");
+        assert_eq!(sent(&r)[0].tab_id, Some(5));
+        let question = a.asked.lock().unwrap()[0].clone();
+        assert!(
+            question.contains("Navigate to: https://safe.example/"),
+            "{question}"
+        );
+        assert!(question.contains("tab 5"), "{question}");
+        assert!(!question.contains("muse.example"), "{question}");
+
+        let r = rig_with(
+            ExecutionTier::ReadOnly,
+            Judgement::Rewrite {
+                arguments: json!({ "url": "https://rewritten.example/", "tab_id": 1 }),
+            },
+            |s| s,
+        );
+        call(
+            &r,
+            "browser_navigate",
+            json!({ "url": "https://muse.example/", "tab_id": 1 }),
+        )
+        .await;
+        assert_eq!(sent(&r)[0].params["url"], "https://rewritten.example/");
+        assert_eq!(sent(&r)[0].tab_id, Some(1));
+    }
+
+    #[tokio::test]
+    async fn the_installed_judge_asks_what_an_active_site_rule_asks() {
+        let dir = tempfile::tempdir().unwrap();
+        let pd = dir.path().join("ask-guard");
+        std::fs::create_dir_all(&pd).unwrap();
+        std::fs::write(
+            pd.join("pack.toml"),
+            "[pack]\nname = \"ask-guard\"\nversion = \"1.0.0\"\nprotocol = \"pack-protocol/0.2\"\nmin_nevoflux = \"0.3.0\"\n\n[[components.tool_policy]]\nscope = \"active\"\nmatch = { url = [\"*://ask.example/*\"] }\ndeny = []\nask = [\"browser_navigate\"]\nmessage = \"ask.example wants a person to confirm\"\n",
+        )
+        .unwrap();
+        let db = Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        let services = HostServices::new(db);
+        services
+            .active_packs
+            .write()
+            .unwrap()
+            .insert("ask-guard".into());
+        let judge = PipelineJudge::at(dir.path().to_path_buf());
+        assert!(matches!(
+            judge.judge("browser_navigate", &json!({ "url": "https://ask.example/x" }), &services).await,
+            Judgement::Ask { ref prompts, .. } if prompts[0].prompt.contains("ask-guard")
+        ));
+        assert!(matches!(
+            judge
+                .judge(
+                    "browser_navigate",
+                    &json!({ "url": "https://other.example/" }),
+                    &services
+                )
+                .await,
+            Judgement::Allow
+        ));
+    }
+
+    fn jev_cfg(url: &str) -> crate::config::AgentConfig {
+        let mut c = crate::config::AgentConfig::default();
+        c.llm.provider = Some("anthropic".into());
+        c.jev.enabled = true;
+        c.jev.endpoint = url.to_string();
+        c.jev.api_key = "k".into();
+        c.jev.timeout_ms = 2000;
+        c.jev.points.permissions = true;
+        c
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_call_jev_flags_becomes_a_question_and_is_logged() {
+        let (url, bodies) = crate::jev::test_support::answering(
+            json!({ "answers": { "risk": { "noul": 0.9 } }, "usage": { "input_tokens": 1, "output_tokens": 1 } }),
+            Duration::ZERO,
+        )
+        .await;
+        let db = Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        let services = HostServices::new(db.clone())
+            .with_agent_config(Arc::new(jev_cfg(&url)))
+            .with_session_id("agent-2f1c4a90".into());
+        let judge = PipelineJudge::at(PathBuf::from("this-directory-does-not-exist"));
+
+        match judge
+            .judge("browser_click", &json!({ "selector": "#pay" }), &services)
+            .await
+        {
+            Judgement::Ask { prompts, .. } => assert_eq!(prompts[0].stage, "jev"),
+            other => panic!("expected an ask, got {other:?}"),
+        }
+        let flagged = nevoflux_storage::repositories::SessionEventRepository::new(&db)
+            .list("agent-2f1c4a90")
+            .unwrap()
+            .into_iter()
+            .filter(|e| {
+                matches!(
+                    e.payload,
+                    SessionEventPayload::PermissionJev {
+                        unattended: false,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(flagged, 1);
+
+        // A read-only tool is never put to Jev.
+        let before = bodies.lock().unwrap().len();
+        assert!(matches!(
+            judge
+                .judge("browser_snapshot", &json!({ "tab_id": 1 }), &services)
+                .await,
+            Judgement::Allow
+        ));
+        assert_eq!(bodies.lock().unwrap().len(), before);
     }
 }
