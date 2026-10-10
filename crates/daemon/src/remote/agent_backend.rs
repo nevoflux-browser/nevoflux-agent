@@ -1853,7 +1853,10 @@ mod tests {
         p.control_channel_id = CHANNEL.into();
         let backend = DesktopBrowserBackend::for_pairing(&p, store);
         assert_eq!(backend.short, "2f1c4a90");
-        assert!(Arc::ptr_eq(&backend.tabs, &crate::remote::agent_tabs::shared()));
+        assert!(Arc::ptr_eq(
+            &backend.tabs,
+            &crate::remote::agent_tabs::shared()
+        ));
         assert_eq!(backend.tools().len(), 16);
     }
 
@@ -1921,16 +1924,21 @@ mod tests {
         async fn connect(backend: DesktopBrowserBackend, capabilities: Value) -> Self {
             let sink = Arc::new(Collect::default());
             let gw = McpGateway::new(KEY, sink.clone(), Arc::new(backend), CHANNEL);
-            gw.on_wire_in(&Wire::Text(r#"{"k":"peers","n":1}"#.into())).await;
+            gw.on_wire_in(&Wire::Text(r#"{"k":"peers","n":1}"#.into()))
+                .await;
             let ch = sink.frames()[0]["ch"].as_str().unwrap().to_string();
             let mut agent = Agent { gw, sink, ch, n: 0 };
             agent
-                .send(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                .send(
+                    json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
                     "protocolVersion": "2025-11-25", "capabilities": capabilities,
-                    "clientInfo": {"name": "nevoflux-muse", "version": "0.3.0"}}}))
+                    "clientInfo": {"name": "nevoflux-muse", "version": "0.3.0"}}}),
+                )
                 .await;
             agent.sink.message(|m| m["id"] == json!(1)).await;
-            agent.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).await;
+            agent
+                .send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+                .await;
             agent
         }
 
@@ -1948,24 +1956,33 @@ mod tests {
         let browser = r.browser.clone();
         let mut agent = Agent::connect(r.backend, json!({})).await;
 
-        agent.send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})).await;
+        agent
+            .send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}))
+            .await;
         let listed = agent.sink.message(|m| m["id"] == json!(2)).await;
         assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 16);
 
         agent
-            .send(json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
-                "name": "browser_navigate", "arguments": {"url": "https://muse.example/"}}}))
+            .send(
+                json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+                "name": "browser_navigate", "arguments": {"url": "https://muse.example/"}}}),
+            )
             .await;
         let nav = agent.sink.message(|m| m["id"] == json!(3)).await;
         assert_eq!(nav["result"]["isError"], json!(false));
-        assert!(nav["result"]["content"][0]["text"].as_str().unwrap().contains("\"tab_id\":100"));
+        assert!(nav["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"tab_id\":100"));
         let first = browser.seen.lock().unwrap()[0].clone();
         assert_eq!(first.origin.as_deref(), Some("agent"));
         assert_eq!(first.params["background"], json!(true));
 
         agent
-            .send(json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {
-                "name": "browser_click", "arguments": {"selector": "#buy"}}}))
+            .send(
+                json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {
+                "name": "browser_click", "arguments": {"selector": "#buy"}}}),
+            )
             .await;
         let click = agent.sink.message(|m| m["id"] == json!(4)).await;
         let f = fixture();
@@ -1974,7 +1991,11 @@ mod tests {
             click["result"]["structuredContent"]["error"]["code"],
             f["errors"]["tier_denied"]["structuredContent"]["error"]["code"]
         );
-        assert_eq!(browser.seen.lock().unwrap().len(), 1, "the click never reached the browser");
+        assert_eq!(
+            browser.seen.lock().unwrap().len(),
+            1,
+            "the click never reached the browser"
+        );
     }
 
     /// The approval request on the wire is the fixture's, `_meta` included,
@@ -2000,12 +2021,17 @@ mod tests {
             // "Click on element 'e1'", which is what the fixture's message says,
             // and the fixture's `approval_denied` example names `browser_click`.
             agent
-                .send(json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {
+                .send(
+                    json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {
                     "name": "browser_click",
                     "arguments": {"element_id": "e1", "tab_id": 1},
-                    "_meta": {"io.nevoflux/call": "0badc0de"}}}))
+                    "_meta": {"io.nevoflux/call": "0badc0de"}}}),
+                )
                 .await;
-            let request = agent.sink.message(|m| m["method"] == "elicitation/create").await;
+            let request = agent
+                .sink
+                .message(|m| m["method"] == "elicitation/create")
+                .await;
             assert_eq!(request["method"], f["approval_request"]["method"]);
             assert_eq!(request["params"], f["approval_request"]["params"]);
             agent
