@@ -6,6 +6,7 @@
 //! trait + registry + WS transport + account wiring land in later phases.
 
 pub mod account;
+pub mod agent_tabs;
 pub mod asset;
 pub mod channel_codec;
 pub mod connect_block;

@@ -613,6 +613,13 @@ async fn handle_proxy_connection(
     if let Some(clients) = crate::registry::CURRENT_CONNECTED_CLIENTS.get() {
         clients.unregister(&proxy_id);
     }
+    // A browser that went away takes its tab numbering with it (M2a §3.3):
+    // after a restart Firefox hands out small ids again, and an agent's old
+    // ones would land on the person's tabs.
+    let forgotten = crate::remote::agent_tabs::shared().connection_closed(&proxy_id);
+    if forgotten > 0 {
+        info!("Proxy {} served {} agent tab tables; forgotten", proxy_id, forgotten);
+    }
 
     // Notify the message loop about the disconnect so EventBus subscriptions
     // belonging to this proxy can be cleaned up.
