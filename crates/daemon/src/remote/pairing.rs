@@ -80,6 +80,13 @@ pub struct Pairing {
     pub push: Option<super::web_push::Subscription>,
     #[serde(default, skip_serializing_if = "PairingKind::is_device")]
     pub kind: PairingKind,
+    /// An agent's execution tier (M2a §2.6): the hard ceiling on what it may
+    /// run. Stored as the setting string and parsed leniently on read —
+    /// absent, or anything unrecognised, is `read-only` — so a hand-edited or
+    /// older file narrows what an agent can do rather than failing to load.
+    /// Never set on a device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
 }
 
 impl Pairing {
@@ -87,6 +94,14 @@ impl Pairing {
     /// device's control + data pair. Decides which gateway serves the channel.
     pub fn is_agent(&self) -> bool {
         self.kind == PairingKind::Agent
+    }
+
+    /// This agent's tier; `read-only` when none is stored (M2a §2.6).
+    pub fn agent_tier(&self) -> nevoflux_protocol::ExecutionTier {
+        self.tier
+            .as_deref()
+            .map(nevoflux_protocol::ExecutionTier::from_setting)
+            .unwrap_or_default()
     }
 
     /// The control channel's key, or `None` if what is stored is not 32 bytes.
@@ -214,6 +229,25 @@ impl PairingStore {
         Ok(true)
     }
 
+    /// Set an agent's tier. Reports whether there was such an agent; a device
+    /// row is never given one.
+    pub fn set_tier(
+        &self,
+        control_channel_id: &str,
+        tier: nevoflux_protocol::ExecutionTier,
+    ) -> Result<bool, PairingError> {
+        let mut all = self.load()?;
+        let Some(entry) = all
+            .iter_mut()
+            .find(|p| p.control_channel_id == control_channel_id && p.is_agent())
+        else {
+            return Ok(false);
+        };
+        entry.tier = Some(tier.as_setting().to_string());
+        self.write(&all)?;
+        Ok(true)
+    }
+
     /// Forget one by its control channel. Reports whether there was one.
     pub fn remove(&self, control_channel_id: &str) -> Result<bool, PairingError> {
         let mut all = self.load()?;
@@ -287,6 +321,7 @@ pub fn mint(code: &str) -> Option<Pairing> {
         label: None,
         push: None,
         kind: PairingKind::Device,
+        tier: None,
     })
 }
 
@@ -313,6 +348,13 @@ pub fn mint_agent(code: &str) -> Option<Pairing> {
         label: None,
         push: None,
         kind: PairingKind::Agent,
+        // Least privilege: a fresh agent can look and navigate, nothing more,
+        // until the person raises it with /agent-tier (decision A2).
+        tier: Some(
+            nevoflux_protocol::ExecutionTier::ReadOnly
+                .as_setting()
+                .to_string(),
+        ),
     })
 }
 
@@ -366,6 +408,7 @@ mod tests {
             label: None,
             push: None,
             kind: PairingKind::Device,
+            tier: None,
         }
     }
 
@@ -547,5 +590,64 @@ mod tests {
         );
         let agent = serde_json::to_string(&mint_agent("A-BCDE-FGHJ-KMNP").unwrap()).unwrap();
         assert!(agent.contains("\"kind\":\"agent\""));
+    }
+
+    use nevoflux_protocol::ExecutionTier;
+
+    fn agent_row(id: &str, tier: Option<&str>) -> Pairing {
+        Pairing {
+            kind: PairingKind::Agent,
+            data_channel_id: String::new(),
+            data_key: String::new(),
+            tier: tier.map(str::to_string),
+            ..pairing(id)
+        }
+    }
+
+    #[test]
+    fn a_new_agent_starts_read_only() {
+        let p = mint_agent("A-BCDE-FGHJ-KMNP").unwrap();
+        assert_eq!(p.tier.as_deref(), Some("read-only"));
+        assert_eq!(p.agent_tier(), ExecutionTier::ReadOnly);
+        assert_eq!(mint("A-BCDE-FGHJ-KMNP").unwrap().tier, None, "devices have no tier");
+    }
+
+    #[test]
+    fn an_agent_written_before_tiers_existed_reads_as_read_only() {
+        let (store, dir) = store();
+        let old = r#"[{"control_channel_id":"a","control_key":"aa","created_at":1,"kind":"agent"}]"#;
+        std::fs::write(dir.path().join("pairings.json"), old).unwrap();
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded[0].tier, None);
+        assert_eq!(loaded[0].agent_tier(), ExecutionTier::ReadOnly);
+    }
+
+    #[test]
+    fn an_unknown_stored_tier_reads_as_read_only_not_as_an_error() {
+        let (store, _dir) = store();
+        store.add(agent_row("a", Some("auto"))).unwrap();
+        assert_eq!(store.load().unwrap()[0].agent_tier(), ExecutionTier::ReadOnly);
+    }
+
+    #[test]
+    fn setting_a_tier_rewrites_only_that_agent() {
+        let (store, _dir) = store();
+        store.add(agent_row("a1", Some("read-only"))).unwrap();
+        store.add(agent_row("a2", None)).unwrap();
+        assert!(store.set_tier("a1", ExecutionTier::BrowserAuto).unwrap());
+        let all = store.load().unwrap();
+        assert_eq!(all[0].agent_tier(), ExecutionTier::BrowserAuto);
+        assert_eq!(all[0].tier.as_deref(), Some("browser-auto"));
+        assert_eq!(all[1].agent_tier(), ExecutionTier::ReadOnly);
+    }
+
+    #[test]
+    fn a_device_is_never_given_a_tier() {
+        let (store, dir) = store();
+        store.add(pairing("d1")).unwrap();
+        assert!(!store.set_tier("d1", ExecutionTier::FullAuto).unwrap());
+        assert!(!store.set_tier("nobody", ExecutionTier::FullAuto).unwrap());
+        let text = std::fs::read_to_string(dir.path().join("pairings.json")).unwrap();
+        assert!(!text.contains("tier"), "{text}");
     }
 }

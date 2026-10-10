@@ -9538,6 +9538,8 @@ async fn handle_chat_message(
                                 "label": p.label,
                                 "created_at": p.created_at,
                                 "can_be_woken": p.push.is_some(),
+                                // An agent's ceiling (M2a §2.6); null for a device.
+                                "tier": p.is_agent().then(|| p.agent_tier().as_setting()),
                             })
                         })
                         .collect::<Vec<_>>();
@@ -9575,6 +9577,53 @@ async fn handle_chat_message(
                             "data": { "removed": removed }
                         }
                     })
+                }
+
+                // --- One agent's execution tier (M2a §2.6). Local only: the
+                //     name is deliberately absent from `translate::PORTAL_QUERIES`,
+                //     so nothing arriving over a relay can raise an agent's tier.
+                "remote.agent_set_tier" => {
+                    let channel = params
+                        .get("control_channel_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let tier = params
+                        .get("tier")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let fail = |code: &str, message: String| {
+                        serde_json::json!({
+                            "type": "system_response",
+                            "payload": {
+                                "request_id": request_id,
+                                "command": "remote.agent_set_tier",
+                                "success": false,
+                                "error": { "code": code, "message": message }
+                            }
+                        })
+                    };
+                    match crate::remote::start::control_deps() {
+                        None => fail("NOT_READY", "the daemon is still starting".into()),
+                        Some(deps) => {
+                            match crate::remote::start::set_agent_tier(deps, &channel, &tier) {
+                                Err(e) => fail(e.code(), e.to_string()),
+                                Ok(t) => serde_json::json!({
+                                    "type": "system_response",
+                                    "payload": {
+                                        "request_id": request_id,
+                                        "command": "remote.agent_set_tier",
+                                        "success": true,
+                                        "data": {
+                                            "control_channel_id": channel,
+                                            "tier": t.as_setting(),
+                                        }
+                                    }
+                                }),
+                            }
+                        }
+                    }
                 }
 
                 // --- Remote-gateway S5: start a portal session. Mints a DO JWT

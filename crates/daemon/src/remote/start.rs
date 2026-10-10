@@ -883,6 +883,55 @@ pub async fn unpair_device(deps: &ControlDeps, control_channel_id: &str) -> bool
     closed || removed
 }
 
+/// Why an agent's tier was not changed.
+#[derive(Debug, thiserror::Error)]
+pub enum SetTierError {
+    /// Not one of the four tier names, spelled exactly.
+    #[error(
+        "unknown tier `{0}`; use read-only, browser-auto, browser-auto-local-read or full-auto"
+    )]
+    InvalidTier(String),
+    /// No agent pairing has that control channel.
+    #[error("no paired agent has that channel")]
+    NotFound,
+    /// The store could not be read or written.
+    #[error("could not store the tier: {0}")]
+    Store(String),
+}
+
+impl SetTierError {
+    /// The `system_response` error code the sidebar shows.
+    pub fn code(&self) -> &'static str {
+        match self {
+            SetTierError::InvalidTier(_) => "INVALID_TIER",
+            SetTierError::NotFound => "NOT_FOUND",
+            SetTierError::Store(_) => "STORE_FAILED",
+        }
+    }
+}
+
+/// Set one agent's tier (M2a §2.6, `remote.agent_set_tier`).
+///
+/// Strict where reading is lenient: a name that `from_setting` would quietly
+/// turn into `read-only` is refused here, so a typo never looks like it
+/// worked. Takes effect on the agent's next call — the backend reads the
+/// store per call.
+pub fn set_agent_tier(
+    deps: &ControlDeps,
+    control_channel_id: &str,
+    tier: &str,
+) -> Result<nevoflux_protocol::ExecutionTier, SetTierError> {
+    let parsed = nevoflux_protocol::ExecutionTier::from_setting(tier);
+    if parsed.as_setting() != tier {
+        return Err(SetTierError::InvalidTier(tier.to_string()));
+    }
+    match deps.agent_pairings.set_tier(control_channel_id, parsed) {
+        Ok(true) => Ok(parsed),
+        Ok(false) => Err(SetTierError::NotFound),
+        Err(e) => Err(SetTierError::Store(e.to_string())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1312,6 +1361,7 @@ mod tests {
             label: None,
             push: None,
             kind: crate::remote::pairing::PairingKind::Device,
+            tier: None,
         }
     }
 
@@ -1325,6 +1375,7 @@ mod tests {
             label: None,
             push: None,
             kind: crate::remote::pairing::PairingKind::Agent,
+            tier: None,
         }
     }
 
@@ -1452,6 +1503,52 @@ mod tests {
         // Only meaningful when the override is absent, which is the CI default.
         if std::env::var("NEVOFLUX_RELAY_URL").is_err() {
             assert_eq!(relay_base(), "wss://relay.nevoflux.app");
+        }
+    }
+
+    #[test]
+    fn an_agents_tier_can_be_raised_and_is_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps(dir.path());
+        store_pairing(&deps, &agent("a1")).unwrap();
+        assert_eq!(
+            set_agent_tier(&deps, "a1", "browser-auto").unwrap(),
+            nevoflux_protocol::ExecutionTier::BrowserAuto
+        );
+        assert_eq!(
+            deps.agent_pairings.load().unwrap()[0].agent_tier(),
+            nevoflux_protocol::ExecutionTier::BrowserAuto
+        );
+    }
+
+    #[test]
+    fn a_tier_that_is_not_one_of_the_four_is_refused_and_nothing_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps(dir.path());
+        store_pairing(&deps, &agent("a1")).unwrap();
+        for bad in ["auto", "Full-Auto", "full_auto", ""] {
+            match set_agent_tier(&deps, "a1", bad) {
+                Err(SetTierError::InvalidTier(s)) => assert_eq!(s, bad),
+                other => panic!("{bad}: {other:?}"),
+            }
+        }
+        assert_eq!(SetTierError::InvalidTier(String::new()).code(), "INVALID_TIER");
+        assert_eq!(
+            deps.agent_pairings.load().unwrap()[0].agent_tier(),
+            nevoflux_protocol::ExecutionTier::ReadOnly
+        );
+    }
+
+    #[test]
+    fn only_a_paired_agent_has_a_tier_to_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps(dir.path());
+        store_pairing(&deps, &device("d1")).unwrap();
+        deps.pairings.add(agent("stray")).unwrap();
+        for id in ["d1", "stray", "nobody"] {
+            let e = set_agent_tier(&deps, id, "full-auto").unwrap_err();
+            assert!(matches!(e, SetTierError::NotFound), "{id}: {e:?}");
+            assert_eq!(e.code(), "NOT_FOUND");
         }
     }
 }
