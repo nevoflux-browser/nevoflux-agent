@@ -848,6 +848,7 @@ Do you want to allow it?",
                     timeout_ms: 86_400_000, // 24 hours — wait for user decision
                     client_identity: browser_ctx.client_identity.clone(),
                     proxy_id: browser_ctx.proxy_id.clone(),
+                    origin: None,
                 };
                 sender
                     .send((request, response_tx))
@@ -1568,6 +1569,7 @@ Do you want to allow it?",
                     timeout_ms: 86_400_000,
                     client_identity,
                     proxy_id,
+                    origin: None,
                 };
                 sender
                     .send((request, response_tx))
@@ -1685,6 +1687,7 @@ Do you want to allow it?",
             timeout_ms: 5_000,
             client_identity: services.client_identity.clone(),
             proxy_id: services.proxy_id.clone(),
+            origin: None,
         };
         Some((sender, request))
     }
@@ -8752,6 +8755,7 @@ impl DaemonHostFunctions {
                 .as_ref()
                 .map(|s| s.proxy_id.clone())
                 .unwrap_or_default(),
+            origin: None,
         };
 
         // Create oneshot channel for response

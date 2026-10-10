@@ -67,6 +67,7 @@ impl BrowserBridge for RealBrowserBridge {
             timeout_ms: 30_000,
             client_identity: self.ctx.client_identity.clone(),
             proxy_id: self.ctx.proxy_id.clone(),
+            origin: self.ctx.origin(),
         };
 
         let (response_tx, response_rx) = oneshot::channel::<BrowserResponse>();

@@ -117,6 +117,15 @@ pub struct BrowserContext {
     pub recordings_dir: std::path::PathBuf,
 }
 
+impl BrowserContext {
+    /// The origin this context's requests carry: `"agent"` when it speaks
+    /// for the agent channel. Derived from the routing label rather than
+    /// stored, so no context can claim it without that label.
+    pub fn origin(&self) -> Option<String> {
+        crate::registry::browser_request_origin(&self.proxy_id)
+    }
+}
+
 /// Browser tool request for the browser sender channel.
 #[derive(Debug, Clone)]
 pub struct BrowserRequest {
@@ -136,6 +145,9 @@ pub struct BrowserRequest {
     pub client_identity: Vec<u8>,
     /// Proxy ID for the response envelope.
     pub proxy_id: String,
+    /// `Some("agent")` for an agent-channel call (M2a §3.4), carried onto the
+    /// wire `BrowserToolRequest`. `None` for everything else.
+    pub origin: Option<String>,
 }
 
 /// Browser tool response.
@@ -1334,6 +1346,7 @@ mod tests {
             timeout_ms: 30000,
             client_identity: vec![1, 2, 3],
             proxy_id: "proxy-001".into(),
+            origin: None,
         };
 
         assert_eq!(request.request_id, "req-001");
@@ -1568,5 +1581,23 @@ mod tests {
 
         assert!(debug_str.contains("knowledge_retriever"));
         assert!(debug_str.contains("Some(...)"));
+    }
+
+    #[test]
+    fn a_context_that_speaks_for_the_agent_channel_marks_its_requests() {
+        let db = Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        let (tx, _rx) = mpsc::channel(1);
+        let agent = HostServices::new(db.clone())
+            .with_browser_sender(tx.clone())
+            .with_client_context(Vec::new(), "agent:2f1c4a90".into())
+            .browser_context()
+            .unwrap();
+        assert_eq!(agent.origin().as_deref(), Some("agent"));
+        let local = HostServices::new(db)
+            .with_browser_sender(tx)
+            .with_client_context(b"p1".to_vec(), "p1".into())
+            .browser_context()
+            .unwrap();
+        assert_eq!(local.origin(), None);
     }
 }

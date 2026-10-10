@@ -281,6 +281,20 @@ pub fn browser_target(sender: &str) -> Option<(String, Vec<u8>)> {
     browser_target_for(sender, browsers, clients)
 }
 
+/// Proxy ids the agent channel stamps on its browser calls (`agent:<pairing>`).
+///
+/// Never a live connection: [`browser_target`] re-addresses them to the
+/// browser this daemon serves, exactly like a paired phone's label.
+pub const AGENT_PROXY_PREFIX: &str = "agent:";
+
+/// The `origin` a browser request carries to the extension (M2a §3.4):
+/// `"agent"` for the agent channel's calls, nothing for anyone else's.
+pub fn browser_request_origin(sender: &str) -> Option<String> {
+    sender
+        .starts_with(AGENT_PROXY_PREFIX)
+        .then(|| "agent".to_string())
+}
+
 /// Registry of connections that declared `role:"browser"`. Distinct from
 /// [`ProxyRegistry`] (which tracks all proxies) and [`SessionProxyTracker`]
 /// (the `/loop` borrow hack): this is the explicit routing target for
@@ -1118,5 +1132,35 @@ mod tests {
         b.bind("sess-1", browser_entry("browser-a"));
         let got = b.get("sess-1").unwrap();
         assert_eq!(got.client_identity, b"browser-a".to_vec());
+    }
+}
+
+
+#[cfg(test)]
+mod origin_tests {
+    use super::*;
+
+    #[test]
+    fn only_the_agent_channel_marks_its_requests() {
+        assert_eq!(browser_request_origin("agent:2f1c4a90"), Some("agent".to_string()));
+        assert_eq!(browser_request_origin("proxy-123"), None);
+        assert_eq!(browser_request_origin("remote-control"), None);
+        assert_eq!(browser_request_origin(""), None);
+        assert_eq!(browser_request_origin("agentx:1"), None);
+    }
+
+    #[test]
+    fn an_agent_label_is_re_addressed_like_any_other_label() {
+        // `agent:<id>` is never a live connection, so its calls go to the
+        // browser this daemon serves — the same rule a paired phone gets.
+        let browsers = BrowserRegistry::new();
+        let clients = ConnectedClients::new();
+        clients.register("sidebar-1", b"sidebar-1".to_vec());
+        assert_eq!(
+            browser_target_for("agent:2f1c4a90", &browsers, &clients),
+            Some(("sidebar-1".to_string(), b"sidebar-1".to_vec()))
+        );
+        let nobody = ConnectedClients::new();
+        assert_eq!(browser_target_for("agent:2f1c4a90", &browsers, &nobody), None);
     }
 }

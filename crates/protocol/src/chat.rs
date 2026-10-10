@@ -301,6 +301,13 @@ pub struct BrowserToolRequest {
     pub params: serde_json::Value,
     /// Timeout in milliseconds
     pub timeout_ms: u64,
+    /// Who asked, when it is not the local chat (M2a §3.4). `"agent"` marks an
+    /// agent-channel call, which the extension runs directly instead of
+    /// handing to the sidebar. Absent for every other request, so an older
+    /// extension sees exactly the shape it always did. Mirrored by hand in
+    /// the browser's `dioxus-ui/shared-protocol/src/chat.rs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 // ============================================================================
@@ -731,6 +738,7 @@ mod tests {
             action: BrowserToolAction::Navigate,
             params: serde_json::json!({"url": "https://github.com"}),
             timeout_ms: 30000,
+            origin: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -738,6 +746,40 @@ mod tests {
 
         let decoded: BrowserToolRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(req, decoded);
+    }
+
+    #[test]
+    fn a_browser_tool_request_without_an_origin_keeps_its_old_shape() {
+        let req = BrowserToolRequest {
+            request_id: "r".into(),
+            session_id: "s".into(),
+            tab_id: None,
+            action: BrowserToolAction::Navigate,
+            params: serde_json::json!({}),
+            timeout_ms: 1,
+            origin: None,
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert!(v.get("origin").is_none(), "{v}");
+        let old = r#"{"request_id":"r","session_id":"s","tab_id":null,"action":"navigate","params":{},"timeout_ms":1}"#;
+        let decoded: BrowserToolRequest = serde_json::from_str(old).unwrap();
+        assert_eq!(decoded.origin, None);
+    }
+
+    #[test]
+    fn browser_tool_request_from_the_agent_says_so_at_the_top_level() {
+        let req = BrowserToolRequest {
+            request_id: "r".into(),
+            session_id: "agent-2f1c4a90".into(),
+            tab_id: Some(100),
+            action: BrowserToolAction::Snapshot,
+            params: serde_json::json!({}),
+            timeout_ms: 30000,
+            origin: Some("agent".into()),
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["origin"], "agent");
+        assert_eq!(serde_json::from_value::<BrowserToolRequest>(v).unwrap(), req);
     }
 
     #[test]

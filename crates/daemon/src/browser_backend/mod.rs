@@ -251,6 +251,7 @@ mod tests {
             timeout_ms: 0,
             client_identity: Vec::new(),
             proxy_id: String::new(),
+            origin: None,
         };
         assert!(!addressed_to_a_browser(&request));
         request.proxy_id = "proxy-b1".into();

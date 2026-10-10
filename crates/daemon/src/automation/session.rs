@@ -856,6 +856,7 @@ fn build_soft_reset_request(
         timeout_ms: 5000,
         client_identity,
         proxy_id,
+        origin: None,
     }
 }
 
@@ -1147,6 +1148,7 @@ mod tests {
                 timeout_ms: 0,
                 client_identity: unbound().client_identity,
                 proxy_id: unbound().proxy_id,
+                origin: None,
             }
         ));
     }

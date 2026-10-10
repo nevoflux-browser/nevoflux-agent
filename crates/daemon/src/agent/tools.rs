@@ -1449,6 +1449,7 @@ impl BrowserTool {
             timeout_ms: 120_000,
             client_identity: self.ctx.client_identity.clone(),
             proxy_id: self.ctx.proxy_id.clone(),
+            origin: None,
         };
 
         let (response_tx, response_rx) = oneshot::channel();
@@ -1544,6 +1545,7 @@ impl ToolExecutor for BrowserTool {
             timeout_ms,
             client_identity: self.ctx.client_identity.clone(),
             proxy_id: self.ctx.proxy_id.clone(),
+            origin: None,
         };
 
         let (response_tx, response_rx) = oneshot::channel();
@@ -1704,6 +1706,7 @@ async fn dispatch_browser_request(
         timeout_ms: 30_000,
         client_identity: ctx.client_identity.clone(),
         proxy_id: ctx.proxy_id.clone(),
+        origin: None,
     };
 
     let (response_tx, response_rx) = oneshot::channel();

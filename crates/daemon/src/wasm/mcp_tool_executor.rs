@@ -309,6 +309,7 @@ async fn execute_ask_user(
         timeout_ms: 86_400_000, // 24 hours — wait for user decision
         client_identity: browser_ctx.client_identity.clone(),
         proxy_id: browser_ctx.proxy_id.clone(),
+        origin: browser_ctx.origin(),
     };
 
     if browser_ctx
@@ -1111,6 +1112,7 @@ async fn execute_browser_tool(
         timeout_ms: 30_000,
         client_identity: browser_ctx.client_identity.clone(),
         proxy_id: browser_ctx.proxy_id.clone(),
+        origin: browser_ctx.origin(),
     };
 
     browser_ctx
@@ -1398,6 +1400,7 @@ pub(crate) async fn execute_browser_upload_orchestrated(
         timeout_ms: 120_000,
         client_identity: browser_ctx.client_identity.clone(),
         proxy_id: browser_ctx.proxy_id.clone(),
+        origin: browser_ctx.origin(),
     };
 
     browser_ctx

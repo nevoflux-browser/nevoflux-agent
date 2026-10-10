@@ -2429,6 +2429,7 @@ pub async fn start_server(
                 action: request.action,
                 params: request.params,
                 timeout_ms: request.timeout_ms,
+                origin: request.origin,
             };
 
             // Wrap in AgentMessage and send

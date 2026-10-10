@@ -693,6 +693,7 @@ mod tests {
             timeout_ms: 5_000,
             client_identity: Vec::new(),
             proxy_id: String::new(),
+            origin: None,
         })
     }
 
