@@ -2033,7 +2033,19 @@ mod tests {
                 .message(|m| m["method"] == "elicitation/create")
                 .await;
             assert_eq!(request["method"], f["approval_request"]["method"]);
-            assert_eq!(request["params"], f["approval_request"]["params"]);
+            // rmcp adds `progressToken`, always equal to the request id.
+            let mut params = request["params"].clone();
+            let token = params["_meta"]
+                .as_object_mut()
+                .unwrap()
+                .remove("progressToken");
+            assert_eq!(token.as_ref(), Some(&request["id"]));
+            let mut expected = f["approval_request"]["params"].clone();
+            expected["_meta"]
+                .as_object_mut()
+                .unwrap()
+                .remove("progressToken");
+            assert_eq!(params, expected);
             agent
                 .send(json!({"jsonrpc": "2.0", "id": request["id"].clone(), "result": answer}))
                 .await;
@@ -2048,6 +2060,109 @@ mod tests {
                 );
                 assert!(browser.seen.lock().unwrap().is_empty());
             }
+        }
+    }
+
+    /// Every `errors.*` entry of the shared fixture, exactly as the head makes
+    /// it: unknown_tool, tier_denied, approval_denied and approval_timeout are
+    /// driven through `DesktopBrowserBackend::call`; tab_closed and tool_failed
+    /// through `after_failure` (the head's own mapping of a browser failure);
+    /// browser_unavailable and no_agent_tab are built with the constructor,
+    /// because their causes (no browser connected / no tab yet) are exercised
+    /// by their own tests and the message text lives in `AgentError::body`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_fixture_error_is_what_the_head_produces() {
+        let f = fixture();
+        let errors = f["errors"].as_object().unwrap();
+
+        let ro = rig(ExecutionTier::ReadOnly);
+        let auto = rig_with(
+            ExecutionTier::BrowserAuto,
+            Judgement::Ask {
+                prompts: vec![AskPrompt {
+                    stage: "site_policy",
+                    prompt: "ask".into(),
+                }],
+                arguments: None,
+            },
+            |s| s,
+        );
+        let click = json!({"element_id": "e1", "tab_id": 1});
+        let denied = auto
+            .backend
+            .call(
+                "browser_click",
+                click.clone(),
+                &approver(Approval::Declined),
+            )
+            .await
+            .unwrap();
+        let timed_out = auto
+            .backend
+            .call("browser_click", click, &approver(Approval::TimedOut))
+            .await
+            .unwrap();
+        let built: Vec<(&str, CallToolResult)> = vec![
+            (
+                "unknown_tool",
+                ro.backend
+                    .call("bash", json!({}), &approver(Approval::Approved))
+                    .await
+                    .unwrap(),
+            ),
+            (
+                "tier_denied",
+                ro.backend
+                    .call(
+                        "browser_click",
+                        json!({"element_id": "e1", "tab_id": 1}),
+                        &approver(Approval::Approved),
+                    )
+                    .await
+                    .unwrap(),
+            ),
+            ("approval_denied", denied),
+            ("approval_timeout", timed_out),
+            (
+                "browser_unavailable",
+                AgentError::BrowserUnavailable.to_result("browser_click"),
+            ),
+            (
+                "no_agent_tab",
+                AgentError::NoAgentTab.to_result("browser_click"),
+            ),
+            (
+                "tab_closed",
+                ro.backend
+                    .after_failure(&json!({"tab_id": 7}), "3001: Tab not found".into())
+                    .to_result("browser_click"),
+            ),
+            (
+                "tool_failed",
+                ro.backend
+                    .after_failure(&json!({}), "-1: Element not found".into())
+                    .to_result("browser_click"),
+            ),
+        ];
+        assert_eq!(
+            built.len(),
+            errors.len(),
+            "every fixture entry is built, none is missing"
+        );
+        for (name, result) in built {
+            let got = serde_json::to_value(&result).unwrap();
+            let want = &errors[name];
+            assert_eq!(got["isError"], want["isError"], "{name}: isError");
+            assert_eq!(
+                got["structuredContent"], want["structuredContent"],
+                "{name}: structuredContent"
+            );
+            assert_eq!(text(&got), text(want), "{name}: content[0].text");
+            assert_eq!(
+                got["content"].as_array().unwrap().len(),
+                1,
+                "{name}: one content block"
+            );
         }
     }
 }
