@@ -38,6 +38,163 @@ pub fn is_allowed(name: &str) -> bool {
     WHITELIST.contains(&name)
 }
 
+const TAB_ID: &str = "Tab to act in. Omit it to act in your own tab (the one your last \
+browser_navigate opened); pass an id from browser_get_tabs to act in any other tab.";
+
+fn tab_id() -> Value {
+    json!({ "type": "integer", "description": TAB_ID })
+}
+
+fn element_id() -> Value {
+    json!({ "type": "string", "description": "[eN] id from browser_snapshot" })
+}
+
+fn selector() -> Value {
+    json!({ "type": "string", "description": "CSS selector" })
+}
+
+/// The schemas the agent channel publishes (M2a §3.2). Its own, not the MCP
+/// catalogue's: these declare `tab_id` and say what omitting it means here.
+/// Daemon-only keys (`background`, `window`, `workspace_dir`) are absent on
+/// purpose — the backend also strips them if an agent sends them anyway.
+pub fn agent_tools() -> Vec<Tool> {
+    fn tool(name: &'static str, description: &'static str, properties: Value, required: &[&str]) -> Tool {
+        Tool::new(
+            name,
+            description,
+            schema(json!({ "type": "object", "properties": properties, "required": required })),
+        )
+    }
+    vec![
+        tool(
+            "browser_snapshot",
+            "Accessibility snapshot of the page, with [eN] element ids for the *_by_id tools.",
+            json!({ "tab_id": tab_id() }),
+            &[],
+        ),
+        tool(
+            "browser_get_markdown",
+            "The page's content as clean markdown. The cheapest way to read a page.",
+            json!({ "tab_id": tab_id() }),
+            &[],
+        ),
+        tool(
+            "browser_screenshot",
+            "A picture of the tab's visible viewport.",
+            json!({
+                "full_page": { "type": "boolean", "default": false, "description": "Capture the whole page instead of the viewport" },
+                "tab_id": tab_id()
+            }),
+            &[],
+        ),
+        tool(
+            "browser_get_tabs",
+            "Every open tab with its id, title and URL. Tabs you opened carry owned: true; \
+the person's own tabs carry owned: false — leave those alone unless asked.",
+            json!({
+                "scope": { "type": "string", "enum": ["all", "space", "folder", "live_folder"], "description": "Zen scope filter; omit for every tab outside live folders" },
+                "scope_id": { "type": "string", "description": "Space, folder or live-folder id that narrows scope" }
+            }),
+            &[],
+        ),
+        tool(
+            "browser_navigate",
+            "Load a URL. Without tab_id it runs in your own tab, opening one in the background \
+the first time; it never takes over the tab the person is looking at.",
+            json!({
+                "url": { "type": "string", "description": "Where to go" },
+                "new_tab": { "type": "boolean", "default": false, "description": "Open another tab of your own instead of reusing your current one" },
+                "tab_id": tab_id()
+            }),
+            &["url"],
+        ),
+        tool(
+            "browser_activate_tab",
+            "Bring a tab to the front. This changes what the person is looking at.",
+            json!({ "tab_id": { "type": "integer", "description": "The tab to show, from browser_get_tabs" } }),
+            &["tab_id"],
+        ),
+        tool(
+            "browser_click_by_id",
+            "Click an element by its [eN] id. Clicking an option id of a <select> chooses it.",
+            json!({ "element_id": element_id(), "tab_id": tab_id() }),
+            &["element_id"],
+        ),
+        tool(
+            "browser_fill_by_id",
+            "Set a form field's value by its [eN] id. On a <select>, pass an option's label or value.",
+            json!({ "element_id": element_id(), "value": { "type": "string", "description": "Value to set" }, "tab_id": tab_id() }),
+            &["element_id", "value"],
+        ),
+        tool(
+            "browser_type_by_id",
+            "Type text key by key into an element by its [eN] id. For autocomplete and search \
+boxes; prefer browser_fill_by_id otherwise.",
+            json!({ "element_id": element_id(), "text": { "type": "string", "description": "Text to type" }, "tab_id": tab_id() }),
+            &["element_id", "text"],
+        ),
+        tool(
+            "browser_click",
+            "Click an element by CSS selector.",
+            json!({ "selector": selector(), "tab_id": tab_id() }),
+            &["selector"],
+        ),
+        tool(
+            "browser_fill",
+            "Set an input's value by CSS selector.",
+            json!({ "selector": selector(), "value": { "type": "string", "description": "Value to set" }, "tab_id": tab_id() }),
+            &["selector", "value"],
+        ),
+        tool(
+            "browser_type",
+            "Type text key by key into an element by CSS selector.",
+            json!({ "selector": selector(), "text": { "type": "string", "description": "Text to type" }, "tab_id": tab_id() }),
+            &["selector", "text"],
+        ),
+        tool(
+            "browser_key_press",
+            "Press a key, such as Enter, Tab or Escape.",
+            json!({
+                "key": { "type": "string", "description": "Key name" },
+                "modifiers": { "type": "array", "items": { "type": "string" }, "description": "Modifier keys held down, e.g. [\"Control\"]" },
+                "tab_id": tab_id()
+            }),
+            &["key"],
+        ),
+        tool(
+            "browser_scroll",
+            "Scroll the page.",
+            json!({
+                "direction": { "type": "string", "enum": ["up", "down", "left", "right"] },
+                "amount": { "type": "string", "description": "'page' (default), 'half', or a pixel count such as '300'" },
+                "tab_id": tab_id()
+            }),
+            &["direction"],
+        ),
+        tool(
+            "browser_wait_for",
+            "Wait until an element appears.",
+            json!({
+                "element_id": element_id(),
+                "selector": selector(),
+                "timeout_ms": { "type": "integer", "default": 10000, "description": "Give up after this many milliseconds" },
+                "tab_id": tab_id()
+            }),
+            &[],
+        ),
+        tool(
+            "browser_upload_file",
+            "Put a file from the desktop's NevoFlux workspace folder into an <input type=\"file\">.",
+            json!({
+                "selector": selector(),
+                "file_path": { "type": "string", "description": "Absolute path of a file inside the workspace folder" },
+                "tab_id": tab_id()
+            }),
+            &["selector", "file_path"],
+        ),
+    ]
+}
+
 /// A JSON-RPC error whose `data.code` a client can branch on (design §12).
 pub fn error_with_code(code: &'static str, message: impl Into<String>) -> ErrorData {
     ErrorData::new(
@@ -158,6 +315,7 @@ impl AgentError {
 
 /// What became of a question put to the agent's client (M2a §4.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
 pub enum Approval {
     /// Accepted with `approve: true`.
     Approved,
@@ -440,5 +598,62 @@ mod tests {
             .await
             .expect("a tool error, not a protocol error");
         assert_eq!(out.structured_content.unwrap()["error"]["code"], "unknown_tool");
+    }
+
+    fn schema_of(t: &Tool) -> Value {
+        Value::Object((*t.input_schema).clone())
+    }
+
+    #[test]
+    fn the_agent_tools_are_exactly_the_whitelist() {
+        let mut names: Vec<String> = agent_tools().iter().map(|t| t.name.to_string()).collect();
+        names.sort();
+        let mut want: Vec<String> = WHITELIST.iter().map(|s| s.to_string()).collect();
+        want.sort();
+        assert_eq!(names, want);
+    }
+
+    #[test]
+    fn every_tab_scoped_tool_lets_the_agent_name_a_tab() {
+        for t in agent_tools() {
+            let s = schema_of(&t);
+            if t.name == "browser_get_tabs" {
+                assert!(s["properties"].get("tab_id").is_none());
+                continue;
+            }
+            assert_eq!(s["properties"]["tab_id"]["type"], "integer", "{}", t.name);
+        }
+    }
+
+    #[test]
+    fn navigate_offers_a_new_tab_and_activating_needs_a_tab() {
+        let tools = agent_tools();
+        let nav = schema_of(tools.iter().find(|t| t.name == "browser_navigate").unwrap());
+        assert_eq!(nav["properties"]["new_tab"]["type"], "boolean");
+        assert_eq!(nav["required"], json!(["url"]));
+        let act = schema_of(tools.iter().find(|t| t.name == "browser_activate_tab").unwrap());
+        assert_eq!(act["required"], json!(["tab_id"]));
+    }
+
+    #[test]
+    fn placement_and_workspace_are_never_the_agents_to_choose() {
+        for t in agent_tools() {
+            let props = schema_of(&t)["properties"].clone();
+            for key in ["background", "window", "workspace_dir"] {
+                assert!(props.get(key).is_none(), "{} offers {key}", t.name);
+            }
+        }
+    }
+
+    #[test]
+    fn every_agent_tool_runs_below_full_auto_except_upload() {
+        for name in WHITELIST {
+            let min = nevoflux_protocol::minimum_tier(name);
+            if *name == "browser_upload_file" {
+                assert_eq!(min, ExecutionTier::FullAuto);
+            } else {
+                assert_ne!(min, ExecutionTier::FullAuto, "{name}");
+            }
+        }
     }
 }
