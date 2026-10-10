@@ -63,7 +63,7 @@ pub use canvas_tools::{
 pub use channel::Channel;
 pub use envelope::{AuthInfo, DaemonEnvelope, ProxyEnvelope};
 pub use error::{ProtocolError, Result};
-pub use execution_tier::{classify_tool, tier_auto_approves, ExecutionTier, RiskBucket};
+pub use execution_tier::{classify_tool, minimum_tier, tier_auto_approves, ExecutionTier, RiskBucket};
 pub use tools::{is_read_only_tool, READ_ONLY_TOOLS};
 
 pub use speech::{

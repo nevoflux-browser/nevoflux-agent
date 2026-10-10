@@ -140,6 +140,10 @@ const B1_TOOLS: &[&str] = &[
     "browser_fill_by_id",
     "browser_scroll",
     "browser_key_press",
+    // Bringing a tab to the front changes what the person is looking at, which
+    // is a browser interaction like a click (M2a decision A3). Unclassified it
+    // was X, so even browser-auto asked about every tab switch.
+    "browser_activate_tab",
 ];
 
 /// L0 bucket — local filesystem reads.
@@ -184,6 +188,19 @@ pub fn tier_auto_approves(tool_name: &str, tier: ExecutionTier) -> bool {
             matches!(bucket, RiskBucket::R | RiskBucket::B1 | RiskBucket::L0)
         }
         ExecutionTier::FullAuto => true,
+    }
+}
+
+/// The least privileged tier that runs `tool_name` without asking.
+///
+/// What an agent channel reports as `required` when a pairing's tier is too
+/// low (M2a §5), so the person is told which tier to pick instead of guessing.
+pub fn minimum_tier(tool_name: &str) -> ExecutionTier {
+    match classify_tool(tool_name) {
+        RiskBucket::R => ExecutionTier::ReadOnly,
+        RiskBucket::B1 => ExecutionTier::BrowserAuto,
+        RiskBucket::L0 => ExecutionTier::BrowserAutoLocalRead,
+        RiskBucket::X => ExecutionTier::FullAuto,
     }
 }
 
@@ -383,6 +400,79 @@ mod tests {
                 tier_auto_approves(t, ExecutionTier::FullAuto),
                 "{t} should auto in full-auto"
             );
+        }
+    }
+
+    /// The agent channel's sixteen tools (M2a §2.5) and their buckets.
+    const AGENT_CHANNEL: &[(&str, RiskBucket)] = &[
+        ("browser_snapshot", RiskBucket::R),
+        ("browser_get_markdown", RiskBucket::R),
+        ("browser_screenshot", RiskBucket::R),
+        ("browser_get_tabs", RiskBucket::R),
+        ("browser_navigate", RiskBucket::R),
+        ("browser_wait_for", RiskBucket::R),
+        ("browser_click_by_id", RiskBucket::B1),
+        ("browser_fill_by_id", RiskBucket::B1),
+        ("browser_type_by_id", RiskBucket::B1),
+        ("browser_click", RiskBucket::B1),
+        ("browser_fill", RiskBucket::B1),
+        ("browser_type", RiskBucket::B1),
+        ("browser_key_press", RiskBucket::B1),
+        ("browser_scroll", RiskBucket::B1),
+        ("browser_activate_tab", RiskBucket::B1),
+        ("browser_upload_file", RiskBucket::X),
+    ];
+
+    #[test]
+    fn the_agent_channel_tools_are_bucketed_as_designed() {
+        assert_eq!(AGENT_CHANNEL.len(), 16);
+        for (tool, bucket) in AGENT_CHANNEL {
+            assert_eq!(classify_tool(tool), *bucket, "{tool}");
+        }
+    }
+
+    #[test]
+    fn the_agent_channel_tier_table() {
+        let tiers = [
+            ExecutionTier::ReadOnly,
+            ExecutionTier::BrowserAuto,
+            ExecutionTier::BrowserAutoLocalRead,
+            ExecutionTier::FullAuto,
+        ];
+        for (tool, bucket) in AGENT_CHANNEL {
+            let expected: [bool; 4] = match bucket {
+                RiskBucket::R => [true, true, true, true],
+                RiskBucket::B1 => [false, true, true, true],
+                RiskBucket::X => [false, false, false, true],
+                RiskBucket::L0 => unreachable!("no agent tool reads local files"),
+            };
+            for (tier, want) in tiers.iter().zip(expected) {
+                assert_eq!(tier_auto_approves(tool, *tier), want, "{tool} at {tier:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn switching_tabs_is_a_browser_interaction() {
+        // It changes what the person is looking at, like a click does.
+        assert_eq!(classify_tool("browser_activate_tab"), RiskBucket::B1);
+        assert!(!tier_auto_approves("browser_activate_tab", ExecutionTier::ReadOnly));
+        assert!(tier_auto_approves("browser_activate_tab", ExecutionTier::BrowserAuto));
+        assert!(tier_auto_approves(
+            "mcp__nevoflux__browser_activate_tab",
+            ExecutionTier::BrowserAuto
+        ));
+    }
+
+    #[test]
+    fn minimum_tier_names_the_first_tier_that_runs_a_tool() {
+        assert_eq!(minimum_tier("browser_navigate"), ExecutionTier::ReadOnly);
+        assert_eq!(minimum_tier("browser_click"), ExecutionTier::BrowserAuto);
+        assert_eq!(minimum_tier("read_file"), ExecutionTier::BrowserAutoLocalRead);
+        assert_eq!(minimum_tier("browser_upload_file"), ExecutionTier::FullAuto);
+        assert_eq!(minimum_tier("never_heard_of_it"), ExecutionTier::FullAuto);
+        for (tool, _) in AGENT_CHANNEL {
+            assert!(tier_auto_approves(tool, minimum_tier(tool)), "{tool}");
         }
     }
 }
