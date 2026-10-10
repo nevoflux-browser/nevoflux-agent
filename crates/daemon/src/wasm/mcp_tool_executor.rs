@@ -421,6 +421,67 @@ fn ask_user_allow_blocking(services: &HostServices, question: &str) -> bool {
     answer.as_deref() == Some("Allow")
 }
 
+/// The gate an MCP-dispatched call is judged by.
+///
+/// One builder for both the run (ACP providers, external MCP clients — see
+/// [`execute_mcp_tool`]) and the judgement the agent channel makes
+/// ([`judge_mcp_call`]), so the two can never be built from different inputs.
+pub(crate) fn gate_pipeline(
+    services: &HostServices,
+    packs_dir: &std::path::Path,
+) -> crate::tool_pipeline::Pipeline {
+    let active: Vec<String> = services
+        .active_packs
+        .read()
+        .map(|g| g.iter().cloned().collect())
+        .unwrap_or_default();
+    let policy_on = services
+        .agent_config
+        .as_deref()
+        .is_some_and(crate::jev::permission::policy_on);
+    crate::tool_pipeline::default_pipeline(packs_dir, &active, policy_on)
+}
+
+/// What the gate would decide about a call, without putting any question to
+/// anyone (M2a §2.4). The agent channel asks its own client instead of the
+/// desktop sidebar, so it needs the question rather than the answer.
+pub(crate) fn judge_mcp_call(
+    name: &str,
+    arguments: &serde_json::Value,
+    services: &HostServices,
+    packs_dir: &std::path::Path,
+) -> crate::tool_pipeline::Judgement {
+    let call = nevoflux_builtin_wasm::ToolCall {
+        id: format!("agent-{}", uuid::Uuid::new_v4()),
+        call_id: None,
+        name: name.to_string(),
+        arguments: arguments.clone(),
+        signature: None,
+    };
+    gate_pipeline(services, packs_dir).judge(&call, &mcp_tool_context(services))
+}
+
+/// Run one agent-channel browser tool: the same browser path
+/// [`execute_mcp_tool_inner`] takes for a browser tool, minus everything the
+/// agent channel never reaches (no `McpToolBridge`, no recording, no
+/// non-browser branches). Anything outside the agent whitelist is refused
+/// here too, so a caller bug cannot widen the channel.
+pub(crate) async fn execute_agent_browser_tool(
+    name: &str,
+    arguments: &serde_json::Value,
+    services: &HostServices,
+) -> Result<String, String> {
+    if !crate::remote::mcp_tools::is_allowed(name) {
+        return Err(format!("{name} is not an agent-channel tool"));
+    }
+    let action =
+        tool_name_to_browser_action(name).ok_or_else(|| format!("{name} is not a browser tool"))?;
+    let browser_ctx = services
+        .browser_context()
+        .ok_or_else(|| "browser not available".to_string())?;
+    execute_browser_tool(action, arguments, &browser_ctx).await
+}
+
 /// Execute a single MCP tool call, routing to the correct category.
 ///
 /// This is the second of the kernel's two tool entry points — the one ACP-bridge
@@ -484,16 +545,7 @@ pub async fn execute_mcp_tool(
     );
 
     let packs_dir = crate::paths::resolve_from_daemon().packs_dir();
-    let active: Vec<String> = services
-        .active_packs
-        .read()
-        .map(|g| g.iter().cloned().collect())
-        .unwrap_or_default();
-    let policy_on = services
-        .agent_config
-        .as_deref()
-        .is_some_and(crate::jev::permission::policy_on);
-    let gate = crate::tool_pipeline::default_pipeline(&packs_dir, &active, policy_on).run(
+    let gate = gate_pipeline(services, &packs_dir).run(
         &call,
         &ctx,
         &|prompt: &str| ask_user_allow_blocking(services, prompt),
@@ -2954,6 +3006,152 @@ fn encode_base64(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn answering_browser() -> (
+        crate::wasm::services::BrowserSender,
+        Arc<std::sync::Mutex<Vec<BrowserRequest>>>,
+    ) {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(
+            BrowserRequest,
+            tokio::sync::oneshot::Sender<crate::wasm::services::BrowserResponse>,
+        )>(8);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s = seen.clone();
+        tokio::spawn(async move {
+            while let Some((req, reply)) = rx.recv().await {
+                s.lock().unwrap().push(req.clone());
+                let _ = reply.send(crate::wasm::services::BrowserResponse {
+                    request_id: req.request_id,
+                    success: true,
+                    result: Some(serde_json::json!({ "tab_id": 100 })),
+                    error: None,
+                });
+            }
+        });
+        (tx, seen)
+    }
+
+    #[tokio::test]
+    async fn the_agent_entry_point_sends_one_marked_request_with_the_tab_routed() {
+        let db = Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        let (tx, seen) = answering_browser();
+        let services = HostServices::new(db)
+            .with_browser_sender(tx)
+            .with_client_context(Vec::new(), "agent:2f1c4a90".into());
+        let out = execute_agent_browser_tool(
+            "browser_click",
+            &serde_json::json!({ "selector": "#go", "tab_id": 7 }),
+            &services,
+        )
+        .await;
+        assert!(out.is_ok(), "{out:?}");
+        let sent = seen.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].action, BrowserToolAction::Click);
+        assert_eq!(sent[0].tab_id, Some(7));
+        assert!(sent[0].params.get("tab_id").is_none(), "routing, not a parameter");
+        assert_eq!(sent[0].origin.as_deref(), Some("agent"));
+    }
+
+    #[tokio::test]
+    async fn the_agent_entry_point_refuses_what_the_channel_does_not_carry() {
+        let db = Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        let (tx, seen) = answering_browser();
+        let services = HostServices::new(db)
+            .with_browser_sender(tx)
+            .with_client_context(Vec::new(), "agent:2f1c4a90".into());
+        for name in ["browser_eval_js", "browser_ask_user", "run_command", "computer_click"] {
+            assert!(
+                execute_agent_browser_tool(name, &serde_json::json!({}), &services)
+                    .await
+                    .is_err(),
+                "{name}"
+            );
+        }
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_local_chat_request_carries_no_origin() {
+        let db = Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        let (tx, seen) = answering_browser();
+        let services = HostServices::new(db)
+            .with_browser_sender(tx)
+            .with_client_context(b"sidebar-1".to_vec(), "sidebar-1".into());
+        let _ = execute_agent_browser_tool(
+            "browser_snapshot",
+            &serde_json::json!({ "tab_id": 1 }),
+            &services,
+        )
+        .await;
+        assert_eq!(seen.lock().unwrap()[0].origin, None);
+    }
+
+    fn ask_pack(dir: &std::path::Path) {
+        let pd = dir.join("ask-guard");
+        std::fs::create_dir_all(&pd).unwrap();
+        std::fs::write(
+            pd.join("pack.toml"),
+            r#"
+[pack]
+name = "ask-guard"
+version = "1.0.0"
+protocol = "pack-protocol/0.2"
+min_nevoflux = "0.3.0"
+
+[[components.tool_policy]]
+scope   = "active"
+match   = { url = ["*://ask.example/*"] }
+deny    = []
+ask     = ["browser_navigate"]
+message = "ask.example wants a person to confirm"
+"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn judging_a_call_asks_what_running_it_would_ask() {
+        let dir = tempfile::tempdir().unwrap();
+        ask_pack(dir.path());
+        let db = Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        let services = HostServices::new(db);
+        services
+            .active_packs
+            .write()
+            .unwrap()
+            .insert("ask-guard".to_string());
+
+        match judge_mcp_call(
+            "browser_navigate",
+            &serde_json::json!({ "url": "https://ask.example/x" }),
+            &services,
+            dir.path(),
+        ) {
+            crate::tool_pipeline::Judgement::Ask { prompts, arguments } => {
+                assert_eq!(prompts.len(), 1);
+                assert_eq!(prompts[0].stage, "site_policy");
+                assert!(prompts[0].prompt.contains("ask-guard"), "{}", prompts[0].prompt);
+                assert!(arguments.is_none());
+            }
+            other => panic!("expected an ask, got {other:?}"),
+        }
+        assert!(matches!(
+            judge_mcp_call(
+                "browser_navigate",
+                &serde_json::json!({ "url": "https://elsewhere.example/" }),
+                &services,
+                dir.path(),
+            ),
+            crate::tool_pipeline::Judgement::Allow
+        ));
+        // The judgement and the dispatcher build their gate from the same inputs.
+        assert_eq!(
+            gate_pipeline(&services, dir.path()).stage_names(),
+            crate::tool_pipeline::default_pipeline(dir.path(), &["ask-guard".to_string()], false)
+                .stage_names()
+        );
+    }
 
     #[tokio::test]
     async fn local_path_reads_disk_bytes_into_resolved_asset() {
