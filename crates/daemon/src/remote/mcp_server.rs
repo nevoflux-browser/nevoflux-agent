@@ -16,6 +16,7 @@ use nevoflux_mcp::rmcp::service::RequestContext;
 use nevoflux_mcp::rmcp::{ErrorData as McpError, RoleServer};
 use serde_json::{json, Value};
 
+use super::elicit::{call_correlation, PeerApprover, APPROVAL_TIMEOUT};
 use super::mcp_tools::{is_allowed, AgentError, AgentToolBackend};
 
 /// The agent-channel protocol version. Same number as
@@ -64,17 +65,21 @@ impl ServerHandler for AgentMcpServer {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         if !is_allowed(&request.name) {
             tracing::info!(target: "remote", tool = %request.name, "agent asked for a tool off the whitelist");
             return Ok(AgentError::UnknownTool.to_result(&request.name).into());
         }
+        // The approver borrows this request's peer and is awaited inside this
+        // very future, never spawned: see `elicit` for why that is required.
+        let approver = PeerApprover::new(context.peer.clone(), APPROVAL_TIMEOUT)
+            .with_call(call_correlation(&context.meta, request.meta.as_ref()));
         let arguments = request
             .arguments
             .map(Value::Object)
             .unwrap_or_else(|| json!({}));
-        let result = self.backend.call(&request.name, arguments).await?;
+        let result = self.backend.call(&request.name, arguments, &approver).await?;
         Ok(result.into())
     }
 }

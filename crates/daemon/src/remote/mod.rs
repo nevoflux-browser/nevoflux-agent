@@ -15,6 +15,7 @@ pub mod control_config;
 pub mod control_gateway;
 pub mod control_service;
 pub mod crypto;
+pub mod elicit;
 pub mod envelope;
 pub mod gateway;
 pub mod history;

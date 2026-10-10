@@ -156,11 +156,49 @@ impl AgentError {
     }
 }
 
+/// What became of a question put to the agent's client (M2a §4.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Approval {
+    /// Accepted with `approve: true`.
+    Approved,
+    /// Accepted with anything but `approve: true`, declined, or cancelled.
+    Declined,
+    /// Nobody answered in time.
+    TimedOut,
+    /// The client never declared it can be asked.
+    Unsupported,
+    /// The question could not be put (session gone, client error).
+    Failed,
+}
+
+/// Puts one question to whoever is on the other end of the agent channel.
+#[async_trait]
+pub trait Approver: Send + Sync {
+    async fn ask(&self, message: String) -> Approval;
+}
+
+/// Nobody to ask: for backends that never need to, and for tests.
+pub struct NoApprover;
+
+#[async_trait]
+impl Approver for NoApprover {
+    async fn ask(&self, _message: String) -> Approval {
+        Approval::Unsupported
+    }
+}
+
 /// Whatever actually runs the tools behind an agent channel.
 #[async_trait]
 pub trait AgentToolBackend: Send + Sync + 'static {
     fn tools(&self) -> Vec<Tool>;
-    async fn call(&self, name: &str, arguments: Value) -> Result<CallToolResult, ErrorData>;
+    /// Run one tool. `approver` is how a rule's question reaches the agent's
+    /// client; it is valid only for the duration of this call.
+    async fn call(
+        &self,
+        name: &str,
+        arguments: Value,
+        approver: &dyn Approver,
+    ) -> Result<CallToolResult, ErrorData>;
 }
 
 /// M1's production backend: the channel, envelope and handshake are real, the
@@ -173,7 +211,12 @@ impl AgentToolBackend for UnavailableBackend {
         Vec::new()
     }
 
-    async fn call(&self, name: &str, _arguments: Value) -> Result<CallToolResult, ErrorData> {
+    async fn call(
+        &self,
+        name: &str,
+        _arguments: Value,
+        _approver: &dyn Approver,
+    ) -> Result<CallToolResult, ErrorData> {
         Err(error_with_code(
             "unavailable",
             format!("{name} is not available on this head yet"),
@@ -215,7 +258,12 @@ impl AgentToolBackend for StubBrowserBackend {
         ]
     }
 
-    async fn call(&self, name: &str, arguments: Value) -> Result<CallToolResult, ErrorData> {
+    async fn call(
+        &self,
+        name: &str,
+        arguments: Value,
+        _approver: &dyn Approver,
+    ) -> Result<CallToolResult, ErrorData> {
         let body = match name {
             "browser_snapshot" => json!({
                 "title": "Example Domain",
@@ -285,7 +333,7 @@ mod tests {
         let b = UnavailableBackend;
         assert!(b.tools().is_empty());
         let err = b
-            .call("browser_snapshot", serde_json::json!({}))
+            .call("browser_snapshot", serde_json::json!({}), &NoApprover)
             .await
             .expect_err("nothing runs in M1");
         assert_eq!(err.data, Some(serde_json::json!({"code": "unavailable"})));
@@ -304,6 +352,7 @@ mod tests {
             .call(
                 "browser_navigate",
                 serde_json::json!({"url": "https://example.com/"}),
+                &NoApprover,
             )
             .await
             .unwrap();
@@ -387,7 +436,7 @@ mod tests {
     #[tokio::test]
     async fn the_stub_answers_a_whitelisted_tool_it_lacks_with_unknown_tool() {
         let out = StubBrowserBackend
-            .call("browser_click", json!({}))
+            .call("browser_click", json!({}), &NoApprover)
             .await
             .expect("a tool error, not a protocol error");
         assert_eq!(out.structured_content.unwrap()["error"]["code"], "unknown_tool");
