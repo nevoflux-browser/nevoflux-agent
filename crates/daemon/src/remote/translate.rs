@@ -2232,3 +2232,45 @@ mod tests {
             .is_empty());
     }
 }
+
+/// Gap 7 (M2a §6): a remote peer must not be able to raise any execution
+/// tier. Agent tiers live in `agent-pairings.json`, which `content_store.set`
+/// cannot reach; these pin that nothing arriving over the relay can reach
+/// either of them.
+#[cfg(test)]
+mod gap_seven {
+    use super::*;
+
+    #[test]
+    fn a_portal_cannot_send_a_system_command_of_its_own() {
+        for frame in [
+            // Frames 1-2 pin "no direct arm exists" — queries go through query path
+            json!({ "kind": "system_command", "command": "content_store.set",
+                    "params": { "key": "general.agentExecution", "value": "full-auto" } }),
+            json!({ "kind": "content_store.set", "key": "general.agentExecution", "value": "full-auto" }),
+            // Frame 3 covered by the_agent_tier_is_never_a_portal_query query check
+            json!({ "kind": "query", "id": "q", "name": "content_store.set",
+                    "params": { "key": "general.agentExecution", "value": "full-auto" } }),
+            // Frame 4 pins the wrong-shape case — no top-level `kind` returns None due to shape check
+            json!({ "type": "system_command",
+                    "payload": { "request_id": "r", "command": "content_store.set" } }),
+        ] {
+            assert!(uplink(&frame, "s", "m", None, &[]).is_none(), "{frame}");
+        }
+    }
+
+    #[test]
+    fn the_agent_tier_is_never_a_portal_query() {
+        assert!(!PORTAL_QUERIES.contains(&"remote.agent_set_tier"));
+        assert!(!PORTAL_QUERIES.iter().any(|q| q.starts_with("remote.")));
+        assert!(uplink(
+            &json!({ "kind": "query", "id": "q", "name": "remote.agent_set_tier",
+                     "params": { "control_channel_id": "c", "tier": "full-auto" } }),
+            "s",
+            "m",
+            None,
+            &[]
+        )
+        .is_none());
+    }
+}

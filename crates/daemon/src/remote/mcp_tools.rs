@@ -656,4 +656,12 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn the_agent_channel_cannot_reach_the_content_store_or_its_own_tier() {
+        for name in ["content_store_set", "content_store.set", "remote.agent_set_tier", "remote.pairings"] {
+            assert!(!is_allowed(name), "{name}");
+            assert!(agent_tools().iter().all(|t| t.name != name), "{name}");
+        }
+    }
 }
