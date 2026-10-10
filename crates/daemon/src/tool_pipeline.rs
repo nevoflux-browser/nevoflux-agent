@@ -135,6 +135,41 @@ pub trait Stage: Send + Sync {
 /// without a UI.
 pub type AskFn<'a> = dyn Fn(&str) -> bool + 'a;
 
+/// One question a stage wants put, and which stage wants it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AskPrompt {
+    /// The stage's [`Stage::name`].
+    pub stage: &'static str,
+    /// What to put in front of the person.
+    pub prompt: String,
+}
+
+/// What the gate concludes about a call when nobody is asked anything.
+///
+/// The agent channel (M2a §2.4) cannot put a question from inside the
+/// synchronous pipeline: its answer comes back over MCP, awaited in the
+/// handler's own future. So it asks the pipeline what it *would* ask, puts
+/// all of it in one question, and runs only on a yes.
+#[derive(Debug, Clone)]
+pub enum Judgement {
+    /// No stage objects.
+    Allow,
+    /// No stage asks or refuses, and the call runs with these arguments.
+    Rewrite {
+        /// Replacement arguments.
+        arguments: serde_json::Value,
+    },
+    /// Stages want a person asked; nothing refuses.
+    Ask {
+        /// Every question, in stage order.
+        prompts: Vec<AskPrompt>,
+        /// The arguments that were judged, when a stage rewrote them.
+        arguments: Option<serde_json::Value>,
+    },
+    /// A stage refuses. Wins over any question (I3).
+    Deny(ToolDenial),
+}
+
 /// The ordered gate.
 pub struct Pipeline {
     stages: Vec<Box<dyn Stage>>,
@@ -152,19 +187,23 @@ impl Pipeline {
         self.stages.iter().map(|s| s.name()).collect()
     }
 
-    /// Run every stage in order and settle on one verdict.
+    /// The one loop [`Pipeline::run`] and [`Pipeline::judge`] both go
+    /// through, so the order and Deny-beats-Ask cannot drift between them.
     ///
-    /// An `Ask` from any stage is resolved here: unattended runs refuse it
-    /// outright (invariant I6 — a guard that cannot ask must not assume yes),
-    /// and interactive runs put it to the user.
-    pub fn run(&self, call: &ToolCall, ctx: &ToolContext, ask: &AskFn<'_>) -> ToolGate {
+    /// `on_ask` decides what an `Ask` means: `Some(denial)` ends the walk
+    /// with that refusal, `None` carries on to the next stage.
+    fn walk(
+        &self,
+        call: &ToolCall,
+        ctx: &ToolContext,
+        on_ask: &mut dyn FnMut(&'static str, String) -> Option<ToolDenial>,
+    ) -> Result<Option<serde_json::Value>, ToolDenial> {
         let mut effective = call.clone();
         let mut rewritten: Option<serde_json::Value> = None;
-
         for stage in &self.stages {
             match stage.check(&effective, ctx) {
                 Verdict::Allow => {}
-                Verdict::Deny(d) => return ToolGate::Deny(d),
+                Verdict::Deny(d) => return Err(d),
                 Verdict::Rewrite { arguments } => {
                     // Later stages judge what will actually run, not what was
                     // asked for — otherwise a rewrite could smuggle a call past
@@ -173,32 +212,67 @@ impl Pipeline {
                     rewritten = Some(arguments);
                 }
                 Verdict::Ask { prompt } => {
-                    if ctx.is_unattended {
-                        return ToolGate::Deny(ToolDenial {
-                            code: "CONFIRMATION_REQUIRED".into(),
-                            message: format!(
-                                "`{}` needs confirmation, and this run is unattended",
-                                call.name
-                            ),
-                            rule: Some(stage.name().to_string()),
-                            pack: None,
-                        });
-                    }
-                    if !ask(&prompt) {
-                        return ToolGate::Deny(ToolDenial {
-                            code: "USER_DENIED".into(),
-                            message: format!("the user declined `{}`", call.name),
-                            rule: Some(stage.name().to_string()),
-                            pack: None,
-                        });
+                    if let Some(denial) = on_ask(stage.name(), prompt) {
+                        return Err(denial);
                     }
                 }
             }
         }
+        Ok(rewritten)
+    }
 
-        match rewritten {
-            Some(arguments) => ToolGate::Rewrite { arguments },
-            None => ToolGate::Allow,
+    /// Run every stage in order and settle on one verdict.
+    ///
+    /// An `Ask` from any stage is resolved here: unattended runs refuse it
+    /// outright (invariant I6 — a guard that cannot ask must not assume yes),
+    /// and interactive runs put it to the user.
+    pub fn run(&self, call: &ToolCall, ctx: &ToolContext, ask: &AskFn<'_>) -> ToolGate {
+        let outcome = self.walk(call, ctx, &mut |stage, prompt| {
+            if ctx.is_unattended {
+                return Some(ToolDenial {
+                    code: "CONFIRMATION_REQUIRED".into(),
+                    message: format!(
+                        "`{}` needs confirmation, and this run is unattended",
+                        call.name
+                    ),
+                    rule: Some(stage.to_string()),
+                    pack: None,
+                });
+            }
+            if !ask(&prompt) {
+                return Some(ToolDenial {
+                    code: "USER_DENIED".into(),
+                    message: format!("the user declined `{}`", call.name),
+                    rule: Some(stage.to_string()),
+                    pack: None,
+                });
+            }
+            None
+        });
+        match outcome {
+            Err(denial) => ToolGate::Deny(denial),
+            Ok(Some(arguments)) => ToolGate::Rewrite { arguments },
+            Ok(None) => ToolGate::Allow,
+        }
+    }
+
+    /// What [`Pipeline::run`] would decide, with every question collected
+    /// instead of asked. `ctx.is_unattended` is not consulted: a caller that
+    /// cannot ask must treat [`Judgement::Ask`] as a refusal itself.
+    pub fn judge(&self, call: &ToolCall, ctx: &ToolContext) -> Judgement {
+        let mut asks: Vec<AskPrompt> = Vec::new();
+        let outcome = self.walk(call, ctx, &mut |stage, prompt| {
+            asks.push(AskPrompt { stage, prompt });
+            None
+        });
+        match outcome {
+            Err(denial) => Judgement::Deny(denial),
+            Ok(arguments) if !asks.is_empty() => Judgement::Ask {
+                prompts: asks,
+                arguments,
+            },
+            Ok(Some(arguments)) => Judgement::Rewrite { arguments },
+            Ok(None) => Judgement::Allow,
         }
     }
 }
@@ -463,5 +537,109 @@ mod tests {
             vec!["policy", "allowlist", "repetition", "permission"],
             "stages must run in the declared order"
         );
+    }
+
+    #[test]
+    fn judging_collects_every_question_without_asking_anyone() {
+        let seen = Arc::new(Mutex::new(vec![]));
+        let p = Pipeline::new(vec![
+            stage("first", Verdict::Ask { prompt: "one?".into() }, &seen),
+            stage("second", Verdict::Allow, &seen),
+            stage("third", Verdict::Ask { prompt: "two?".into() }, &seen),
+        ]);
+        match p.judge(&a_call(), &a_context(false)) {
+            Judgement::Ask { prompts, arguments } => {
+                assert_eq!(
+                    prompts,
+                    vec![
+                        AskPrompt { stage: "first", prompt: "one?".into() },
+                        AskPrompt { stage: "third", prompt: "two?".into() },
+                    ]
+                );
+                assert!(arguments.is_none());
+            }
+            other => panic!("expected an ask, got {other:?}"),
+        }
+        assert_eq!(*seen.lock().unwrap(), vec!["first", "second", "third"]);
+    }
+
+    #[test]
+    fn a_refusal_after_a_question_is_a_refusal_and_nobody_was_asked() {
+        // Deny beats Ask (I3): there is no point asking about a call that a
+        // later stage refuses anyway.
+        let seen = Arc::new(Mutex::new(vec![]));
+        let p = Pipeline::new(vec![
+            stage("ask", Verdict::Ask { prompt: "allow?".into() }, &seen),
+            stage("deny", Verdict::Deny(denial("POLICY_DENIED")), &seen),
+        ]);
+        assert!(matches!(
+            p.judge(&a_call(), &a_context(false)),
+            Judgement::Deny(d) if d.code == "POLICY_DENIED"
+        ));
+    }
+
+    #[test]
+    fn a_rewrite_travels_with_the_question() {
+        let seen = Arc::new(Mutex::new(vec![]));
+        let p = Pipeline::new(vec![
+            stage(
+                "rewrite",
+                Verdict::Rewrite { arguments: serde_json::json!({ "selector": "#safe" }) },
+                &seen,
+            ),
+            stage("ask", Verdict::Ask { prompt: "allow?".into() }, &seen),
+        ]);
+        match p.judge(&a_call(), &a_context(false)) {
+            Judgement::Ask { arguments, .. } => {
+                assert_eq!(arguments, Some(serde_json::json!({ "selector": "#safe" })))
+            }
+            other => panic!("expected an ask, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_quiet_pipeline_judges_allow_or_rewrite() {
+        let seen = Arc::new(Mutex::new(vec![]));
+        assert!(matches!(
+            Pipeline::new(vec![stage("a", Verdict::Allow, &seen)]).judge(&a_call(), &a_context(false)),
+            Judgement::Allow
+        ));
+        let p = Pipeline::new(vec![stage(
+            "r",
+            Verdict::Rewrite { arguments: serde_json::json!({ "x": 1 }) },
+            &seen,
+        )]);
+        assert!(matches!(
+            p.judge(&a_call(), &a_context(false)),
+            Judgement::Rewrite { arguments } if arguments == serde_json::json!({ "x": 1 })
+        ));
+    }
+
+    #[test]
+    fn running_still_stops_at_the_first_no() {
+        // `run` and `judge` share one loop; this pins that `run` kept its
+        // own behaviour: ask in order, and a "no" ends the run there.
+        let seen = Arc::new(Mutex::new(vec![]));
+        let p = Pipeline::new(vec![
+            stage("first", Verdict::Ask { prompt: "one?".into() }, &seen),
+            stage("second", Verdict::Ask { prompt: "two?".into() }, &seen),
+        ]);
+        let asked = RefCell::new(Vec::new());
+        let gate = p.run(&a_call(), &a_context(false), &|prompt: &str| {
+            asked.borrow_mut().push(prompt.to_string());
+            false
+        });
+        assert!(matches!(gate, ToolGate::Deny(d) if d.code == "USER_DENIED" && d.rule.as_deref() == Some("first")));
+        assert_eq!(*asked.borrow(), vec!["one?".to_string()]);
+        assert_eq!(*seen.lock().unwrap(), vec!["first"]);
+    }
+
+    #[test]
+    fn the_shipped_pipeline_judges_a_plain_call_as_allowed() {
+        let no_packs = std::path::Path::new("this-directory-does-not-exist");
+        assert!(matches!(
+            default_pipeline(no_packs, &[], false).judge(&a_call(), &a_context(false)),
+            Judgement::Allow
+        ));
     }
 }
