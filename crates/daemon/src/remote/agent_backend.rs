@@ -20,7 +20,7 @@
 //!    results, which can hold what was typed.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -202,6 +202,23 @@ pub fn short_id(channel_id: &str) -> String {
         .filter(|c| c.is_ascii_alphanumeric())
         .take(8)
         .collect()
+}
+
+/// The daemon's fully wired services, published once startup is done.
+///
+/// Late on purpose: `ControlDeps` (and the agent channels restored from it)
+/// are built before the asset server and the recorder exist, and an upload
+/// without the asset server fails. Read per call, so a channel restored
+/// before this is set answers `browser_unavailable` until it is.
+static SERVICES: OnceLock<HostServices> = OnceLock::new();
+
+/// Publish the services agent calls clone from. Called once from `server.rs`.
+pub fn set_services_template(services: HostServices) {
+    let _ = SERVICES.set(services);
+}
+
+fn services_template() -> Option<HostServices> {
+    SERVICES.get().cloned()
 }
 
 /// Which tab a call runs in (spec §3.2).
@@ -401,6 +418,22 @@ impl DesktopBrowserBackend {
             services,
             target,
         }
+    }
+
+    /// The production backend for one agent pairing.
+    pub fn for_pairing(pairing: &Pairing, store: Arc<PairingStore>) -> Self {
+        let services: ServicesFn = Arc::new(services_template);
+        let target: TargetFn = Arc::new(|sender: &str| {
+            crate::registry::browser_target(sender).map(|(proxy, _)| proxy)
+        });
+        Self::new(
+            &pairing.control_channel_id,
+            Arc::new(StoredTier::new(store, &pairing.control_channel_id)),
+            super::agent_tabs::shared(),
+            Arc::new(PipelineJudge::installed()),
+            services,
+            target,
+        )
     }
 
     /// The daemon's services, dressed as this agent (spec §2.3).
@@ -1810,5 +1843,17 @@ mod tests {
             Judgement::Allow
         ));
         assert_eq!(bodies.lock().unwrap().len(), before);
+    }
+
+    #[test]
+    fn a_pairing_gets_its_own_short_id_and_the_shared_tab_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PairingStore::new(dir.path().join("agent-pairings.json")));
+        let mut p = crate::remote::pairing::mint_agent("A-BCDE-FGHJ-KMNP").unwrap();
+        p.control_channel_id = CHANNEL.into();
+        let backend = DesktopBrowserBackend::for_pairing(&p, store);
+        assert_eq!(backend.short, "2f1c4a90");
+        assert!(Arc::ptr_eq(&backend.tabs, &crate::remote::agent_tabs::shared()));
+        assert_eq!(backend.tools().len(), 16);
     }
 }

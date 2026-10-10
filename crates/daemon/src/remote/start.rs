@@ -706,13 +706,12 @@ pub async fn open_for_pairing(
     // Routed by kind wherever the row came from: an agent row found in the
     // device store is still served as an agent, never as a device.
     if pairing.is_agent() {
-        // M1: the channel and handshake are real; tools arrive in M2.
-        return open_mcp_channel(
+        // M2: real tools, capped by the tier stored with this pairing.
+        let backend = Arc::new(super::agent_backend::DesktopBrowserBackend::for_pairing(
             pairing,
-            Arc::new(super::mcp_tools::UnavailableBackend),
-            &deps.registry,
-        )
-        .await;
+            deps.agent_pairings.clone(),
+        ));
+        return open_mcp_channel(pairing, backend, &deps.registry).await;
     }
     let injector: Arc<dyn super::inject::Injector> = Arc::new(super::inject::ChannelInjector::new(
         deps.msg_tx.clone(),

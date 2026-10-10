@@ -618,7 +618,10 @@ async fn handle_proxy_connection(
     // ones would land on the person's tabs.
     let forgotten = crate::remote::agent_tabs::shared().connection_closed(&proxy_id);
     if forgotten > 0 {
-        info!("Proxy {} served {} agent tab tables; forgotten", proxy_id, forgotten);
+        info!(
+            target: "remote",
+            "Proxy {} served {} agent tab tables; forgotten", proxy_id, forgotten
+        );
     }
 
     // Notify the message loop about the disconnect so EventBus subscriptions
@@ -2587,6 +2590,9 @@ pub async fn start_server(
     crate::tts::backend::prime_demotion(&process_config.read().unwrap().clone());
     let process_session_manager = session_manager.clone();
     let process_services = services.clone();
+    // Agent channels clone their per-call services from this, the fully wired
+    // copy (asset server and recorder included) — M2a §2.3.
+    crate::remote::agent_backend::set_services_template(services.clone());
     let process_available_browsers = available_browsers.clone();
     let process_runtime = tokio::runtime::Handle::current();
     let process_browser_registry = browser_registry.clone();
