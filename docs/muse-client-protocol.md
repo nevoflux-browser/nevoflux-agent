@@ -115,7 +115,7 @@ Example requests: `fixtures/muse/mcp_messages.json`.
 
 Every agent pairing has its own execution tier, `read-only` when paired. The
 person changes it in the NevoFlux sidebar with `/agent-tier <name> <tier>`;
-nothing on this channel can. The tier is a ceiling: a call above it fails at
+nothing on this channel can. A tier change applies from the next call. The tier is a ceiling: a call above it fails at
 once with `tier_denied` and nobody is asked.
 
 | tools | first tier that runs them |
@@ -130,12 +130,14 @@ once with `tier_denied` and nobody is asked.
 
 You work in tabs of your own. Without `tab_id`, `browser_navigate` opens a tab
 for you in the background the first time and reuses it afterwards;
-`new_tab: true` opens another. Every other tool without `tab_id` acts in your
-most recently opened tab, or fails with `no_agent_tab` if you have none. With
+`new_tab: true` opens another. Every other tool without `tab_id` (except `browser_get_tabs`, which
+lists all tabs) acts in your most recently opened tab, or fails with `no_agent_tab` if you have none. With
 `tab_id` any tab can be read or acted on, within your tier.
 `browser_get_tabs` marks each tab `owned: true` (yours) or `owned: false` (the
 person's). `browser_activate_tab` requires `tab_id` and changes what the
-person sees.
+person sees; without one it fails with `tool_failed` (`tab_id is required`),
+not `no_agent_tab`. A `tab_id` that is not a positive integer, on any tool,
+also fails with `tool_failed`.
 
 Your tabs are forgotten when the browser disconnects or restarts (tab ids are
 reused after a restart); navigate again to get a new one. A tab that was
@@ -161,7 +163,7 @@ with `isError: true`:
 | `browser_unavailable` | the desktop browser is not connected | |
 | `no_agent_tab` | no tab of yours and no `tab_id` | |
 | `tab_closed` | the tab is gone | `tab_id` |
-| `tool_failed` | the browser ran the call and it failed | `detail` |
+| `tool_failed` | the call was malformed (for example a bad `tab_id`), or the browser failed it or did not answer within 150 s; `detail` says which | `detail` |
 
 Branch on `code` and the extra fields; `message` is for people. Every case is
 in `fixtures/muse/tool_errors.json` exactly as the head sends it.
@@ -185,8 +187,9 @@ the call only after the person decides:
 
 - Declare `capabilities.elicitation` in `initialize`, or every such call fails
   with `approval_denied` / `client_cannot_approve`. Only form mode is used.
-- Stamp each `tools/call` with `_meta: {"io.nevoflux/call": "<id>"}`; the head
-  copies it into the elicitation's `_meta` so you know which call is asking.
+- Optionally stamp a `tools/call` with `_meta: {"io.nevoflux/call": "<id>"}`;
+  the head copies it into the elicitation's `_meta` so you know which call is
+  asking. Without the stamp the elicitation carries no such key.
 - The elicitation's `_meta` may also carry `progressToken`, added by the MCP
   library; it always equals the request `id`. Accept extra `_meta` keys, and
   do not pin the request id or the token to any particular value.

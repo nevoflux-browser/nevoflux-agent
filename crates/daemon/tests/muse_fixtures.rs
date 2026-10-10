@@ -200,11 +200,14 @@ fn the_approval_fixture_is_what_the_head_asks_and_understands() {
 
 #[test]
 fn an_off_whitelist_call_is_answered_as_the_messages_fixture_says() {
-    let want = json("mcp_messages.json")["expected"]["unknown_tool_result"].clone();
+    let messages = json("mcp_messages.json");
+    let want = messages["expected"]["unknown_tool_result"].clone();
     let got = serde_json::to_value(AgentError::UnknownTool.to_result("bash")).unwrap();
     assert_eq!(got["isError"], want["isError"]);
     assert_eq!(got["structuredContent"], want["structuredContent"]);
-    assert!(json("mcp_messages.json")["expected"]
-        .get("not_allowed_error")
-        .is_none());
+    let text: Value = serde_json::from_str(got["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(text, want["structuredContent"], "text is the same object");
+    for gone in ["not_allowed_error", "unavailable_error"] {
+        assert!(messages["expected"].get(gone).is_none(), "{gone}");
+    }
 }
