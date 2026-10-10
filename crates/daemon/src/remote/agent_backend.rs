@@ -1856,4 +1856,172 @@ mod tests {
         assert!(Arc::ptr_eq(&backend.tabs, &crate::remote::agent_tabs::shared()));
         assert_eq!(backend.tools().len(), 16);
     }
+
+    use crate::remote::channel_codec;
+    use crate::remote::mcp_gateway::McpGateway;
+    use crate::remote::portal_gateway::WireSink;
+    use crate::remote::relay_protocol::WireMessage;
+    use crate::remote::session::Wire;
+
+    const KEY: [u8; 32] = [5u8; 32];
+
+    fn fixture() -> Value {
+        serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/muse/tool_errors.json"
+        )))
+        .unwrap()
+    }
+
+    #[derive(Default)]
+    struct Collect {
+        wires: Mutex<Vec<Wire>>,
+    }
+
+    #[async_trait]
+    impl WireSink for Collect {
+        async fn send(&self, wire: Wire) {
+            self.wires.lock().unwrap().push(wire);
+        }
+    }
+
+    impl Collect {
+        fn frames(&self) -> Vec<Value> {
+            self.wires
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|w| match channel_codec::decode(Some(&KEY), w) {
+                    Some(WireMessage::Frame { frame, .. }) => Some(frame),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        async fn message(&self, pred: impl Fn(&Value) -> bool) -> Value {
+            for _ in 0..250 {
+                if let Some(f) = self.frames().into_iter().find(|f| pred(&f["m"])) {
+                    return f["m"].clone();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            panic!("no such message from the head");
+        }
+    }
+
+    struct Agent {
+        gw: McpGateway,
+        sink: Arc<Collect>,
+        ch: String,
+        n: u64,
+    }
+
+    impl Agent {
+        /// Presence -> challenge -> initialize (with `capabilities`) -> initialized.
+        async fn connect(backend: DesktopBrowserBackend, capabilities: Value) -> Self {
+            let sink = Arc::new(Collect::default());
+            let gw = McpGateway::new(KEY, sink.clone(), Arc::new(backend), CHANNEL);
+            gw.on_wire_in(&Wire::Text(r#"{"k":"peers","n":1}"#.into())).await;
+            let ch = sink.frames()[0]["ch"].as_str().unwrap().to_string();
+            let mut agent = Agent { gw, sink, ch, n: 0 };
+            agent
+                .send(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                    "protocolVersion": "2025-11-25", "capabilities": capabilities,
+                    "clientInfo": {"name": "nevoflux-muse", "version": "0.3.0"}}}))
+                .await;
+            agent.sink.message(|m| m["id"] == json!(1)).await;
+            agent.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).await;
+            agent
+        }
+
+        async fn send(&mut self, m: Value) {
+            let frame = json!({"d": "c2h", "n": self.n, "ch": self.ch, "m": m});
+            self.n += 1;
+            let wire = channel_codec::encode(Some(&KEY), &WireMessage::Frame { seq: None, frame });
+            self.gw.on_wire_in(&wire).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_call_end_to_end_over_a_sealed_channel() {
+        let r = rig(ExecutionTier::ReadOnly);
+        let browser = r.browser.clone();
+        let mut agent = Agent::connect(r.backend, json!({})).await;
+
+        agent.send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})).await;
+        let listed = agent.sink.message(|m| m["id"] == json!(2)).await;
+        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 16);
+
+        agent
+            .send(json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+                "name": "browser_navigate", "arguments": {"url": "https://muse.example/"}}}))
+            .await;
+        let nav = agent.sink.message(|m| m["id"] == json!(3)).await;
+        assert_eq!(nav["result"]["isError"], json!(false));
+        assert!(nav["result"]["content"][0]["text"].as_str().unwrap().contains("\"tab_id\":100"));
+        let first = browser.seen.lock().unwrap()[0].clone();
+        assert_eq!(first.origin.as_deref(), Some("agent"));
+        assert_eq!(first.params["background"], json!(true));
+
+        agent
+            .send(json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {
+                "name": "browser_click", "arguments": {"selector": "#buy"}}}))
+            .await;
+        let click = agent.sink.message(|m| m["id"] == json!(4)).await;
+        let f = fixture();
+        assert_eq!(click["result"]["isError"], json!(true));
+        assert_eq!(
+            click["result"]["structuredContent"]["error"]["code"],
+            f["errors"]["tier_denied"]["structuredContent"]["error"]["code"]
+        );
+        assert_eq!(browser.seen.lock().unwrap().len(), 1, "the click never reached the browser");
+    }
+
+    /// The approval request on the wire is the fixture's, `_meta` included,
+    /// and the fixture's answers settle the call both ways.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_approval_round_trip_matches_the_shared_fixture() {
+        let f = fixture();
+        for (answer, runs) in [(f["approve"].clone(), true), (f["deny"].clone(), false)] {
+            let r = rig_with(
+                ExecutionTier::BrowserAuto,
+                Judgement::Ask {
+                    prompts: vec![AskPrompt {
+                        stage: "site_policy",
+                        prompt: "ask-guard wants a person to confirm".into(),
+                    }],
+                    arguments: None,
+                },
+                |s| s,
+            );
+            let browser = r.browser.clone();
+            let mut agent = Agent::connect(r.backend, json!({"elicitation": {}})).await;
+            // `browser_click` with an `element_id`: the desktop dialog words it
+            // "Click on element 'e1'", which is what the fixture's message says,
+            // and the fixture's `approval_denied` example names `browser_click`.
+            agent
+                .send(json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {
+                    "name": "browser_click",
+                    "arguments": {"element_id": "e1", "tab_id": 1},
+                    "_meta": {"io.nevoflux/call": "0badc0de"}}}))
+                .await;
+            let request = agent.sink.message(|m| m["method"] == "elicitation/create").await;
+            assert_eq!(request["method"], f["approval_request"]["method"]);
+            assert_eq!(request["params"], f["approval_request"]["params"]);
+            agent
+                .send(json!({"jsonrpc": "2.0", "id": request["id"].clone(), "result": answer}))
+                .await;
+            let result = agent.sink.message(|m| m["id"] == json!(5)).await;
+            if runs {
+                assert_eq!(result["result"]["isError"], json!(false));
+                assert_eq!(browser.seen.lock().unwrap().len(), 1);
+            } else {
+                assert_eq!(
+                    result["result"]["structuredContent"],
+                    f["errors"]["approval_denied"]["structuredContent"]
+                );
+                assert!(browser.seen.lock().unwrap().is_empty());
+            }
+        }
+    }
 }
