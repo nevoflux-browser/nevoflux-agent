@@ -8,7 +8,6 @@
   ],
   "expected": {
     "initialize_result": {"serverInfo": {"name": "nevoflux-head"}, "capabilities": {"experimental": {"nevoflux": {"protocol": 1}}}},
-    "not_allowed_error": {"code": -32602, "data": {"code": "not_allowed"}},
-    "unavailable_error": {"code": -32602, "data": {"code": "unavailable"}}
+    "unknown_tool_result": {"isError": true, "structuredContent": {"error": {"code": "unknown_tool", "message": "bash is not available over the agent channel"}}}
   }
 }

@@ -2,12 +2,15 @@
 //! design §8.2). If one of these fails, the two sides disagree about the wire.
 
 use nevoflux_daemon::remote::channel_codec;
+use nevoflux_daemon::remote::elicit::{approval_schema, outcome_of, APPROVAL_TIMEOUT, CALL_META_KEY};
 use nevoflux_daemon::remote::envelope::{self, InboundVerifier};
+use nevoflux_daemon::remote::mcp_tools::{AgentError, Approval, REASON_DECLINED};
 use nevoflux_daemon::remote::mcp_server::PROTOCOL;
 use nevoflux_daemon::remote::relay_protocol::WireMessage;
 use nevoflux_daemon::remote::session::Wire;
 use nevoflux_mcp::rmcp::service::RxJsonRpcMessage;
 use nevoflux_mcp::rmcp::RoleServer;
+use nevoflux_protocol::ExecutionTier;
 use serde_json::Value;
 
 const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/muse");
@@ -118,4 +121,90 @@ fn example_requests_are_valid_json_rpc_for_rmcp() {
         serde_json::from_value::<RxJsonRpcMessage<RoleServer>>(r.clone())
             .unwrap_or_else(|e| panic!("{r} is not a server-bound message: {e}"));
     }
+}
+
+/// Each fixture error is what the head really sends, byte for byte in
+/// `structuredContent`, and its text is the same object.
+#[test]
+fn the_tool_error_fixture_is_what_the_head_sends() {
+    let f = json("tool_errors.json");
+    let cases: Vec<(&str, &str, AgentError)> = vec![
+        ("unknown_tool", "bash", AgentError::UnknownTool),
+        (
+            "tier_denied",
+            "browser_click",
+            AgentError::TierDenied {
+                tier: ExecutionTier::ReadOnly,
+                required: ExecutionTier::BrowserAuto,
+            },
+        ),
+        (
+            "approval_denied",
+            "browser_click",
+            AgentError::ApprovalDenied {
+                reason: REASON_DECLINED,
+                message: "the person declined browser_click".into(),
+            },
+        ),
+        ("approval_timeout", "browser_click", AgentError::ApprovalTimeout),
+        ("browser_unavailable", "browser_click", AgentError::BrowserUnavailable),
+        ("no_agent_tab", "browser_click", AgentError::NoAgentTab),
+        ("tab_closed", "browser_click", AgentError::TabClosed { tab_id: 7 }),
+        (
+            "tool_failed",
+            "browser_click",
+            AgentError::ToolFailed {
+                detail: "-1: Element not found".into(),
+            },
+        ),
+    ];
+    let errors = f["errors"].as_object().unwrap();
+    assert_eq!(errors.len(), cases.len(), "one example per code");
+    for (code, tool, error) in cases {
+        let want = &errors[code];
+        let got = serde_json::to_value(error.to_result(tool)).unwrap();
+        assert_eq!(got["isError"], want["isError"], "{code}");
+        assert_eq!(got["structuredContent"], want["structuredContent"], "{code}");
+        let text: Value =
+            serde_json::from_str(got["content"][0]["text"].as_str().unwrap()).unwrap();
+        let want_text: Value =
+            serde_json::from_str(want["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(text, want_text, "{code}");
+        assert_eq!(
+            text, want["structuredContent"],
+            "{code}: text and structuredContent agree"
+        );
+    }
+}
+
+#[test]
+fn the_approval_fixture_is_what_the_head_asks_and_understands() {
+    let f = json("tool_errors.json");
+    assert_eq!(f["call_meta_key"], CALL_META_KEY);
+    assert_eq!(f["approval_timeout_seconds"], APPROVAL_TIMEOUT.as_secs());
+    let request = &f["approval_request"];
+    assert_eq!(request["method"], "elicitation/create");
+    assert_eq!(request["params"]["mode"], "form");
+    assert_eq!(
+        request["params"]["requestedSchema"],
+        serde_json::to_value(approval_schema()).unwrap()
+    );
+    assert!(request["params"]["_meta"][CALL_META_KEY].is_string());
+    let approve: nevoflux_mcp::rmcp::model::ElicitResult =
+        serde_json::from_value(f["approve"].clone()).unwrap();
+    let deny: nevoflux_mcp::rmcp::model::ElicitResult =
+        serde_json::from_value(f["deny"].clone()).unwrap();
+    assert_eq!(outcome_of(&approve), Approval::Approved);
+    assert_eq!(outcome_of(&deny), Approval::Declined);
+}
+
+#[test]
+fn an_off_whitelist_call_is_answered_as_the_messages_fixture_says() {
+    let want = json("mcp_messages.json")["expected"]["unknown_tool_result"].clone();
+    let got = serde_json::to_value(AgentError::UnknownTool.to_result("bash")).unwrap();
+    assert_eq!(got["isError"], want["isError"]);
+    assert_eq!(got["structuredContent"], want["structuredContent"]);
+    assert!(json("mcp_messages.json")["expected"]
+        .get("not_allowed_error")
+        .is_none());
 }

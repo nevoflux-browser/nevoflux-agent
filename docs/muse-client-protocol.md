@@ -101,26 +101,103 @@ in flight when it ends gets no answer.
 - `capabilities.experimental.nevoflux.protocol = 1` — refuse to proceed on a
   version you do not support
 
-Tools: `tools/list` shows only tools from the head's whitelist; `tools/call`
-of anything else fails. In protocol v1 / head M1 the list is empty and every
-call fails with `unavailable`; real browser tools arrive with head M2. The
-whitelist is browser tools only: `browser_snapshot`, `browser_get_markdown`,
-`browser_screenshot`, `browser_get_tabs`, `browser_navigate`,
-`browser_activate_tab`, `browser_click_by_id`, `browser_fill_by_id`,
-`browser_type_by_id`, `browser_click`, `browser_fill`, `browser_type`,
-`browser_key_press`, `browser_scroll`, `browser_wait_for`,
-`browser_upload_file`.
-
-Errors are JSON-RPC errors with `code = -32602` and a machine-readable
-`data.code`:
-
-| `data.code` | meaning |
-|---|---|
-| `not_allowed` | the tool is not on the agent-channel whitelist |
-| `unavailable` | the head has no tools to run yet |
-| `unknown_tool` | the backend has no such tool |
+Tools: `tools/list` shows the head's whitelist with their schemas:
+`browser_snapshot`, `browser_get_markdown`, `browser_screenshot`,
+`browser_get_tabs`, `browser_navigate`, `browser_activate_tab`,
+`browser_click_by_id`, `browser_fill_by_id`, `browser_type_by_id`,
+`browser_click`, `browser_fill`, `browser_type`, `browser_key_press`,
+`browser_scroll`, `browser_wait_for`, `browser_upload_file`. Calls run in the
+person's desktop NevoFlux browser.
 
 Example requests: `fixtures/muse/mcp_messages.json`.
+
+### 5.1 Tiers
+
+Every agent pairing has its own execution tier, `read-only` when paired. The
+person changes it in the NevoFlux sidebar with `/agent-tier <name> <tier>`;
+nothing on this channel can. The tier is a ceiling: a call above it fails at
+once with `tier_denied` and nobody is asked.
+
+| tools | first tier that runs them |
+|---|---|
+| snapshot, get_markdown, screenshot, get_tabs, navigate, wait_for | `read-only` |
+| click_by_id, fill_by_id, type_by_id, click, fill, type, key_press, scroll, activate_tab | `browser-auto` |
+| upload_file | `full-auto` |
+
+(`browser-auto-local-read` adds nothing on this channel.)
+
+### 5.2 Tabs
+
+You work in tabs of your own. Without `tab_id`, `browser_navigate` opens a tab
+for you in the background the first time and reuses it afterwards;
+`new_tab: true` opens another. Every other tool without `tab_id` acts in your
+most recently opened tab, or fails with `no_agent_tab` if you have none. With
+`tab_id` any tab can be read or acted on, within your tier.
+`browser_get_tabs` marks each tab `owned: true` (yours) or `owned: false` (the
+person's). `browser_activate_tab` requires `tab_id` and changes what the
+person sees.
+
+Your tabs are forgotten when the browser disconnects or restarts (tab ids are
+reused after a restart); navigate again to get a new one. A tab that was
+closed answers `tab_closed` once and is then forgotten.
+
+### 5.3 Errors
+
+A call that was understood but refused or failed is a normal JSON-RPC result
+with `isError: true`:
+
+```json
+{"isError": true,
+ "content": [{"type": "text", "text": "<the structuredContent object as JSON>"}],
+ "structuredContent": {"error": {"code": "tier_denied", "message": "…", "tier": "read-only", "required": "browser-auto"}}}
+```
+
+| `code` | meaning | extra fields |
+|---|---|---|
+| `unknown_tool` | not on the whitelist | |
+| `tier_denied` | above this pairing's tier | `tier`, `required` |
+| `approval_denied` | refused | `reason`: `declined` (the person said no), `client_cannot_approve` (your client did not declare elicitation), `rule` (a site rule, a pack hook, or the allowlist refused the call outright), `approval_failed` (the question could not be put) |
+| `approval_timeout` | nobody answered within 60 s | |
+| `browser_unavailable` | the desktop browser is not connected | |
+| `no_agent_tab` | no tab of yours and no `tab_id` | |
+| `tab_closed` | the tab is gone | `tab_id` |
+| `tool_failed` | the browser ran the call and it failed | `detail` |
+
+Branch on `code` and the extra fields; `message` is for people. Every case is
+in `fixtures/muse/tool_errors.json` exactly as the head sends it.
+JSON-RPC errors still mean a malformed request. A head before M2 answered
+off-whitelist calls with JSON-RPC errors carrying `data.code` `not_allowed` or
+`unavailable`; an M2 head sends neither.
+
+### 5.4 Approvals
+
+When a rule wants a person to confirm a call within your tier, the head sends
+`elicitation/create` (form mode) while that call is still open, and answers
+the call only after the person decides:
+
+```json
+{"jsonrpc": "2.0", "id": 7, "method": "elicitation/create",
+ "params": {"mode": "form",
+            "message": "Click on element 'e1'\nTab: tab 1\nWhy: …",
+            "requestedSchema": {"type": "object", "properties": {"approve": {"type": "boolean"}}, "required": ["approve"]},
+            "_meta": {"io.nevoflux/call": "0badc0de", "progressToken": 7}}}
+```
+
+- Declare `capabilities.elicitation` in `initialize`, or every such call fails
+  with `approval_denied` / `client_cannot_approve`. Only form mode is used.
+- Stamp each `tools/call` with `_meta: {"io.nevoflux/call": "<id>"}`; the head
+  copies it into the elicitation's `_meta` so you know which call is asking.
+- The elicitation's `_meta` may also carry `progressToken`, added by the MCP
+  library; it always equals the request `id`. Accept extra `_meta` keys, and
+  do not pin the request id or the token to any particular value.
+- Answer `{"action": "accept", "content": {"approve": true}}` to run the call.
+  Anything else — `approve: false`, `decline`, `cancel` — refuses it
+  (`approval_denied`, `reason: declined`).
+- Answer within 60 s. After that the head sends `notifications/cancelled` for
+  the elicitation and the call fails with `approval_timeout`.
+- Every question is asked separately; there is no "always allow".
+
+Request, answers and errors: `fixtures/muse/tool_errors.json`.
 
 ### Limitations
 
@@ -150,4 +227,4 @@ browser. Environment:
 | `NF_STUB_TOKEN` | sent as the relay `t` parameter instead of a minted JWT, default `test` |
 
 It answers `browser_snapshot` and `browser_navigate` with fixed results and
-lists only whitelisted tools; anything else fails as in section 5.
+lists only whitelisted tools; a whitelisted tool it does not stub answers `unknown_tool` (section 5.3).
