@@ -10,8 +10,13 @@
 //!
 //! The primary tab is the one opened most recently; a call that names no tab
 //! runs there.
+//!
+//! The same table remembers which ids the agent may name at all: its own
+//! tabs and every tab a `browser_get_tabs` result showed it in this browser
+//! session. An id from anywhere else — most often from before a restart —
+//! is refused rather than sent (spec goal 4).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 /// One tab an agent opened.
@@ -28,6 +33,8 @@ struct Owned {
     served_by: String,
     /// Oldest first; the last is primary.
     tabs: Vec<OwnedTab>,
+    /// Ids a `browser_get_tabs` result showed this agent here.
+    listed: HashSet<i64>,
 }
 
 /// Every agent's tabs, keyed by the pairing's control channel id.
@@ -83,22 +90,49 @@ impl AgentTabs {
             .clone()
     }
 
-    /// The agent opened `tab_id`; it becomes primary.
-    pub fn record_opened(&self, pairing: &str, served_by: &str, tab_id: i64, url: Option<String>) {
-        let mut map = self.lock();
-        if Self::current(&mut map, pairing, served_by).is_none() {
+    /// The pairing's table under `served_by`, started empty if there is
+    /// none (or only another browser's).
+    fn current_or_new<'a>(
+        map: &'a mut HashMap<String, Owned>,
+        pairing: &str,
+        served_by: &str,
+    ) -> &'a mut Owned {
+        if Self::current(map, pairing, served_by).is_none() {
             map.insert(
                 pairing.to_string(),
                 Owned {
                     served_by: served_by.to_string(),
                     tabs: Vec::new(),
+                    listed: HashSet::new(),
                 },
             );
         }
-        if let Some(owned) = map.get_mut(pairing) {
-            owned.tabs.retain(|t| t.id != tab_id);
-            owned.tabs.push(OwnedTab { id: tab_id, url });
-        }
+        map.get_mut(pairing).expect("just inserted")
+    }
+
+    /// The agent opened `tab_id`; it becomes primary.
+    pub fn record_opened(&self, pairing: &str, served_by: &str, tab_id: i64, url: Option<String>) {
+        let mut map = self.lock();
+        let owned = Self::current_or_new(&mut map, pairing, served_by);
+        owned.tabs.retain(|t| t.id != tab_id);
+        owned.tabs.push(OwnedTab { id: tab_id, url });
+    }
+
+    /// A `browser_get_tabs` result from `served_by` showed the agent these
+    /// tabs; it may name them from now on, in that browser only.
+    pub fn record_listed(&self, pairing: &str, served_by: &str, ids: &[i64]) {
+        let mut map = self.lock();
+        Self::current_or_new(&mut map, pairing, served_by)
+            .listed
+            .extend(ids.iter().copied());
+    }
+
+    /// Whether the agent may name `tab_id` in the browser `served_by` names:
+    /// it opened the tab there, or was shown it there by `browser_get_tabs`.
+    pub fn is_known(&self, pairing: &str, served_by: &str, tab_id: i64) -> bool {
+        let mut map = self.lock();
+        Self::current(&mut map, pairing, served_by)
+            .is_some_and(|o| o.listed.contains(&tab_id) || o.tabs.iter().any(|t| t.id == tab_id))
     }
 
     /// An owned tab was navigated. A tab the agent does not own is left
@@ -119,6 +153,7 @@ impl AgentTabs {
         let Some(owned) = map.get_mut(pairing) else {
             return false;
         };
+        owned.listed.remove(&tab_id);
         let before = owned.tabs.len();
         owned.tabs.retain(|t| t.id != tab_id);
         owned.tabs.len() != before
@@ -258,6 +293,39 @@ mod tests {
         t.forget_pairing(A);
         assert!(t.owned_ids(A, S1).is_empty());
         assert_eq!(t.owned_ids(B, S1), vec![20]);
+    }
+
+    #[test]
+    fn only_owned_and_listed_ids_are_known() {
+        let t = AgentTabs::new();
+        assert!(!t.is_known(A, S1, 1));
+        t.record_opened(A, S1, 10, None);
+        t.record_listed(A, S1, &[1, 2]);
+        assert!(t.is_known(A, S1, 10));
+        assert!(t.is_known(A, S1, 1));
+        assert!(!t.is_known(A, S1, 3));
+        assert!(!t.is_known(B, S1, 1), "pairings never share a listing");
+        assert_eq!(t.primary(A, S1).unwrap().id, 10, "listing adopts nothing");
+        assert!(t.forget_tab(A, 10));
+        assert!(!t.forget_tab(A, 1), "a listed tab was never owned");
+        assert!(!t.is_known(A, S1, 10) && !t.is_known(A, S1, 1));
+        assert!(t.is_known(A, S1, 2));
+    }
+
+    #[test]
+    fn listed_ids_go_with_the_browser_that_listed_them() {
+        let t = AgentTabs::new();
+        t.record_listed(A, S1, &[1]);
+        assert_eq!(t.connection_closed(S1), 1);
+        assert!(!t.is_known(A, S1, 1));
+
+        t.record_listed(A, S1, &[1]);
+        assert!(!t.is_known(A, S2, 1));
+        assert!(!t.is_known(A, S1, 1), "dropped, not merely hidden");
+
+        t.record_listed(A, S1, &[1]);
+        t.forget_pairing(A);
+        assert!(!t.is_known(A, S1, 1));
     }
 
     #[test]

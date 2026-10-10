@@ -10,12 +10,16 @@
 //!    anything is sent, so a missing browser fails at once rather than after
 //!    a timeout;
 //! 3. **the tab** — the agent works in tabs it opened itself unless it names
-//!    one (decision A5), and those tabs open in the background;
+//!    one (decision A5), and those tabs open in the background. A named tab
+//!    must be one the agent opened or was shown by `browser_get_tabs` in the
+//!    browser now answering; a navigate goes only to http, https or
+//!    `about:blank`;
 //! 4. **the rules** — Jev and the site/pack pipeline, judged the way the MCP
 //!    dispatcher judges, with any question put to the agent's client instead
 //!    of the desktop sidebar;
-//! 5. **the call** — through the same browser path the MCP dispatcher uses,
-//!    bounded by [`EXECUTE_TIMEOUT`];
+//! 5. **the call** — the tier read again (the question can take a minute),
+//!    then through the same browser path the MCP dispatcher uses, bounded by
+//!    [`EXECUTE_TIMEOUT`];
 //! 6. **one audit line** — tool, outcome, duration; never arguments or
 //!    results, which can hold what was typed.
 
@@ -257,6 +261,40 @@ fn check_tab_id(arguments: &Value) -> Result<(), AgentError> {
     }
 }
 
+/// The refusal for a navigate to anything but http, https or `about:blank`.
+pub const URL_SCHEME_DETAIL: &str = "only http and https URLs can be opened";
+
+/// A navigate may only go to an http or https URL, or to `about:blank`. The
+/// extension opens a URL through a privileged loader, so `file://` — and at
+/// higher tiers `about:config` or `nevoflux://` pages — would otherwise be
+/// readable with `browser_get_markdown` or `browser_screenshot`. Matched on
+/// the raw string: a leading space or any other scheme is refused, not
+/// cleaned up.
+fn check_url(tool: &str, arguments: &Value) -> Result<(), AgentError> {
+    if tool != "browser_navigate" {
+        return Ok(());
+    }
+    let allowed = arguments
+        .get("url")
+        .and_then(Value::as_str)
+        .is_some_and(|url| {
+            let has_prefix = |prefix: &str| {
+                url.get(..prefix.len())
+                    .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+            };
+            has_prefix("http://")
+                || has_prefix("https://")
+                || url.eq_ignore_ascii_case("about:blank")
+        });
+    if allowed {
+        Ok(())
+    } else {
+        Err(AgentError::ToolFailed {
+            detail: URL_SCHEME_DETAIL.to_string(),
+        })
+    }
+}
+
 /// Decide the tab before anything runs.
 pub fn plan_tab(
     tool: &str,
@@ -319,10 +357,18 @@ pub fn apply_plan(plan: TabPlan, arguments: &mut Value) {
 
 /// Put a rule's rewrite through what [`apply_plan`] did to the agent's own
 /// arguments: placement keys and `workspace_dir` dropped, `new_tab` set only
-/// for [`TabPlan::OpenNew`], and any `tab_id` a positive integer. A rule may
-/// still move the call to another tab: rules are the person's own config,
-/// and the approval question names the tab that will run.
-fn settle(plan: TabPlan, mut arguments: Value) -> Result<Value, AgentError> {
+/// for [`TabPlan::OpenNew`], any `tab_id` a positive integer, and a navigate
+/// still bound for http, https or `about:blank`. A rule may still move the
+/// call to another tab: rules are the person's own config, and the approval
+/// question names the tab that will run. A rule that drops the tab, though,
+/// does not send the call to whatever tab is active: `planned_tab` (the tab
+/// the call was planned for, if any) goes back in.
+fn settle(
+    tool: &str,
+    plan: TabPlan,
+    planned_tab: Option<i64>,
+    mut arguments: Value,
+) -> Result<Value, AgentError> {
     if !arguments.is_object() {
         return Err(AgentError::ToolFailed {
             detail: "a rule rewrote the arguments into something that is not an object".to_string(),
@@ -335,6 +381,12 @@ fn settle(plan: TabPlan, mut arguments: Value) -> Result<Value, AgentError> {
     };
     apply_plan(again, &mut arguments);
     check_tab_id(&arguments)?;
+    if let (Some(id), Some(args)) = (planned_tab, arguments.as_object_mut()) {
+        if args.get("tab_id").and_then(Value::as_i64).is_none() {
+            args.insert("tab_id".into(), json!(id));
+        }
+    }
+    check_url(tool, &arguments)?;
     Ok(arguments)
 }
 
@@ -349,22 +401,40 @@ pub fn is_tab_gone(detail: &str) -> bool {
         || d.contains("no tab with id")
 }
 
+/// The tab list of a `browser_get_tabs` result: the result itself or its
+/// `tabs` field.
+fn listed_tabs(v: &mut Value) -> Option<&mut Vec<Value>> {
+    if v.is_array() {
+        v.as_array_mut()
+    } else {
+        v.get_mut("tabs").and_then(Value::as_array_mut)
+    }
+}
+
+fn listed_tab_id(tab: &Value) -> Option<i64> {
+    tab.get("id")
+        .or_else(|| tab.get("tab_id"))
+        .and_then(Value::as_i64)
+}
+
+/// Every tab id a `browser_get_tabs` result shows.
+pub fn listed_ids(result: &str) -> Vec<i64> {
+    let Ok(mut v) = serde_json::from_str::<Value>(result) else {
+        return Vec::new();
+    };
+    listed_tabs(&mut v)
+        .map(|tabs| tabs.iter().filter_map(listed_tab_id).collect())
+        .unwrap_or_default()
+}
+
 /// Add `owned: true|false` to each tab in a `browser_get_tabs` result.
 pub fn annotate_owned(result: &str, owned: &[i64]) -> String {
     let Ok(mut v) = serde_json::from_str::<Value>(result) else {
         return result.to_string();
     };
-    let tabs = if v.is_array() {
-        v.as_array_mut()
-    } else {
-        v.get_mut("tabs").and_then(Value::as_array_mut)
-    };
-    if let Some(tabs) = tabs {
+    if let Some(tabs) = listed_tabs(&mut v) {
         for tab in tabs {
-            let id = tab
-                .get("id")
-                .or_else(|| tab.get("tab_id"))
-                .and_then(Value::as_i64);
+            let id = listed_tab_id(tab);
             if let Some(obj) = tab.as_object_mut() {
                 obj.insert(
                     "owned".into(),
@@ -503,12 +573,22 @@ impl DesktopBrowserBackend {
         let primary = self.tabs.primary(&self.channel_id, &served_by);
         let plan = plan_tab(name, &arguments, primary.map(|t| t.id))?;
         apply_plan(plan, &mut arguments);
+        check_url(name, &arguments)?;
+        let planned_tab = arguments.get("tab_id").and_then(Value::as_i64);
+        // A tab the agent names must be one it opened or was shown in this
+        // browser: an id from before a restart would be one of the person's
+        // tabs now (spec goal 4).
+        if let (TabPlan::AsGiven, Some(tab_id)) = (plan, planned_tab) {
+            if !self.tabs.is_known(&self.channel_id, &served_by, tab_id) {
+                return Err(AgentError::TabClosed { tab_id });
+            }
+        }
         // 4. The rules, judged on exactly the arguments that will run.
         let arguments = match self.judge.judge(name, &arguments, &services).await {
             Judgement::Allow => arguments,
             Judgement::Rewrite {
                 arguments: rewritten,
-            } => settle(plan, rewritten)?,
+            } => settle(name, plan, planned_tab, rewritten)?,
             Judgement::Deny(denial) => {
                 return Err(AgentError::ApprovalDenied {
                     reason: REASON_RULE,
@@ -522,7 +602,7 @@ impl DesktopBrowserBackend {
                 // The person is asked about exactly what would run: a rule's
                 // rewrite, when there is one, not what the agent sent.
                 let effective = match rewritten {
-                    Some(rewritten) => settle(plan, rewritten)?,
+                    Some(rewritten) => settle(name, plan, planned_tab, rewritten)?,
                     None => arguments,
                 };
                 let target = self.tab_label(plan, &effective);
@@ -553,7 +633,16 @@ impl DesktopBrowserBackend {
                 }
             }
         };
-        // 5. The call, bounded. The browser may have changed while the rules
+        // 5. The tier again: the person may have lowered it, or unpaired the
+        // agent, while the question was open.
+        let tier = self.tier.tier();
+        if !nevoflux_protocol::tier_auto_approves(name, tier) {
+            return Err(AgentError::TierDenied {
+                tier,
+                required: nevoflux_protocol::minimum_tier(name),
+            });
+        }
+        // The call, bounded. The browser may have changed while the rules
         // or the person were deciding, and the request is re-addressed when
         // it is sent: a tab number planned for the old browser could be one
         // of the person's tabs in the new one. Nothing is sent then.
@@ -570,7 +659,11 @@ impl DesktopBrowserBackend {
             crate::wasm::mcp_tool_executor::execute_agent_browser_tool(name, &arguments, &services);
         let outcome = match tokio::time::timeout(EXECUTE_TIMEOUT, call).await {
             Ok(outcome) => outcome,
-            Err(_) => Err("the browser did not answer".to_string()),
+            // Only the daemon stopped waiting: the browser may still act.
+            Err(_) => Err(format!(
+                "the browser did not answer within {} s; the action may still have happened",
+                EXECUTE_TIMEOUT.as_secs()
+            )),
         };
         match outcome {
             Ok(text) => Ok(self.after_success(name, plan, &arguments, &services, &served_by, text)),
@@ -623,6 +716,12 @@ impl DesktopBrowserBackend {
                 text
             }
             "browser_get_tabs" => {
+                // Filed under a browser that no longer answers, the ids
+                // would name whatever tabs the new one numbers so.
+                if self.still_served_by(services, served_by) {
+                    self.tabs
+                        .record_listed(&self.channel_id, served_by, &listed_ids(&text));
+                }
                 annotate_owned(&text, &self.tabs.owned_ids(&self.channel_id, served_by))
             }
             _ => text,
@@ -988,6 +1087,8 @@ mod tests {
     #[tokio::test]
     async fn activating_a_tab_needs_browser_auto() {
         let r = rig(ExecutionTier::ReadOnly);
+        // The person's tab 1, as browser_get_tabs showed it to the agent.
+        r.tabs.record_listed(CHANNEL, SIDEBAR, &[1]);
         assert_eq!(
             error(&call(&r, "browser_activate_tab", json!({ "tab_id": 1 })).await)["code"],
             "tier_denied"
@@ -1130,6 +1231,8 @@ mod tests {
     #[tokio::test]
     async fn a_named_tab_is_used_as_given_and_not_adopted() {
         let r = rig(ExecutionTier::BrowserAuto);
+        // The person's tab 1, as browser_get_tabs showed it to the agent.
+        r.tabs.record_listed(CHANNEL, SIDEBAR, &[1]);
         call(
             &r,
             "browser_click",
@@ -1641,6 +1744,7 @@ mod tests {
             (Approval::TimedOut, "approval_timeout", None),
         ] {
             let r = rig_with(ExecutionTier::BrowserAuto, ask("why"), |s| s);
+            r.tabs.record_listed(CHANNEL, SIDEBAR, &[1]);
             let a = approver(answer);
             let out = call_with(
                 &r,
@@ -1664,6 +1768,7 @@ mod tests {
             pack: Some("bank-guard".into()),
         };
         let r = rig_with(ExecutionTier::BrowserAuto, Judgement::Deny(denial), |s| s);
+        r.tabs.record_listed(CHANNEL, SIDEBAR, &[1]);
         let a = approver(Approval::Approved);
         let out = call_with(
             &r,
@@ -1716,6 +1821,7 @@ mod tests {
         );
         r.tabs
             .record_opened(CHANNEL, SIDEBAR, 5, Some("https://safe.example/".into()));
+        r.tabs.record_listed(CHANNEL, SIDEBAR, &[1]);
         let a = approver(Approval::Approved);
         let out = call_with(
             &r,
@@ -1743,6 +1849,7 @@ mod tests {
             },
             |s| s,
         );
+        r.tabs.record_listed(CHANNEL, SIDEBAR, &[1]);
         call(
             &r,
             "browser_navigate",
@@ -1858,6 +1965,298 @@ mod tests {
             &crate::remote::agent_tabs::shared()
         ));
         assert_eq!(backend.tools().len(), 16);
+    }
+
+    // ---- final-review fixes ----
+
+    fn detail(v: &Value) -> String {
+        error(v)["detail"].as_str().unwrap_or_default().to_string()
+    }
+
+    #[tokio::test]
+    async fn only_http_https_and_about_blank_can_be_opened() {
+        // C1: the extension loads a navigate through a privileged loader, so
+        // file:// (and, at browser-auto, about:config or nevoflux:// pages)
+        // would be readable with get_markdown / screenshot.
+        let r = rig(ExecutionTier::FullAuto);
+        for bad in [
+            "file:///C:/Users/me/secret.txt",
+            "about:config",
+            "nevoflux://settings",
+            "javascript:alert(1)",
+            "data:text/html,<h1>x</h1>",
+            "FILE:///x",
+            "  https://muse.example/",
+            "\thttps://muse.example/",
+            "about:blank#x",
+            "",
+        ] {
+            let out = call(&r, "browser_navigate", json!({ "url": bad })).await;
+            assert_eq!(error(&out)["code"], "tool_failed", "{bad:?}");
+            assert_eq!(
+                detail(&out),
+                "only http and https URLs can be opened",
+                "{bad:?}"
+            );
+        }
+        for missing in [json!({}), json!({ "url": 7 }), json!({ "url": null })] {
+            let out = call(&r, "browser_navigate", missing.clone()).await;
+            assert_eq!(error(&out)["code"], "tool_failed", "{missing}");
+        }
+        assert!(sent(&r).is_empty(), "nothing reached the browser");
+
+        for good in [
+            "http://muse.example/",
+            "https://muse.example/",
+            "HTTPS://MUSE.example/",
+            "about:blank",
+        ] {
+            let out = call(&r, "browser_navigate", json!({ "url": good })).await;
+            assert_eq!(out["isError"], false, "{good}");
+        }
+        assert_eq!(sent(&r).len(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_rule_rewrite_cannot_open_a_forbidden_scheme() {
+        for judgement in [
+            Judgement::Rewrite {
+                arguments: json!({ "url": "file:///etc/passwd" }),
+            },
+            Judgement::Ask {
+                prompts: vec![AskPrompt {
+                    stage: "pack_hook",
+                    prompt: "why".into(),
+                }],
+                arguments: Some(json!({ "url": "FILE:///etc/passwd" })),
+            },
+        ] {
+            let r = rig_with(ExecutionTier::ReadOnly, judgement, |s| s);
+            let a = approver(Approval::Approved);
+            let out = call_with(
+                &r,
+                &a,
+                "browser_navigate",
+                json!({ "url": "https://muse.example/" }),
+            )
+            .await;
+            assert_eq!(error(&out)["code"], "tool_failed");
+            assert_eq!(detail(&out), "only http and https URLs can be opened");
+            assert!(sent(&r).is_empty());
+            assert!(a.asked.lock().unwrap().is_empty(), "nobody is asked");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_old_tab_id_after_a_reconnect_is_closed_and_nothing_runs() {
+        // C2 / spec goal 4: Firefox reuses small ids after a restart, so an
+        // id from before must never land on whatever tab carries it now.
+        let r = rig(ExecutionTier::BrowserAuto);
+        call(
+            &r,
+            "browser_navigate",
+            json!({ "url": "https://muse.example/" }),
+        )
+        .await;
+        assert_eq!(sent(&r)[0].params["new_tab"], true);
+        r.tabs.connection_closed(SIDEBAR);
+        for (tool, args) in [
+            ("browser_snapshot", json!({ "tab_id": 100 })),
+            ("browser_click", json!({ "selector": "#a", "tab_id": 100 })),
+            ("browser_activate_tab", json!({ "tab_id": 100 })),
+            (
+                "browser_navigate",
+                json!({ "url": "https://muse.example/", "tab_id": 100 }),
+            ),
+        ] {
+            let out = call(&r, tool, args).await;
+            assert_eq!(error(&out)["code"], "tab_closed", "{tool}");
+            assert_eq!(error(&out)["tab_id"], 100, "{tool}");
+        }
+        assert_eq!(sent(&r).len(), 1, "only the first navigate was sent");
+    }
+
+    #[tokio::test]
+    async fn a_tab_id_never_listed_to_the_agent_is_refused() {
+        let r = rig(ExecutionTier::BrowserAuto);
+        let out = call(
+            &r,
+            "browser_click",
+            json!({ "selector": "#a", "tab_id": 1 }),
+        )
+        .await;
+        assert_eq!(error(&out)["code"], "tab_closed");
+        assert_eq!(error(&out)["tab_id"], 1);
+        assert!(sent(&r).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_tab_listed_by_get_tabs_can_be_named() {
+        // A5: the person's tabs are reachable by id, once the agent has seen
+        // them in this browser.
+        let r = rig(ExecutionTier::BrowserAuto);
+        call(&r, "browser_get_tabs", json!({})).await;
+        let out = call(
+            &r,
+            "browser_click",
+            json!({ "selector": "#a", "tab_id": 1 }),
+        )
+        .await;
+        assert_eq!(out["isError"], false);
+        assert_eq!(sent(&r)[1].tab_id, Some(1));
+        let out = call(&r, "browser_activate_tab", json!({ "tab_id": 1 })).await;
+        assert_eq!(out["isError"], false);
+        assert_eq!(sent(&r)[2].action, BrowserToolAction::ActivateTab);
+    }
+
+    #[tokio::test]
+    async fn another_serving_browser_forgets_the_listed_ids() {
+        let r = rig(ExecutionTier::BrowserAuto);
+        call(&r, "browser_get_tabs", json!({})).await;
+        *r.target.lock().unwrap() = Some("proxy-sidebar-2".into());
+        let out = call(
+            &r,
+            "browser_click",
+            json!({ "selector": "#a", "tab_id": 1 }),
+        )
+        .await;
+        assert_eq!(error(&out)["code"], "tab_closed");
+        assert_eq!(sent(&r).len(), 1, "only get_tabs was sent");
+        // Back on the first browser the old listing is gone too: it was
+        // dropped, not hidden.
+        *r.target.lock().unwrap() = Some(SIDEBAR.into());
+        let out = call(
+            &r,
+            "browser_click",
+            json!({ "selector": "#a", "tab_id": 1 }),
+        )
+        .await;
+        assert_eq!(error(&out)["code"], "tab_closed");
+        assert_eq!(sent(&r).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_rewrite_that_drops_the_tab_id_stays_in_the_planned_tab() {
+        // M2: without tab_id the extension would use the active tab.
+        for judgement in [
+            Judgement::Rewrite {
+                arguments: json!({}),
+            },
+            Judgement::Rewrite {
+                arguments: json!({ "tab_id": null }),
+            },
+            Judgement::Ask {
+                prompts: vec![AskPrompt {
+                    stage: "pack_hook",
+                    prompt: "why".into(),
+                }],
+                arguments: Some(json!({})),
+            },
+        ] {
+            let r = rig_with(ExecutionTier::ReadOnly, judgement, |s| s);
+            r.tabs.record_opened(CHANNEL, SIDEBAR, 100, None);
+            let out = call(&r, "browser_snapshot", json!({})).await;
+            assert_eq!(out["isError"], false);
+            assert_eq!(sent(&r)[0].tab_id, Some(100));
+        }
+    }
+
+    /// Approves, but lowers the pairing's tier while the person is asked.
+    struct LowersTier {
+        tier: Arc<FixedTier>,
+    }
+    #[async_trait]
+    impl Approver for LowersTier {
+        async fn ask(&self, _message: String) -> Approval {
+            *self.tier.0.lock().unwrap() = ExecutionTier::ReadOnly;
+            Approval::Approved
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tier_lowered_during_the_question_stops_the_call() {
+        // M1: the question can take up to 60 s.
+        let r = rig_with(ExecutionTier::BrowserAuto, asks(), |s| s);
+        r.tabs.record_opened(CHANNEL, SIDEBAR, 100, None);
+        let a = LowersTier {
+            tier: r.tier.clone(),
+        };
+        let out = serde_json::to_value(
+            r.backend
+                .call("browser_click", json!({ "selector": "#go" }), &a)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(error(&out)["code"], "tier_denied");
+        assert_eq!(error(&out)["tier"], "read-only");
+        assert_eq!(error(&out)["required"], "browser-auto");
+        assert!(sent(&r).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_call_says_it_may_still_have_happened() {
+        // I2: the browser may still act after the daemon gives up.
+        let r = rig(ExecutionTier::ReadOnly);
+        r.browser.silent.store(true, Ordering::SeqCst);
+        let out = call(
+            &r,
+            "browser_navigate",
+            json!({ "url": "https://muse.example/" }),
+        )
+        .await;
+        assert_eq!(
+            detail(&out),
+            "the browser did not answer within 150 s; the action may still have happened"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_disconnect_cleanup_server_rs_runs_clears_the_shared_table() {
+        // T6: `handle_proxy_connection` is a live TCP loop; this drives the
+        // exact call it makes on disconnect —
+        // `agent_tabs::shared().connection_closed(&proxy_id)` — against a
+        // backend wired to the shared table the way `for_pairing` wires it.
+        // Its own channel and proxy ids keep it apart from other tests.
+        const T6_CHANNEL: &str = "t6-disconnect-0000-channel";
+        const T6_PROXY: &str = "proxy-t6-disconnect";
+        let (tx, browser) = browser();
+        let db = Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        let services = HostServices::new(db).with_browser_sender(tx);
+        let backend = DesktopBrowserBackend::new(
+            T6_CHANNEL,
+            Arc::new(FixedTier(Mutex::new(ExecutionTier::ReadOnly))),
+            crate::remote::agent_tabs::shared(),
+            Arc::new(FixedJudge(Judgement::Allow)),
+            Arc::new(move || Some(services.clone())),
+            Arc::new(|_: &str| Some(T6_PROXY.to_string())),
+        );
+        let a = approver(Approval::Approved);
+        let run = |tool: &'static str, args: Value| {
+            let backend = &backend;
+            let a = &a;
+            async move { serde_json::to_value(backend.call(tool, args, a).await.unwrap()).unwrap() }
+        };
+        run(
+            "browser_navigate",
+            json!({ "url": "https://muse.example/" }),
+        )
+        .await;
+        run("browser_get_tabs", json!({})).await;
+        assert_eq!(
+            crate::remote::agent_tabs::shared().owned_ids(T6_CHANNEL, T6_PROXY),
+            vec![100]
+        );
+
+        assert!(crate::remote::agent_tabs::shared().connection_closed(T6_PROXY) >= 1);
+
+        let out = run("browser_snapshot", json!({})).await;
+        assert_eq!(error(&out)["code"], "no_agent_tab");
+        for id in [100, 1] {
+            let out = run("browser_snapshot", json!({ "tab_id": id })).await;
+            assert_eq!(error(&out)["code"], "tab_closed", "{id}");
+        }
+        assert_eq!(browser.seen.lock().unwrap().len(), 2);
     }
 
     use crate::remote::channel_codec;
@@ -2015,6 +2414,7 @@ mod tests {
                 },
                 |s| s,
             );
+            r.tabs.record_listed(CHANNEL, SIDEBAR, &[1]);
             let browser = r.browser.clone();
             let mut agent = Agent::connect(r.backend, json!({"elicitation": {}})).await;
             // `browser_click` with an `element_id`: the desktop dialog words it
@@ -2087,6 +2487,7 @@ mod tests {
             },
             |s| s,
         );
+        auto.tabs.record_listed(CHANNEL, SIDEBAR, &[1]);
         let click = json!({"element_id": "e1", "tab_id": 1});
         let denied = auto
             .backend

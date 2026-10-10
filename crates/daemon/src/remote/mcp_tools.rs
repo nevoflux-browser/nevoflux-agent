@@ -39,7 +39,9 @@ pub fn is_allowed(name: &str) -> bool {
 }
 
 const TAB_ID: &str = "Tab to act in. Omit it to act in your own tab (the one your last \
-browser_navigate opened); pass an id from browser_get_tabs to act in any other tab.";
+browser_navigate opened); pass an id from browser_get_tabs to act in any other tab. An id \
+must come from your own browser_navigate or a browser_get_tabs result in the current browser \
+session; any other id answers tab_closed.";
 
 fn tab_id() -> Value {
     json!({ "type": "integer", "description": TAB_ID })
@@ -102,7 +104,7 @@ the person's own tabs carry owned: false — leave those alone unless asked.",
             "Load a URL. Without tab_id it runs in your own tab, opening one in the background \
 the first time; it never takes over the tab the person is looking at.",
             json!({
-                "url": { "type": "string", "description": "Where to go" },
+                "url": { "type": "string", "description": "Where to go: an http:// or https:// URL, or about:blank" },
                 "new_tab": { "type": "boolean", "default": false, "description": "Open another tab of your own instead of reusing your current one" },
                 "tab_id": tab_id()
             }),
@@ -111,7 +113,7 @@ the first time; it never takes over the tab the person is looking at.",
         tool(
             "browser_activate_tab",
             "Bring a tab to the front. This changes what the person is looking at.",
-            json!({ "tab_id": { "type": "integer", "description": "The tab to show, from browser_get_tabs" } }),
+            json!({ "tab_id": { "type": "integer", "description": "The tab to show: one you opened, or one from a browser_get_tabs result in the current browser session" } }),
             &["tab_id"],
         ),
         tool(
