@@ -16,7 +16,7 @@ use nevoflux_mcp::rmcp::service::RequestContext;
 use nevoflux_mcp::rmcp::{ErrorData as McpError, RoleServer};
 use serde_json::{json, Value};
 
-use super::mcp_tools::{error_with_code, is_allowed, AgentToolBackend};
+use super::mcp_tools::{is_allowed, AgentError, AgentToolBackend};
 
 /// The agent-channel protocol version. Same number as
 /// `crates/daemon/tests/fixtures/muse/PROTOCOL_VERSION` (pinned by a test).
@@ -68,10 +68,7 @@ impl ServerHandler for AgentMcpServer {
     ) -> Result<CallToolResponse, McpError> {
         if !is_allowed(&request.name) {
             tracing::info!(target: "remote", tool = %request.name, "agent asked for a tool off the whitelist");
-            return Err(error_with_code(
-                "not_allowed",
-                format!("{} is not available over the agent channel", request.name),
-            ));
+            return Ok(AgentError::UnknownTool.to_result(&request.name).into());
         }
         let arguments = request
             .arguments

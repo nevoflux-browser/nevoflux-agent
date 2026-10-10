@@ -402,8 +402,12 @@ mod tests {
         let reply = wait_for(&sink, |f| f["m"]["id"] == json!(3))
             .await
             .expect("answered");
-        assert_eq!(reply["m"]["error"]["code"], json!(-32602));
-        assert_eq!(reply["m"]["error"]["data"]["code"], "not_allowed");
+        assert!(reply["m"].get("error").is_none(), "a tool error, not a protocol error");
+        assert_eq!(reply["m"]["result"]["isError"], json!(true));
+        assert_eq!(
+            reply["m"]["result"]["structuredContent"]["error"]["code"],
+            "unknown_tool"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
