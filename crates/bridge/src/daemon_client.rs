@@ -70,6 +70,10 @@ pub struct DaemonClient {
     config: Arc<BridgeConfig>,
     /// Connected daemon info.
     daemon_info: Option<DaemonInfo>,
+    /// The last address a connection succeeded on. In zero-file managed mode
+    /// the proxy picks the daemon's port itself and no port file exists, so
+    /// `reconnect` falls back to this address when discovery finds nothing.
+    last_addr: Option<String>,
     /// Current connection state.
     state: ConnectionState,
     /// Reconnection configuration.
@@ -85,6 +89,7 @@ impl DaemonClient {
             writer: None,
             config: Arc::new(config),
             daemon_info: None,
+            last_addr: None,
             state: ConnectionState::Disconnected,
             reconnect_config: ReconnectConfig::default(),
         }
@@ -102,6 +107,7 @@ impl DaemonClient {
             writer: None,
             config: Arc::new(config),
             daemon_info: None,
+            last_addr: None,
             state: ConnectionState::Disconnected,
             reconnect_config,
         }
@@ -171,6 +177,7 @@ impl DaemonClient {
 
         self.establish_connection(&addr).await?;
 
+        self.last_addr = Some(addr);
         self.daemon_info = Some(info);
         self.state = ConnectionState::Connected;
 
@@ -186,6 +193,7 @@ impl DaemonClient {
         let tcp_addr = addr.strip_prefix("tcp://").unwrap_or(addr);
 
         self.establish_connection(tcp_addr).await?;
+        self.last_addr = Some(tcp_addr.to_string());
         self.state = ConnectionState::Connected;
         Ok(())
     }
@@ -239,10 +247,32 @@ impl DaemonClient {
                     }
                 }
                 Err(e) => {
-                    warn!(
-                        "Reconnect attempt {} - daemon discovery failed: {}",
-                        attempts, e
-                    );
+                    // No port file (zero-file managed mode, or it was removed):
+                    // go back to the address we were connected to.
+                    match self.last_addr.clone() {
+                        Some(addr) => match self.establish_connection(&addr).await {
+                            Ok(()) => {
+                                self.state = ConnectionState::Connected;
+                                info!(
+                                    "Reconnected to daemon at its previous address after {} attempts (proxy_id={})",
+                                    attempts, self.proxy_id
+                                );
+                                return Ok(());
+                            }
+                            Err(conn_err) => {
+                                warn!(
+                                    "Reconnect attempt {} - no port file ({}) and previous address {} failed: {}",
+                                    attempts, e, addr, conn_err
+                                );
+                            }
+                        },
+                        None => {
+                            warn!(
+                                "Reconnect attempt {} - daemon discovery failed: {}",
+                                attempts, e
+                            );
+                        }
+                    }
                 }
             }
 
@@ -547,6 +577,42 @@ mod tests {
         let result = client.reconnect().await;
         assert!(matches!(result, Err(BridgeError::ReconnectionFailed(2))));
         assert_eq!(client.connection_state(), ConnectionState::Disconnected);
+    }
+
+    /// Zero-file managed mode: the proxy launched the daemon on a port it chose
+    /// and connected with `connect_to`; no port file exists. After the
+    /// connection drops, `reconnect` must go back to that same address
+    /// instead of failing forever on the missing port file.
+    #[tokio::test]
+    async fn reconnect_returns_to_the_address_it_connected_to_without_a_port_file() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                held.push(stream);
+            }
+        });
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let config = BridgeConfig::new().with_data_dir(temp.path());
+        let reconnect_config = ReconnectConfig {
+            max_retries: 2,
+            initial_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(50),
+            backoff_multiplier: 2.0,
+        };
+        let mut client =
+            DaemonClient::with_reconnect_config("test-proxy", config, reconnect_config);
+        client.connect_to(&addr).await.unwrap();
+
+        client.reconnect().await.unwrap();
+
+        assert_eq!(client.connection_state(), ConnectionState::Connected);
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
