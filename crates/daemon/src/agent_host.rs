@@ -5244,6 +5244,20 @@ impl HostFunctions for DaemonHostFunctions {
             return Ok(serde_json::to_string(&result).unwrap_or_default());
         }
 
+        // The WASM agent sends every `browser_activate_tab` here. Like the
+        // new-tab navigate above it is not MCP-provided; run it as the native
+        // loop does (agent/tools.rs build_params): ActivateTab with the target
+        // tab both in the params and as the request's tab.
+        if tool_name == "browser_activate_tab" {
+            let tab_id = arguments.get("tab_id").and_then(|v| v.as_i64());
+            let result = self.execute_browser_action(
+                BrowserToolAction::ActivateTab,
+                serde_json::json!({ "tab_id": tab_id.unwrap_or(0) }),
+                tab_id,
+            )?;
+            return Ok(serde_json::to_string(&result).unwrap_or_default());
+        }
+
         // Intercept PR #2 browser input strategy engine tools.
         //
         // browser_input and browser_probe are built-in tools (not MCP) that
@@ -9535,15 +9549,15 @@ fn dynamic_browser_route(name: &str) -> Option<DynamicBrowserRoute> {
 
 #[cfg(test)]
 mod tests {
-    /// The WASM agent sends `browser_navigate` with `new_tab: true` through
-    /// tool_call_dynamic (so new_tab reaches the extension). It used to fall
-    /// through to the MCP manager and fail with "No server provides tool:
-    /// browser_navigate"; it must reach the browser as one Navigate request
-    /// that keeps new_tab.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_new_tab_navigate_through_tool_call_dynamic_reaches_the_browser() {
-        use super::HostFunctions;
-
+    /// A host whose browser requests go to the returned receiver, with
+    /// full-auto execution so the permission gate lets browser tools through.
+    fn host_with_browser() -> (
+        super::DaemonHostFunctions,
+        tokio::sync::mpsc::Receiver<(
+            crate::wasm::services::BrowserRequest,
+            tokio::sync::oneshot::Sender<crate::wasm::services::BrowserResponse>,
+        )>,
+    ) {
         let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
         nevoflux_storage::ConfigRepository::new(&db)
             .set(
@@ -9551,31 +9565,60 @@ mod tests {
                 serde_json::json!({"general": {"agentExecution": "full-auto"}}),
             )
             .unwrap();
-        let (btx, mut brx) = tokio::sync::mpsc::channel(1);
+        let (btx, brx) = tokio::sync::mpsc::channel(1);
         let host = super::DaemonHostFunctions::new(
             std::sync::Arc::new(crate::config::AgentConfig::default()),
             tokio::runtime::Handle::current(),
         )
         .with_services(crate::wasm::services::HostServices::new(db).with_browser_sender(btx))
         .with_session_id("s1");
-        let browser = tokio::spawn(async move {
+        (host, brx)
+    }
+
+    /// Answers one browser request with `result` and hands back what it saw.
+    fn answer_one_browser_request(
+        mut brx: tokio::sync::mpsc::Receiver<(
+            crate::wasm::services::BrowserRequest,
+            tokio::sync::oneshot::Sender<crate::wasm::services::BrowserResponse>,
+        )>,
+        result: serde_json::Value,
+    ) -> tokio::task::JoinHandle<(
+        nevoflux_protocol::BrowserToolAction,
+        serde_json::Value,
+        Option<i64>,
+    )> {
+        tokio::spawn(async move {
             let (req, reply) = brx.recv().await.unwrap();
             let seen = (req.action, req.params.clone(), req.tab_id);
             reply
                 .send(crate::wasm::services::BrowserResponse {
                     request_id: req.request_id,
                     success: true,
-                    result: Some(serde_json::json!({"tab_id": 9, "new_tab": true})),
+                    result: Some(result),
                     error: None,
                 })
                 .unwrap();
             seen
-        });
+        })
+    }
+
+    /// The WASM agent sends `browser_navigate` with `new_tab: true` through
+    /// tool_call_dynamic (so new_tab reaches the extension). It used to fall
+    /// through to the MCP manager and fail with "No server provides tool:
+    /// browser_navigate"; it must reach the browser as one Navigate request
+    /// that keeps new_tab and the tab it was issued from.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_new_tab_navigate_through_tool_call_dynamic_reaches_the_browser() {
+        use super::HostFunctions;
+
+        let (host, brx) = host_with_browser();
+        let browser =
+            answer_one_browser_request(brx, serde_json::json!({"tab_id": 9, "new_tab": true}));
 
         let out = host
             .tool_call_dynamic(
                 "browser_navigate",
-                &serde_json::json!({"url": "https://example.com/", "new_tab": true}),
+                &serde_json::json!({"url": "https://example.com/", "new_tab": true, "tab_id": 4}),
             )
             .expect("a new-tab navigate must not fall through to MCP");
 
@@ -9583,8 +9626,29 @@ mod tests {
         assert_eq!(action, nevoflux_protocol::BrowserToolAction::Navigate);
         assert_eq!(params["url"], "https://example.com/");
         assert_eq!(params["new_tab"], true);
-        assert_eq!(tab_id, None);
+        assert_eq!(tab_id, Some(4));
         assert!(out.contains("\"tab_id\":9"), "{out}");
+    }
+
+    /// The WASM agent sends every `browser_activate_tab` through
+    /// tool_call_dynamic. It is not MCP-provided either, so it must reach the
+    /// browser as an ActivateTab request for that tab, like the native loop's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn activate_tab_through_tool_call_dynamic_reaches_the_browser() {
+        use super::HostFunctions;
+
+        let (host, brx) = host_with_browser();
+        let browser = answer_one_browser_request(brx, serde_json::json!({"tab_id": 7}));
+
+        let out = host
+            .tool_call_dynamic("browser_activate_tab", &serde_json::json!({"tab_id": 7}))
+            .expect("activate_tab must not fall through to MCP");
+
+        let (action, params, tab_id) = browser.await.unwrap();
+        assert_eq!(action, nevoflux_protocol::BrowserToolAction::ActivateTab);
+        assert_eq!(params["tab_id"], 7);
+        assert_eq!(tab_id, Some(7));
+        assert!(out.contains("\"tab_id\":7"), "{out}");
     }
 
     /// browser_upload_file reached tool_call_dynamic from the native loop and
