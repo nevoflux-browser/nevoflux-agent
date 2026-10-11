@@ -104,6 +104,19 @@ pub fn canonical_url(raw: &str) -> String {
     let _ = url.set_username("");
     let _ = url.set_password(None);
     url.set_fragment(None);
+    // `example.org.` is the same site as `example.org` (the fully qualified
+    // spelling), but the glob sees a different string. If the host will not
+    // take the trimmed name, keep the parsed form.
+    let trimmed = url
+        .host_str()
+        .filter(|h| h.ends_with('.'))
+        .map(|h| h.trim_end_matches('.').to_string());
+    if let Some(host) = trimmed {
+        let mut candidate = url.clone();
+        if candidate.set_host(Some(&host)).is_ok() {
+            url = candidate;
+        }
+    }
     url.to_string()
 }
 
@@ -595,6 +608,8 @@ message = "no automation on banking sites"
             "https://user:pw@example.org/",
             "https://user@example.org/",
             "https://example.org/#frag",
+            "https://example.org./",
+            "https://EXAMPLE.ORG.:443",
         ] {
             let c = canonical_url(u);
             assert!(SitePolicyStage::applies(&rule, Some(&c)), "{u} -> {c}");
