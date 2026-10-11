@@ -84,10 +84,34 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
     }
 }
 
+/// The canonical form of a URL, for matching against site rules.
+///
+/// Rules are plain `*`-globs over the URL string, so without this the same
+/// address written differently would slip past them: `https://example.org`
+/// (no path) escapes `*://example.org/*`, and so does `https://u@example.org/`,
+/// because no `*` in that pattern sits where the userinfo is. Parsing settles
+/// the spelling — lowercase scheme and host, default port dropped, an empty
+/// path made `/` — and userinfo and fragment are removed because neither says
+/// anything about which site the call is on.
+///
+/// A string that will not parse is returned as written. Treating it as "no
+/// URL" instead would make every URL-scoped rule silently skip the call.
+pub fn canonical_url(raw: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(raw) else {
+        return raw.to_string();
+    };
+    // Both fail only for URLs that cannot carry userinfo, which have none.
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_fragment(None);
+    url.to_string()
+}
+
 /// The URL a call should be judged against, if any.
 ///
 /// Prefers a URL the call is carrying — `browser_navigate` is about *where it
-/// is going*, not where it is — and falls back to the tab it targets.
+/// is going*, not where it is — and falls back to the tab it targets. Either
+/// way the URL comes back in [`canonical_url`] form.
 pub fn target_url(call: &ToolCall, ctx: &ToolContext) -> Option<String> {
     if let Some(u) = call
         .arguments
@@ -95,9 +119,9 @@ pub fn target_url(call: &ToolCall, ctx: &ToolContext) -> Option<String> {
         .and_then(|v| v.as_str())
         .filter(|u| !u.is_empty())
     {
-        return Some(u.to_string());
+        return Some(canonical_url(u));
     }
-    ctx.tab_url.clone()
+    ctx.tab_url.as_deref().map(canonical_url)
 }
 
 /// Load the `installed`-scope rules every installed pack contributes.
@@ -547,6 +571,71 @@ message = "no automation on banking sites"
         let missing = std::env::temp_dir().join("nf-sp-definitely-not-here");
         let _ = std::fs::remove_dir_all(&missing);
         assert!(load_installed_rules(&missing).is_empty());
+    }
+
+    fn example_org_ask_rule() -> SiteRule {
+        SiteRule {
+            pack: "example-guard".into(),
+            urls: vec!["*://example.org/*".into()],
+            deny: vec![],
+            ask: vec!["browser_navigate".into()],
+            message: "check before going there".into(),
+        }
+    }
+
+    /// Rules are matched against the canonical URL, so writing the same
+    /// address differently cannot slip past a rule.
+    #[test]
+    fn a_rule_matches_every_spelling_of_the_same_url() {
+        let rule = example_org_ask_rule();
+        for u in [
+            "https://example.org",
+            "https://EXAMPLE.org/",
+            "https://example.org:443/x",
+            "https://user:pw@example.org/",
+            "https://user@example.org/",
+            "https://example.org/#frag",
+        ] {
+            let c = canonical_url(u);
+            assert!(SitePolicyStage::applies(&rule, Some(&c)), "{u} -> {c}");
+        }
+        for u in ["https://example.org.evil.io/", "https://evil.io/x"] {
+            let c = canonical_url(u);
+            assert!(!SitePolicyStage::applies(&rule, Some(&c)), "{u} -> {c}");
+        }
+    }
+
+    /// A string that will not parse as a URL is judged as written rather than
+    /// dropped, so a URL-scoped rule still gets its chance to apply.
+    #[test]
+    fn an_unparseable_url_is_kept_as_written() {
+        assert_eq!(canonical_url("not a url"), "not a url");
+    }
+
+    #[test]
+    fn a_navigation_without_a_trailing_slash_is_still_asked_about() {
+        let s = SitePolicyStage::new(vec![example_org_ask_rule()]);
+        let going = call_with(
+            "browser_navigate",
+            serde_json::json!({ "url": "https://example.org" }),
+        );
+        assert!(matches!(s.check(&going, &ctx(None)), Verdict::Ask { .. }));
+    }
+
+    #[test]
+    fn the_tab_url_fallback_is_canonicalised_too() {
+        let s = SitePolicyStage::new(vec![example_org_ask_rule()]);
+        assert!(matches!(
+            s.check(
+                &call("browser_navigate"),
+                &ctx(Some("https://User@EXAMPLE.org:443"))
+            ),
+            Verdict::Ask { .. }
+        ));
+        assert_eq!(
+            target_url(&call("x"), &ctx(Some("https://example.org"))).as_deref(),
+            Some("https://example.org/")
+        );
     }
 
     /// The strictest rule decides, whichever pack contributed it and whatever
