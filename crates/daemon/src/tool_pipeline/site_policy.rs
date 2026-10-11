@@ -96,7 +96,19 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
 ///
 /// A string that will not parse is returned as written. Treating it as "no
 /// URL" instead would make every URL-scoped rule silently skip the call.
+///
+/// A `view-source:` wrapper (any case, any number of times) is peeled off
+/// first: Gecko loads the inner page with its cookies, so it is that page the
+/// call is on.
 pub fn canonical_url(raw: &str) -> String {
+    const VIEW_SOURCE: &str = "view-source:";
+    let mut raw = raw;
+    while raw
+        .get(..VIEW_SOURCE.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(VIEW_SOURCE))
+    {
+        raw = &raw[VIEW_SOURCE.len()..];
+    }
     let Ok(mut url) = reqwest::Url::parse(raw) else {
         return raw.to_string();
     };
@@ -118,6 +130,62 @@ pub fn canonical_url(raw: &str) -> String {
         }
     }
     url.to_string()
+}
+
+/// A pack's URL pattern, put in the same shape as [`canonical_url`] output.
+///
+/// URLs are canonical, so a pattern spelled differently would silently never
+/// match. For a pattern with `://`, the scheme-and-host part is lowercased (the
+/// path and query keep their case), `:443` after an `https` host and `:80`
+/// after an `http` host are dropped, and a bare host gets `/*` — a pattern
+/// naming only a host means the whole site. Everything else, including the
+/// globs, is left as the author wrote it.
+///
+/// Userinfo or a fragment in a pattern can never match, since canonical URLs
+/// carry neither; that is warned about rather than fixed, because the author
+/// meant something we cannot guess.
+pub fn normalize_url_pattern(pack: &str, pattern: &str) -> String {
+    let Some(sep) = pattern.find("://") else {
+        warn_unmatchable(pack, pattern, "");
+        return pattern.to_string();
+    };
+    let host_start = sep + 3;
+    let host_end = pattern[host_start..]
+        .find('/')
+        .map(|i| i + host_start)
+        .unwrap_or(pattern.len());
+
+    warn_unmatchable(pack, pattern, &pattern[host_start..host_end]);
+    let mut head = pattern[..host_end].to_lowercase();
+    if head.starts_with("https://") && head.ends_with(":443") {
+        head.truncate(head.len() - ":443".len());
+    } else if head.starts_with("http://") && head.ends_with(":80") {
+        head.truncate(head.len() - ":80".len());
+    }
+
+    let tail = &pattern[host_end..];
+    if tail.is_empty() {
+        format!("{head}/*")
+    } else {
+        format!("{head}{tail}")
+    }
+}
+
+fn warn_unmatchable(pack: &str, pattern: &str, authority: &str) {
+    if authority.contains('@') || pattern.contains('#') {
+        tracing::warn!(
+            pack = %pack,
+            pattern = %pattern,
+            "site policy: a URL pattern with userinfo or a fragment can never match"
+        );
+    }
+}
+
+fn normalize_url_patterns(pack: &str, patterns: &[String]) -> Vec<String> {
+    patterns
+        .iter()
+        .map(|p| normalize_url_pattern(pack, p))
+        .collect()
 }
 
 /// The URL a call should be judged against, if any.
@@ -173,7 +241,7 @@ pub fn load_installed_rules(packs_dir: &std::path::Path) -> Vec<SiteRule> {
             }
             out.push(SiteRule {
                 pack: manifest.pack.name.clone(),
-                urls: tp.match_on.url.clone(),
+                urls: normalize_url_patterns(&manifest.pack.name, &tp.match_on.url),
                 deny: tp.deny.clone(),
                 ask: tp.ask.clone(),
                 message: if tp.message.is_empty() {
@@ -209,7 +277,7 @@ pub fn load_active_rules(packs_dir: &std::path::Path, active: &[String]) -> Vec<
             }
             out.push(SiteRule {
                 pack: manifest.pack.name.clone(),
-                urls: tp.match_on.url.clone(),
+                urls: normalize_url_patterns(&manifest.pack.name, &tp.match_on.url),
                 deny: tp.deny.clone(),
                 ask: tp.ask.clone(),
                 message: if tp.message.is_empty() {
@@ -635,6 +703,82 @@ message = "no automation on banking sites"
             serde_json::json!({ "url": "https://example.org" }),
         );
         assert!(matches!(s.check(&going, &ctx(None)), Verdict::Ask { .. }));
+    }
+
+    #[test]
+    fn view_source_is_judged_as_the_page_it_shows() {
+        let rule = SiteRule {
+            urls: vec!["https://example.org/*".into()],
+            ..example_org_ask_rule()
+        };
+        for u in [
+            "view-source:https://example.org",
+            "VIEW-SOURCE:view-source:https://EXAMPLE.org",
+        ] {
+            let c = canonical_url(u);
+            assert!(SitePolicyStage::applies(&rule, Some(&c)), "{u} -> {c}");
+        }
+        let s = SitePolicyStage::new(vec![SiteRule {
+            urls: vec!["https://www.bank.com/*".into()],
+            ..bank_rule()
+        }]);
+        assert!(matches!(
+            s.check(
+                &call("browser_click"),
+                &ctx(Some("view-source:https://www.bank.com/transfer"))
+            ),
+            Verdict::Deny(_)
+        ));
+    }
+
+    /// Patterns are normalised once at load so that, against canonical URLs,
+    /// an author's uppercase host, explicit default port or bare host still
+    /// means what it looks like.
+    #[test]
+    fn patterns_are_normalised_to_match_canonical_urls() {
+        for (pattern, url) in [
+            ("*://Example.org/*", "https://example.org/x"),
+            ("HTTPS://EXAMPLE.ORG/*", "https://example.org/x"),
+            ("https://bank.com:443/*", "https://bank.com/x"),
+            ("http://bank.com:80/*", "http://bank.com/x"),
+            ("*://example.org", "https://example.org/x"),
+            ("https://example.org", "https://example.org/x"),
+        ] {
+            let p = normalize_url_pattern("t", pattern);
+            assert!(glob_match(&p, &canonical_url(url)), "{pattern} -> {p} vs {url}");
+        }
+        // The path keeps its case; only scheme and host are folded.
+        assert_eq!(
+            normalize_url_pattern("t", "*://Example.org/Path/*"),
+            "*://example.org/Path/*"
+        );
+        // A non-default port and a pattern without a scheme are left alone.
+        assert_eq!(
+            normalize_url_pattern("t", "https://bank.com:8443/*"),
+            "https://bank.com:8443/*"
+        );
+        assert_eq!(normalize_url_pattern("t", "*.bank.com/*"), "*.bank.com/*");
+    }
+
+    #[test]
+    fn the_loaders_normalise_patterns() {
+        let tmp = std::env::temp_dir().join(format!("nf-sp-norm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        for scope in ["installed", "active"] {
+            write_pack(
+                &tmp,
+                "bank-guard",
+                &manifest_with(scope).replace("*.bank.com/*", "*://Bank.com:443"),
+            );
+            let rules = if scope == "installed" {
+                load_installed_rules(&tmp)
+            } else {
+                load_active_rules(&tmp, &["bank-guard".to_string()])
+            };
+            assert_eq!(rules[0].urls, vec!["*://bank.com:443/*".to_string()]);
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
