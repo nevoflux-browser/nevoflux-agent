@@ -24,7 +24,7 @@
 //!    results, which can hold what was typed.
 
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -214,15 +214,26 @@ pub fn short_id(channel_id: &str) -> String {
 /// are built before the asset server and the recorder exist, and an upload
 /// without the asset server fails. Read per call, so a channel restored
 /// before this is set answers `browser_unavailable` until it is.
-static SERVICES: OnceLock<HostServices> = OnceLock::new();
+///
+/// A slot, not a `OnceLock`: the services hold clones of the daemon's
+/// channel senders, so a server that shuts down must drop them
+/// (`clear_services_template`) or those channels never close and the runtime
+/// cannot finish.
+static SERVICES: RwLock<Option<HostServices>> = RwLock::new(None);
 
-/// Publish the services agent calls clone from. Called once from `server.rs`.
+/// Publish the services agent calls clone from. Called from `server.rs` once
+/// startup is done; a later server replaces an earlier one's.
 pub fn set_services_template(services: HostServices) {
-    let _ = SERVICES.set(services);
+    *SERVICES.write().unwrap_or_else(|p| p.into_inner()) = Some(services);
+}
+
+/// Drop the published services. Called when the server shuts down.
+pub fn clear_services_template() {
+    SERVICES.write().unwrap_or_else(|p| p.into_inner()).take();
 }
 
 fn services_template() -> Option<HostServices> {
-    SERVICES.get().cloned()
+    SERVICES.read().unwrap_or_else(|p| p.into_inner()).clone()
 }
 
 /// Which tab a call runs in (spec §3.2).
@@ -1950,6 +1961,30 @@ mod tests {
             Judgement::Allow
         ));
         assert_eq!(bodies.lock().unwrap().len(), before);
+    }
+
+    /// The template holds clones of the daemon's channel senders. A server
+    /// that shuts down must be able to drop it, or those channels never close
+    /// and the runtime cannot finish (server::tests::test_server_start_and_shutdown
+    /// hung on every platform); a later server must be able to publish its own.
+    #[test]
+    fn the_services_template_is_released_on_clear_and_can_be_set_again() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let db = Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        set_services_template(HostServices::new(db.clone()).with_browser_sender(tx));
+        assert!(services_template().is_some());
+
+        clear_services_template();
+        assert!(services_template().is_none());
+        // Every sender is gone, so the channel reports closed instead of waiting.
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ));
+
+        set_services_template(HostServices::new(db));
+        assert!(services_template().is_some());
+        clear_services_template();
     }
 
     #[test]

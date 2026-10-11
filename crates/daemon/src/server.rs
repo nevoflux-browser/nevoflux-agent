@@ -450,6 +450,10 @@ impl Server {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(()).await;
         }
+        // Agent channels clone their services from a process-wide template
+        // that holds this server's channel senders; drop it so those channels
+        // can close.
+        crate::remote::agent_backend::clear_services_template();
         // The on-device engine goes down first, before anything else gets a
         // chance to wedge this path: it is a separate process holding
         // several GB of VRAM and a machine-wide lock file, and on Windows
