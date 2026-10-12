@@ -666,4 +666,17 @@ mod tests {
             assert!(agent_tools().iter().all(|t| t.name != name), "{name}");
         }
     }
+
+    #[test]
+    fn the_agent_channel_cannot_pause_or_resume_anything() {
+        for name in [
+            "remote.agent_pause",
+            "remote.agent_resume",
+            "remote_agent_pause",
+            "remote_agent_resume",
+        ] {
+            assert!(!is_allowed(name), "{name}");
+            assert!(agent_tools().iter().all(|t| t.name != name), "{name}");
+        }
+    }
 }

@@ -2274,3 +2274,28 @@ mod gap_seven {
         .is_none());
     }
 }
+
+/// M2b B7: taking an agent's access back, or giving it back, is the desktop
+/// person's alone. Pinned the same three ways as gap 7.
+#[cfg(test)]
+mod pause_is_local_only {
+    use super::*;
+
+    #[test]
+    fn pausing_and_resuming_are_never_portal_queries() {
+        for name in ["remote.agent_pause", "remote.agent_resume"] {
+            assert!(!PORTAL_QUERIES.contains(&name), "{name}");
+            for frame in [
+                json!({ "kind": "query", "id": "q", "name": name,
+                        "params": { "control_channel_id": "c" } }),
+                json!({ "kind": "system_command", "command": name,
+                        "params": { "control_channel_id": "c" } }),
+                json!({ "type": "system_command",
+                        "payload": { "request_id": "r", "command": name,
+                                     "params": { "control_channel_id": "c" } } }),
+            ] {
+                assert!(uplink(&frame, "s", "m", None, &[]).is_none(), "{frame}");
+            }
+        }
+    }
+}

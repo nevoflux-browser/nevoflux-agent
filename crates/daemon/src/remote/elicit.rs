@@ -414,4 +414,76 @@ mod tests {
         let muse = Muse::new(Answer::Approve(true), true, ProtocolVersion::V_2026_07_28);
         assert_eq!(ask_through_the_channel(muse, None).await, "Approved");
     }
+
+    /// M2b §2.2: pausing closes the channel while a question may be open. The
+    /// question must end at once as `Failed` (→ `approval_denied` and a
+    /// "cancelled" notice), not sit out its sixty seconds as a timeout.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_closed_mid_question_ends_the_question_as_failed() {
+        struct Reports(tokio::sync::mpsc::UnboundedSender<Approval>);
+
+        #[async_trait]
+        impl AgentToolBackend for Reports {
+            fn tools(&self) -> Vec<Tool> {
+                vec![Tool::new(
+                    "browser_click",
+                    "asks first",
+                    serde_json::Map::new(),
+                )]
+            }
+            async fn call(
+                &self,
+                _name: &str,
+                _arguments: Value,
+                approver: &dyn Approver,
+            ) -> Result<CallToolResult, ErrorData> {
+                let answer = approver.ask("Click on element 'e1'".into()).await;
+                let _ = self.0.send(answer);
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                    "{answer:?}"
+                ))]))
+            }
+        }
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+        let session = tokio_util::sync::CancellationToken::new();
+        let ct = session.clone();
+        tokio::spawn(async move {
+            if let Ok(running) = AgentMcpServer::new(Arc::new(Reports(tx)))
+                .serve_with_ct(server_io, ct)
+                .await
+            {
+                let _ = running.waiting().await;
+            }
+        });
+        let muse = Muse::new(Answer::Never, true, V);
+        let seen = muse.seen.clone();
+        let client = muse
+            .serve(client_io)
+            .await
+            .expect("the session initialises");
+        let peer = client.peer().clone();
+        tokio::spawn(async move {
+            let _ = peer
+                .call_tool(CallToolRequestParams::new("browser_click"))
+                .await;
+        });
+        for _ in 0..250 {
+            if !seen.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(seen.lock().unwrap().len(), 1, "the question is open");
+
+        // What closing the channel does to the session (`McpGateway::end_session`).
+        session.cancel();
+        let answer = tokio::time::timeout(Duration::from_secs(15), rx.recv())
+            .await
+            .expect("the question ends well inside its sixty seconds")
+            .expect("the backend reported");
+        assert_eq!(answer, Approval::Failed);
+        let _ = client.cancel().await;
+    }
 }

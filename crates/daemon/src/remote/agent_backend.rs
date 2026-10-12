@@ -2394,8 +2394,22 @@ mod tests {
     impl Agent {
         /// Presence -> challenge -> initialize (with `capabilities`) -> initialized.
         async fn connect(backend: DesktopBrowserBackend, capabilities: Value) -> Self {
+            Self::connect_to(backend, capabilities, |gw| gw).await
+        }
+
+        /// [`Agent::connect`], with the gateway adjusted by `wrap` first.
+        async fn connect_to(
+            backend: DesktopBrowserBackend,
+            capabilities: Value,
+            wrap: impl FnOnce(McpGateway) -> McpGateway,
+        ) -> Self {
             let sink = Arc::new(Collect::default());
-            let gw = McpGateway::new(KEY, sink.clone(), Arc::new(backend), CHANNEL);
+            let gw = wrap(McpGateway::new(
+                KEY,
+                sink.clone(),
+                Arc::new(backend),
+                CHANNEL,
+            ));
             gw.on_wire_in(&Wire::Text(r#"{"k":"peers","n":1}"#.into()))
                 .await;
             let ch = sink.frames()[0]["ch"].as_str().unwrap().to_string();
@@ -2827,6 +2841,102 @@ mod tests {
             assert_eq!(notes[0]["title"], title, "{answer:?}");
             assert_eq!(notes[0]["body"], "Click on element '#go' in tab 1", "{answer:?}");
             assert!(status.current()["agents"][0]["approval"].is_null(), "{answer:?}");
+        }
+    }
+
+    /// M2b §2.2, end to end through the real gateway, backend and registry:
+    /// an agent call is waiting on its question when the session closes —
+    /// the head's socket dropping (what a pause does, via `close_channel`) or
+    /// nobody left on the channel. The question ends at once with exactly one
+    /// "cancelled" notice, and the desktop is left showing neither the call
+    /// nor the question.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_closed_mid_question_is_announced_once_as_cancelled() {
+        for ending in ["the socket dropped", "nobody is left"] {
+            let (r, status, seen) = watched_rig(ExecutionTier::BrowserAuto, ask("why"));
+            r.tabs.record_listed(CHANNEL, SIDEBAR, &[1]);
+            let browser = r.browser.clone();
+            let st = status.clone();
+            let mut agent = Agent::connect_to(r.backend, json!({"elicitation": {}}), |gw| {
+                gw.with_status(st)
+            })
+            .await;
+            agent
+                .send(
+                    json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {
+                    "name": "browser_click", "arguments": {"element_id": "e1", "tab_id": 1}}}),
+                )
+                .await;
+            agent
+                .sink
+                .message(|m| m["method"] == "elicitation/create")
+                .await;
+            let open = status.current()["agents"][0].clone();
+            assert_eq!(open["channel_id"], CHANNEL, "{ending}");
+            assert_eq!(open["state"], "connected", "{ending}");
+            assert_eq!(open["tool"], "browser_click", "{ending}");
+            assert_eq!(
+                open["approval"]["summary"], "Click on element 'e1' in tab 1",
+                "{ending}"
+            );
+            assert!(
+                seen.notifications().is_empty(),
+                "{ending}: nothing has ended yet"
+            );
+
+            match ending {
+                "the socket dropped" => agent.gw.on_disconnected().await,
+                _ => {
+                    agent
+                        .gw
+                        .on_wire_in(&Wire::Text(r#"{"k":"peers","n":0}"#.into()))
+                        .await
+                }
+            }
+            let mut settled = false;
+            for _ in 0..250 {
+                let now = status.current()["agents"][0].clone();
+                if now["approval"].is_null() && now["tool"].is_null() {
+                    settled = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(
+                settled,
+                "{ending}: the question ends well inside its sixty seconds"
+            );
+            // Room for a second notice, were one ever to be sent.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            let notes = seen.notifications();
+            assert_eq!(notes.len(), 1, "{ending}: {notes:?}");
+            assert_eq!(notes[0]["source"], "agent_approval", "{ending}");
+            assert_eq!(notes[0]["outcome"], "cancelled", "{ending}");
+            assert_eq!(
+                notes[0]["title"], "Approval cancelled — Muse disconnected",
+                "{ending}"
+            );
+            assert_eq!(
+                notes[0]["body"], "Click on element 'e1' in tab 1",
+                "{ending}"
+            );
+            let last = seen
+                .statuses()
+                .last()
+                .cloned()
+                .expect("snapshots were sent");
+            for snapshot in [last, status.current()] {
+                let row = &snapshot["agents"][0];
+                assert_eq!(row["channel_id"], CHANNEL, "{ending}");
+                assert_eq!(row["state"], "offline", "{ending}");
+                assert!(row["tool"].is_null(), "{ending}: {snapshot}");
+                assert!(row["approval"].is_null(), "{ending}: {snapshot}");
+            }
+            assert!(
+                browser.seen.lock().unwrap().is_empty(),
+                "{ending}: nothing reached the browser"
+            );
         }
     }
 }
