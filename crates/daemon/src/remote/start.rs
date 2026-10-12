@@ -1361,6 +1361,7 @@ mod tests {
             push: None,
             kind: crate::remote::pairing::PairingKind::Device,
             tier: None,
+            paused: false,
         }
     }
 
@@ -1375,6 +1376,7 @@ mod tests {
             push: None,
             kind: crate::remote::pairing::PairingKind::Agent,
             tier: None,
+            paused: false,
         }
     }
 

@@ -87,6 +87,16 @@ pub struct Pairing {
     /// Never set on a device.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier: Option<String>,
+    /// The person paused this agent on the desktop (M2b B1): the pairing is
+    /// kept, but nothing dials its channel until they resume it. Persisted, so
+    /// a restart keeps it paused. Absent in older files, which reads as not
+    /// paused; written only when true. Never set on a device.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub paused: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl Pairing {
@@ -248,6 +258,21 @@ impl PairingStore {
         Ok(true)
     }
 
+    /// Pause or resume an agent. Reports whether there was such an agent; a
+    /// device row is never paused.
+    pub fn set_paused(&self, control_channel_id: &str, paused: bool) -> Result<bool, PairingError> {
+        let mut all = self.load()?;
+        let Some(entry) = all
+            .iter_mut()
+            .find(|p| p.control_channel_id == control_channel_id && p.is_agent())
+        else {
+            return Ok(false);
+        };
+        entry.paused = paused;
+        self.write(&all)?;
+        Ok(true)
+    }
+
     /// Forget one by its control channel. Reports whether there was one.
     pub fn remove(&self, control_channel_id: &str) -> Result<bool, PairingError> {
         let mut all = self.load()?;
@@ -322,6 +347,7 @@ pub fn mint(code: &str) -> Option<Pairing> {
         push: None,
         kind: PairingKind::Device,
         tier: None,
+        paused: false,
     })
 }
 
@@ -355,6 +381,7 @@ pub fn mint_agent(code: &str) -> Option<Pairing> {
                 .as_setting()
                 .to_string(),
         ),
+        paused: false,
     })
 }
 
@@ -409,6 +436,7 @@ mod tests {
             push: None,
             kind: PairingKind::Device,
             tier: None,
+            paused: false,
         }
     }
 
@@ -649,5 +677,51 @@ mod tests {
         assert!(!store.set_tier("nobody", ExecutionTier::FullAuto).unwrap());
         let text = std::fs::read_to_string(dir.path().join("pairings.json")).unwrap();
         assert!(!text.contains("tier"), "{text}");
+    }
+
+    #[test]
+    fn an_agent_written_before_pausing_existed_is_not_paused() {
+        let (store, dir) = store();
+        let old = r#"[{"control_channel_id":"a","control_key":"aa","created_at":1,"kind":"agent","tier":"read-only"}]"#;
+        std::fs::write(dir.path().join("pairings.json"), old).unwrap();
+        assert!(!store.load().unwrap()[0].paused);
+    }
+
+    #[test]
+    fn an_unpaused_row_is_written_without_the_field() {
+        let text = serde_json::to_string(&agent_row("a", None)).unwrap();
+        assert!(!text.contains("paused"), "{text}");
+        let paused = Pairing {
+            paused: true,
+            ..agent_row("a", None)
+        };
+        let text = serde_json::to_string(&paused).unwrap();
+        assert!(text.contains("\"paused\":true"), "{text}");
+    }
+
+    #[test]
+    fn pausing_rewrites_only_that_agent_and_survives_a_restart() {
+        let (store, dir) = store();
+        store.add(agent_row("a1", None)).unwrap();
+        store.add(agent_row("a2", None)).unwrap();
+        assert!(store.set_paused("a1", true).unwrap());
+        // A fresh store on the same file is what a restarted daemon reads.
+        let reloaded = PairingStore::new(dir.path().join("pairings.json"))
+            .load()
+            .unwrap();
+        assert!(reloaded[0].paused);
+        assert!(!reloaded[1].paused);
+        assert!(store.set_paused("a1", false).unwrap());
+        assert!(!store.load().unwrap()[0].paused);
+    }
+
+    #[test]
+    fn a_device_is_never_paused() {
+        let (store, dir) = store();
+        store.add(pairing("d1")).unwrap();
+        assert!(!store.set_paused("d1", true).unwrap());
+        assert!(!store.set_paused("nobody", true).unwrap());
+        let text = std::fs::read_to_string(dir.path().join("pairings.json")).unwrap();
+        assert!(!text.contains("paused"), "{text}");
     }
 }
