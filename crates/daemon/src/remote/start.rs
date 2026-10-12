@@ -639,18 +639,6 @@ pub async fn open_mcp_channel_with_token(
         cancel: cancel.clone(),
         registry: registry.clone(),
     };
-    {
-        let (relay, ch, sink, gw, cancel) = (
-            relay_base(),
-            channel_id.clone(),
-            sink.clone(),
-            gateway.clone(),
-            cancel.clone(),
-        );
-        tokio::spawn(async move {
-            super::ws::run_mcp_socket(&relay, &ch, base, tokens, sink, gw, cancel).await;
-        });
-    }
     if let Some(previous) = channels()
         .lock()
         .await
@@ -666,6 +654,14 @@ pub async fn open_mcp_channel_with_token(
         handle.close().await;
         return Err(OpenError::Paused);
     }
+    // Only a channel that survived the re-check is dialled: a paused agent
+    // never gets a socket task, not even one cancelled straight away.
+    #[cfg(test)]
+    test_hooks::socket_spawned(&channel_id);
+    let relay = relay_base();
+    tokio::spawn(async move {
+        super::ws::run_mcp_socket(&relay, &channel_id, base, tokens, sink, gateway, cancel).await;
+    });
     Ok(handle)
 }
 
@@ -674,7 +670,7 @@ pub async fn open_mcp_channel_with_token(
 /// by side and each must only ever meet its own.
 #[cfg(test)]
 pub(crate) mod test_hooks {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::{Mutex, OnceLock};
 
     type Hook = Box<dyn FnOnce() + Send>;
@@ -697,6 +693,20 @@ pub(crate) mod test_hooks {
         if let Some(hook) = hook {
             hook();
         }
+    }
+
+    fn spawned() -> &'static Mutex<HashSet<String>> {
+        static S: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+        S.get_or_init(|| Mutex::new(HashSet::new()))
+    }
+
+    pub(super) fn socket_spawned(channel_id: &str) {
+        spawned().lock().unwrap().insert(channel_id.to_string());
+    }
+
+    /// Whether a socket task was ever spawned for this channel id.
+    pub(crate) fn was_socket_spawned(channel_id: &str) -> bool {
+        spawned().lock().unwrap().contains(channel_id)
     }
 }
 
@@ -1159,14 +1169,13 @@ where
     Fut: std::future::Future<Output = bool>,
 {
     write_paused(deps, control_channel_id, false)?;
+    // A store that cannot be read is a store failure, not a missing agent.
     let pairing = deps
         .agent_pairings
         .load()
-        .ok()
-        .and_then(|all| {
-            all.into_iter()
-                .find(|p| p.control_channel_id == control_channel_id)
-        })
+        .map_err(|e| AgentSwitchError::Store(e.to_string()))?
+        .into_iter()
+        .find(|p| p.control_channel_id == control_channel_id)
         .ok_or(AgentSwitchError::NotFound)?;
     let opened = open(pairing).await;
     deps.agent_status.set_pairings(&all_pairings(deps));
@@ -1907,17 +1916,21 @@ mod tests {
     async fn a_paused_agent_stays_down_through_a_restart() {
         let dir = tempfile::tempdir().unwrap();
         let (deps, seen) = watched_deps(dir.path());
+        let id = "m2b-paused-restart";
+        // Keyless: were the pause ignored, the refusal would be the missing
+        // key, never a preflight against the real account service.
         store_pairing(
             &deps,
             &crate::remote::pairing::Pairing {
                 paused: true,
-                ..agent("a1")
+                control_key: "not hex".into(),
+                ..agent(id)
             },
         )
         .unwrap();
         assert_eq!(restore_pairings(&deps).await, 0);
         assert!(deps.registry.lock().await.is_empty(), "nothing dialled");
-        assert!(!open_channels().await.contains(&"a1".to_string()));
+        assert!(!open_channels().await.contains(&id.to_string()));
         assert_eq!(seen.statuses()[0]["agents"][0]["state"], "paused");
     }
 
@@ -1974,6 +1987,10 @@ mod tests {
         assert_eq!(srv.hits(), 1, "the preflight ran");
         assert!(!open_channels().await.contains(&"race-1".to_string()));
         assert!(deps.registry.lock().await.is_empty(), "nothing left registered");
+        assert!(
+            !test_hooks::was_socket_spawned("race-1"),
+            "a channel paused before it was dialled never got a socket task"
+        );
     }
 
     #[tokio::test]
@@ -2070,6 +2087,61 @@ mod tests {
         assert!(!deps.agent_pairings.load().unwrap()[0].paused);
         assert_eq!(seen.statuses().last().unwrap()["agents"][0]["state"], "offline");
         assert!(!open_channels().await.contains(&id.to_string()));
+    }
+
+    /// File a stand-in channel for `id` under the process-wide map, holding
+    /// a token the caller keeps to see whether anything closed it.
+    async fn file_channel(deps: &ControlDeps, id: &str) -> CancellationToken {
+        let cancel = CancellationToken::new();
+        channels().lock().await.insert(
+            id.to_string(),
+            ChannelHandle {
+                gateway_id: format!("mcp:{id}"),
+                portal: None,
+                cancel: cancel.clone(),
+                registry: deps.registry.clone(),
+            },
+        );
+        cancel
+    }
+
+    #[tokio::test]
+    async fn resuming_an_open_channel_leaves_it_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps(dir.path());
+        let id = "m2b-resume-already-open";
+        // Keyless: a redial would be refused, so `Ok(true)` can only come
+        // from finding the channel already up.
+        let keyless = crate::remote::pairing::Pairing {
+            control_key: "not hex".into(),
+            ..agent(id)
+        };
+        store_pairing(&deps, &keyless).unwrap();
+        let cancel = file_channel(&deps, id).await;
+        assert!(resume_agent(&deps, id).await.unwrap(), "reported up");
+        assert!(!cancel.is_cancelled(), "the live session was not dropped");
+        assert!(deps.registry.lock().await.is_empty(), "nothing redialled");
+        assert!(open_channels().await.contains(&id.to_string()));
+        channels().lock().await.remove(id);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_store_fails_a_pause_and_a_resume_as_a_store_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps(dir.path());
+        let id = "m2b-switch-store-failed";
+        std::fs::write(dir.path().join("agent-pairings.json"), "{ nope").unwrap();
+        let cancel = file_channel(&deps, id).await;
+        let e = pause_agent(&deps, id).await.unwrap_err();
+        assert!(matches!(e, AgentSwitchError::Store(_)), "{e:?}");
+        assert_eq!(e.code(), "STORE_FAILED");
+        assert!(!cancel.is_cancelled(), "nothing closed on a failed pause");
+        assert!(open_channels().await.contains(&id.to_string()));
+        let e = resume_agent(&deps, id).await.unwrap_err();
+        assert!(matches!(e, AgentSwitchError::Store(_)), "{e:?}");
+        assert_eq!(e.code(), "STORE_FAILED");
+        assert!(!cancel.is_cancelled());
+        channels().lock().await.remove(id);
     }
 
     #[tokio::test]

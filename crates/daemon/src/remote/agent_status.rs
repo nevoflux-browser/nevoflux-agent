@@ -381,13 +381,14 @@ impl AgentStatus {
         self.publish(&mut inner);
     }
 
+    /// The session closed. A channel already forgotten (its pairing is gone)
+    /// is not brought back by a teardown landing late, and nothing is sent.
     pub fn session_ended(&self, channel: &str) {
         let mut inner = self.lock();
-        inner
-            .channels
-            .entry(channel.to_string())
-            .or_default()
-            .connected = false;
+        let Some(ch) = inner.channels.get_mut(channel) else {
+            return;
+        };
+        ch.connected = false;
         self.publish(&mut inner);
     }
 
@@ -412,9 +413,10 @@ impl AgentStatus {
 
     fn tool_ended(&self, channel: &str, id: u64) {
         let mut inner = self.lock();
-        if let Some(ch) = inner.channels.get_mut(channel) {
-            ch.tools.retain(|(call, _)| *call != id);
-        }
+        let Some(ch) = inner.channels.get_mut(channel) else {
+            return;
+        };
+        ch.tools.retain(|(call, _)| *call != id);
         self.publish(&mut inner);
     }
 
@@ -757,6 +759,25 @@ mod tests {
             seen.notifications().is_empty(),
             "a question forgotten is not announced again"
         );
+    }
+
+    #[test]
+    fn a_teardown_after_forget_brings_nothing_back() {
+        let (status, seen, _clock) = testing::watched(100);
+        status.set_pairings(&[testing::agent("a", 1)]);
+        status.session_started("a");
+        let running = status.tool_started("a", "browser_snapshot");
+        status.forget("a");
+        status.set_pairings(&[]);
+        seen.clear();
+        status.session_ended("a");
+        drop(running);
+        assert!(
+            !status.lock().channels.contains_key("a"),
+            "no entry re-created"
+        );
+        assert!(seen.statuses().is_empty(), "no snapshot published");
+        assert!(seen.notifications().is_empty());
     }
 
     #[tokio::test]
