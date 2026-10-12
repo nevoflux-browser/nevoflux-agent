@@ -359,6 +359,9 @@ async fn connect_prod_mode(
     // 4. Connect directly to the known port
     let addr = format!("127.0.0.1:{}", port);
     client.connect_to(&addr).await?;
+    // No port file exists in this mode; let reconnect return to this daemon
+    // while it is alive.
+    client.set_managed_daemon(pid, &addr);
 
     Ok(Some(pid))
 }

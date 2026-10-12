@@ -6,7 +6,7 @@
 use crate::config::BridgeConfig;
 use crate::error::{BridgeError, Result};
 use crate::native_messaging::{write_message, MAX_SOCKET_MESSAGE_SIZE};
-use crate::port_discovery::{discover_daemon, DaemonInfo};
+use crate::port_discovery::{discover_daemon, is_process_running, DaemonInfo};
 use futures::stream::Stream;
 use nevoflux_protocol::{Channel, DaemonEnvelope, ProxyEnvelope};
 use std::pin::Pin;
@@ -77,6 +77,12 @@ pub struct DaemonClient {
     /// consumed, and the next read took the middle of a body as a length
     /// prefix ("Message too large: 1919951483 bytes").
     rx_buf: Vec<u8>,
+    /// The daemon this proxy spawned in zero-file managed mode, and the address
+    /// it listens on. No port file exists in that mode, so when discovery
+    /// fails `reconnect` falls back to this address, but only while that
+    /// process is still alive: once it has died, the port may belong to
+    /// another daemon or an unrelated program.
+    managed_daemon: Option<ManagedDaemon>,
     /// Current connection state.
     state: ConnectionState,
     /// Reconnection configuration.
@@ -93,6 +99,7 @@ impl DaemonClient {
             config: Arc::new(config),
             daemon_info: None,
             rx_buf: Vec::new(),
+            managed_daemon: None,
             state: ConnectionState::Disconnected,
             reconnect_config: ReconnectConfig::default(),
         }
@@ -111,6 +118,7 @@ impl DaemonClient {
             config: Arc::new(config),
             daemon_info: None,
             rx_buf: Vec::new(),
+            managed_daemon: None,
             state: ConnectionState::Disconnected,
             reconnect_config,
         }
@@ -201,6 +209,15 @@ impl DaemonClient {
         Ok(())
     }
 
+    /// Record the daemon this proxy spawned (zero-file managed mode) and the
+    /// address it was connected to, so `reconnect` can return to it while the
+    /// process is alive.
+    pub fn set_managed_daemon(&mut self, pid: u32, addr: impl Into<String>) {
+        let addr = addr.into();
+        let addr = addr.strip_prefix("tcp://").unwrap_or(&addr).to_string();
+        self.managed_daemon = Some(ManagedDaemon { pid, addr });
+    }
+
     /// Reconnect to the daemon with exponential backoff.
     ///
     /// Drops the old connection and attempts to establish a new TCP connection.
@@ -263,10 +280,37 @@ impl DaemonClient {
                     }
                 }
                 Err(e) => {
-                    warn!(
-                        "Reconnect attempt {} - daemon discovery failed: {}",
-                        attempts, e
-                    );
+                    // Discovery failed (in zero-file managed mode there is
+                    // never a port file). Go back to the daemon we spawned,
+                    // but only while that process is alive.
+                    let fallback = match &self.managed_daemon {
+                        Some(m) if is_process_running(m.pid).await => Some(m.clone()),
+                        _ => None,
+                    };
+                    match fallback {
+                        Some(m) => match self.establish_connection(&m.addr).await {
+                            Ok(()) => {
+                                self.state = ConnectionState::Connected;
+                                info!(
+                                    "Reconnected to managed daemon (pid {}) at {} after {} attempts (proxy_id={})",
+                                    m.pid, m.addr, attempts, self.proxy_id
+                                );
+                                return Ok(());
+                            }
+                            Err(conn_err) => {
+                                warn!(
+                                    "Reconnect attempt {} - daemon discovery failed ({}) and managed daemon (pid {}) at {} refused: {}",
+                                    attempts, e, m.pid, m.addr, conn_err
+                                );
+                            }
+                        },
+                        None => {
+                            warn!(
+                                "Reconnect attempt {} - daemon discovery failed: {}",
+                                attempts, e
+                            );
+                        }
+                    }
                 }
             }
 
@@ -454,6 +498,13 @@ impl Stream for DaemonMessageStream {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Pin::new(&mut self.receiver).poll_recv(cx)
     }
+}
+
+/// A daemon spawned by this proxy, see [`DaemonClient::set_managed_daemon`].
+#[derive(Debug, Clone)]
+struct ManagedDaemon {
+    pid: u32,
+    addr: String,
 }
 
 /// Create a unique proxy ID.
@@ -847,6 +898,123 @@ mod tests {
         buf.extend_from_slice(b":3}");
         assert_eq!(take_frame(&mut buf, 1024).unwrap().unwrap(), b"{\"c\":3}");
         assert!(buf.is_empty());
+    }
+
+    /// A listener that reads the registration frame of every connection it
+    /// accepts and reports its proxy_id, keeping the connections open.
+    async fn registering_server() -> (String, mpsc::UnboundedReceiver<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let frame: serde_json::Value =
+                        crate::native_messaging::read_message(&mut stream)
+                            .await
+                            .unwrap();
+                    let _ = tx.send(frame["proxy_id"].as_str().unwrap_or("").to_string());
+                    std::future::pending::<()>().await;
+                    drop(stream);
+                });
+            }
+        });
+        (addr, rx)
+    }
+
+    async fn next_registration(rx: &mut mpsc::UnboundedReceiver<String>) -> Option<String> {
+        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    fn quick_retries(temp: &tempfile::TempDir) -> DaemonClient {
+        let config = BridgeConfig::new().with_data_dir(temp.path());
+        let reconnect_config = ReconnectConfig {
+            max_retries: 2,
+            initial_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(50),
+            backoff_multiplier: 2.0,
+        };
+        DaemonClient::with_reconnect_config("test-proxy", config, reconnect_config)
+    }
+
+    /// Without a managed daemon whose process is known to be alive, an address
+    /// the client once connected to is not trusted on reconnect: after our
+    /// daemon dies another process may hold that port.
+    #[tokio::test]
+    async fn reconnect_does_not_fall_back_without_a_known_live_daemon() {
+        let (addr, mut registrations) = registering_server().await;
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut client = quick_retries(&temp);
+        client.connect_to(&addr).await.unwrap();
+        assert_eq!(
+            next_registration(&mut registrations).await.as_deref(),
+            Some("test-proxy")
+        );
+
+        let result = client.reconnect().await;
+
+        assert!(
+            matches!(result, Err(BridgeError::ReconnectionFailed(2))),
+            "got {:?}",
+            result
+        );
+        assert_eq!(client.connection_state(), ConnectionState::Disconnected);
+        assert!(registrations.try_recv().is_err(), "no second connection");
+    }
+
+    /// Zero-file managed mode: the proxy launched the daemon on a port it chose
+    /// and no port file exists. While that daemon is alive (here: this test
+    /// process stands in for it), `reconnect` goes back to its address instead
+    /// of failing forever on the missing port file.
+    #[tokio::test]
+    async fn reconnect_returns_to_a_live_managed_daemon_without_a_port_file() {
+        let (addr, mut registrations) = registering_server().await;
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut client = quick_retries(&temp);
+        client.connect_to(&addr).await.unwrap();
+        client.set_managed_daemon(std::process::id(), &addr);
+        assert_eq!(
+            next_registration(&mut registrations).await.as_deref(),
+            Some("test-proxy")
+        );
+
+        client.reconnect().await.unwrap();
+
+        assert_eq!(client.connection_state(), ConnectionState::Connected);
+        assert_eq!(
+            next_registration(&mut registrations).await.as_deref(),
+            Some("test-proxy"),
+            "the reconnect must register on the managed daemon's address"
+        );
+    }
+
+    /// Once the managed daemon has died its port is up for grabs, so the
+    /// client must not go back to it.
+    #[tokio::test]
+    async fn reconnect_does_not_fall_back_to_a_dead_managed_daemon() {
+        let (addr, mut registrations) = registering_server().await;
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut client = quick_retries(&temp);
+        client.connect_to(&addr).await.unwrap();
+        // No process has this PID.
+        client.set_managed_daemon(0xFFFF_FFF0, &addr);
+        assert_eq!(
+            next_registration(&mut registrations).await.as_deref(),
+            Some("test-proxy")
+        );
+
+        let result = client.reconnect().await;
+
+        assert!(
+            matches!(result, Err(BridgeError::ReconnectionFailed(2))),
+            "got {:?}",
+            result
+        );
+        assert!(registrations.try_recv().is_err(), "no second connection");
     }
 
     #[tokio::test]
