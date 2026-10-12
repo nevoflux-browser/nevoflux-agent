@@ -7,6 +7,7 @@
 
 pub mod account;
 pub mod agent_backend;
+pub mod agent_status;
 pub mod agent_tabs;
 pub mod asset;
 pub mod channel_codec;
