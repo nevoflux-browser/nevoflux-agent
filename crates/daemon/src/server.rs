@@ -2061,6 +2061,15 @@ pub async fn start_server(
                 None
             }
         };
+        // What the desktop is shown about each paired agent (M2b §2.3), sent
+        // on the bus `CURRENT_EVENT_BUS` has held since earlier in startup.
+        let agent_status = crate::remote::agent_status::shared();
+        match crate::kb_wizard::CURRENT_EVENT_BUS.get() {
+            Some(bus) => agent_status.attach(Arc::new(
+                crate::remote::agent_status::BusSink::spawn(bus.clone()),
+            )),
+            None => error!("no event bus, so the sidebar will not see paired agents"),
+        }
         crate::remote::start::ControlDeps {
             tracker: remote_tracker.clone(),
             sessions: Arc::new(crate::remote::control_gateway::StorageSessions::new(
@@ -2073,6 +2082,7 @@ pub async fn start_server(
             msg_tx: msg_tx.clone(),
             injector_proxy_id: "remote-control".to_string(),
             registry: remote_registry.clone(),
+            agent_status,
         }
     };
     crate::remote::start::set_control_deps(control_deps.clone());

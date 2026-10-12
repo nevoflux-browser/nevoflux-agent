@@ -552,6 +552,8 @@ pub struct ControlDeps {
     pub injector_proxy_id: String,
     /// The gateway registry.
     pub registry: Arc<Mutex<GatewayRegistry>>,
+    /// What the desktop is shown about each paired agent (M2b §2.3).
+    pub agent_status: Arc<super::agent_status::AgentStatus>,
 }
 
 /// The process's control dependencies, once the daemon has built them.
@@ -823,6 +825,10 @@ async fn open_data_channel(
 pub async fn restore_pairings(deps: &ControlDeps) -> usize {
     // Never regenerated on a parse failure — see `PairingStore::load`.
     let pairings = all_pairings(deps);
+    // The desktop's first look at the agents (M2b §2.3), sent before anything
+    // is dialled and even when there are none, so a sidebar that subscribes
+    // later always replays a real state.
+    deps.agent_status.set_pairings(&pairings);
     if pairings.is_empty() {
         return 0;
     }
@@ -1329,6 +1335,20 @@ mod tests {
     }
 
     fn deps(dir: &std::path::Path) -> ControlDeps {
+        deps_with(dir, Arc::new(crate::remote::agent_status::AgentStatus::new()))
+    }
+
+    fn watched_deps(
+        dir: &std::path::Path,
+    ) -> (ControlDeps, Arc<crate::remote::agent_status::testing::Captured>) {
+        let (status, seen, _clock) = crate::remote::agent_status::testing::watched(100);
+        (deps_with(dir, status), seen)
+    }
+
+    fn deps_with(
+        dir: &std::path::Path,
+        agent_status: Arc<crate::remote::agent_status::AgentStatus>,
+    ) -> ControlDeps {
         let database = Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
         let (msg_tx, _rx) = mpsc::channel(8);
         ControlDeps {
@@ -1347,6 +1367,7 @@ mod tests {
             msg_tx,
             injector_proxy_id: "remote-control".into(),
             registry: Arc::new(Mutex::new(GatewayRegistry::new())),
+            agent_status,
         }
     }
 
@@ -1551,5 +1572,75 @@ mod tests {
             assert!(matches!(e, SetTierError::NotFound), "{id}: {e:?}");
             assert_eq!(e.code(), "NOT_FOUND");
         }
+    }
+
+    /// Points the stored-token lookup at an empty directory with no env
+    /// override, so a device's data channel refuses locally ("log in first")
+    /// and nothing is ever dialled, whoever is signed in on this machine.
+    /// Restores both variables on drop.
+    struct NoStoredToken {
+        data_dir: Option<std::ffi::OsString>,
+        service_token: Option<std::ffi::OsString>,
+    }
+
+    impl NoStoredToken {
+        fn under(dir: &std::path::Path) -> Self {
+            let guard = Self {
+                data_dir: std::env::var_os("NEVOFLUX_DATA_DIR"),
+                service_token: std::env::var_os(SERVICE_TOKEN_ENV),
+            };
+            std::env::set_var("NEVOFLUX_DATA_DIR", dir);
+            std::env::remove_var(SERVICE_TOKEN_ENV);
+            guard
+        }
+    }
+
+    impl Drop for NoStoredToken {
+        fn drop(&mut self) {
+            match &self.data_dir {
+                Some(v) => std::env::set_var("NEVOFLUX_DATA_DIR", v),
+                None => std::env::remove_var("NEVOFLUX_DATA_DIR"),
+            }
+            match &self.service_token {
+                Some(v) => std::env::set_var(SERVICE_TOKEN_ENV, v),
+                None => std::env::remove_var(SERVICE_TOKEN_ENV),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn restoring_publishes_the_first_snapshot_even_with_no_agents() {
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, seen) = watched_deps(dir.path());
+        assert_eq!(restore_pairings(&deps).await, 0);
+        assert_eq!(seen.statuses(), vec![serde_json::json!({ "agents": [] })]);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_first_snapshot_lists_every_agent_and_no_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let _no_token = NoStoredToken::under(dir.path());
+        assert_eq!(TokenSource::stored().current(), None, "must stay offline");
+        let (deps, seen) = watched_deps(dir.path());
+        store_pairing(&deps, &device("d1")).unwrap();
+        // Keyless: the agent branch refuses it before any network is touched.
+        let keyless = crate::remote::pairing::Pairing {
+            control_key: "not hex".into(),
+            label: Some("Claude".into()),
+            ..agent("a1")
+        };
+        store_pairing(&deps, &keyless).unwrap();
+        assert_eq!(restore_pairings(&deps).await, 0);
+        assert!(
+            deps.registry.lock().await.is_empty(),
+            "no gateway was registered, so nothing was dialled"
+        );
+        assert!(open_channels().await.is_empty());
+        let first = &seen.statuses()[0];
+        assert_eq!(first["agents"].as_array().unwrap().len(), 1, "devices never appear");
+        assert_eq!(first["agents"][0]["channel_id"], "a1");
+        assert_eq!(first["agents"][0]["label"], "Claude");
+        assert_eq!(first["agents"][0]["state"], "offline");
     }
 }
