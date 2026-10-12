@@ -5,7 +5,7 @@
 
 use crate::config::BridgeConfig;
 use crate::error::{BridgeError, Result};
-use crate::native_messaging::{read_message_capped, write_message, MAX_SOCKET_MESSAGE_SIZE};
+use crate::native_messaging::{write_message, MAX_SOCKET_MESSAGE_SIZE};
 use crate::port_discovery::{discover_daemon, DaemonInfo};
 use futures::stream::Stream;
 use nevoflux_protocol::{Channel, DaemonEnvelope, ProxyEnvelope};
@@ -13,7 +13,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -70,6 +70,13 @@ pub struct DaemonClient {
     config: Arc<BridgeConfig>,
     /// Connected daemon info.
     daemon_info: Option<DaemonInfo>,
+    /// Bytes read from the daemon that do not form a whole frame yet. They
+    /// live on the client, not in a local of `try_recv`, because socket_task
+    /// polls `recv()` inside `select!` and drops it whenever the sidebar sends
+    /// first: with `read_exact` a dropped read lost the bytes it had already
+    /// consumed, and the next read took the middle of a body as a length
+    /// prefix ("Message too large: 1919951483 bytes").
+    rx_buf: Vec<u8>,
     /// Current connection state.
     state: ConnectionState,
     /// Reconnection configuration.
@@ -85,6 +92,7 @@ impl DaemonClient {
             writer: None,
             config: Arc::new(config),
             daemon_info: None,
+            rx_buf: Vec::new(),
             state: ConnectionState::Disconnected,
             reconnect_config: ReconnectConfig::default(),
         }
@@ -102,6 +110,7 @@ impl DaemonClient {
             writer: None,
             config: Arc::new(config),
             daemon_info: None,
+            rx_buf: Vec::new(),
             state: ConnectionState::Disconnected,
             reconnect_config,
         }
@@ -156,6 +165,8 @@ impl DaemonClient {
 
         self.reader = Some(reader);
         self.writer = Some(writer);
+        // A new connection starts on a frame boundary.
+        self.rx_buf = Vec::new();
         Ok(())
     }
 
@@ -194,6 +205,11 @@ impl DaemonClient {
     ///
     /// Drops the old connection and attempts to establish a new TCP connection.
     /// Will retry up to `max_retries` times with exponential backoff.
+    ///
+    /// Cancel safe in the sense that matters to socket_task, which runs this
+    /// inside the `recv()` future it races in `select!`: if the future is
+    /// dropped mid-way the client is left `Disconnected` (not stuck in
+    /// `Reconnecting`), so the next reconnect starts afresh.
     pub async fn reconnect(&mut self) -> Result<()> {
         if self.state == ConnectionState::Reconnecting {
             return Err(BridgeError::ConnectionFailed(
@@ -202,6 +218,13 @@ impl DaemonClient {
         }
 
         self.state = ConnectionState::Reconnecting;
+        let guard = ReconnectingGuard(self);
+        guard.0.reconnect_attempts().await
+    }
+
+    /// The body of [`reconnect`](Self::reconnect); runs with state `Reconnecting`
+    /// and leaves it `Connected` or `Disconnected` when it returns.
+    async fn reconnect_attempts(&mut self) -> Result<()> {
         info!(
             "Attempting to reconnect to daemon (proxy_id={})",
             self.proxy_id
@@ -210,6 +233,7 @@ impl DaemonClient {
         // Drop old connection
         self.reader = None;
         self.writer = None;
+        self.rx_buf = Vec::new();
 
         let mut delay = self.reconnect_config.initial_delay;
         let mut attempts = 0;
@@ -356,14 +380,36 @@ impl DaemonClient {
     }
 
     /// Try to receive a message from the TCP connection.
+    ///
+    /// Cancel safe: the only await is `read_buf`, which reads nothing when it
+    /// is cancelled, and everything it did read is already in `rx_buf`.
     async fn try_recv(&mut self) -> Result<DaemonEnvelope> {
-        let reader = self.reader.as_mut().ok_or(BridgeError::Disconnected)?;
-
-        // Daemon responses (e.g. a >1 MB artifact.get) travel the local socket,
-        // not Firefox's 1 MB native-messaging boundary, so allow the larger
-        // socket frame size here. The proxy re-chunks for stdout downstream.
-        let envelope: DaemonEnvelope = read_message_capped(reader, MAX_SOCKET_MESSAGE_SIZE).await?;
-        Ok(envelope)
+        loop {
+            // Daemon responses (e.g. a >1 MB artifact.get) travel the local
+            // socket, not Firefox's 1 MB native-messaging boundary, so allow the
+            // larger socket frame size here. The proxy re-chunks for stdout
+            // downstream.
+            if let Some(frame) = take_frame(&mut self.rx_buf, MAX_SOCKET_MESSAGE_SIZE)? {
+                return serde_json::from_slice(&frame).map_err(BridgeError::from);
+            }
+            // Once the (already validated) prefix is in, make room for exactly
+            // the rest of the frame rather than letting the buffer double past it.
+            let wanted = match frame_body_len(&self.rx_buf, MAX_SOCKET_MESSAGE_SIZE)? {
+                Some(len) => 4 + len - self.rx_buf.len(),
+                None => READ_CHUNK,
+            };
+            self.rx_buf.reserve_exact(wanted);
+            let reader = self.reader.as_mut().ok_or(BridgeError::Disconnected)?;
+            // read_buf is cancel safe: a dropped call has read nothing.
+            let n = reader.read_buf(&mut self.rx_buf).await?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "daemon closed the connection",
+                )
+                .into());
+            }
+        }
     }
 
     /// Close the connection.
@@ -375,6 +421,7 @@ impl DaemonClient {
         }
         self.reader = None;
         self.writer = None;
+        self.rx_buf = Vec::new();
         self.state = ConnectionState::Disconnected;
         self.daemon_info = None;
         Ok(())
@@ -424,6 +471,62 @@ pub(crate) fn build_register_frame(proxy_id: &str, role: Option<&str>) -> serde_
         v["role"] = serde_json::Value::String(r.to_string());
     }
     v
+}
+
+/// How much to make room for when the length prefix is not in yet.
+const READ_CHUNK: usize = 16 * 1024;
+
+/// Keeps a dropped [`DaemonClient::reconnect`] from leaving the client stuck in
+/// `Reconnecting`, where every later reconnect would fail with "Already
+/// reconnecting".
+struct ReconnectingGuard<'a>(&'a mut DaemonClient);
+
+impl Drop for ReconnectingGuard<'_> {
+    fn drop(&mut self) {
+        if self.0.state == ConnectionState::Reconnecting {
+            self.0.state = ConnectionState::Disconnected;
+        }
+    }
+}
+
+/// The body length announced by the prefix at the front of `buf`, once all
+/// four prefix bytes are there. Rejects a bad length as soon as it arrives.
+///
+/// The length checks and their messages match `read_message_capped`.
+fn frame_body_len(buf: &[u8], max_size: u32) -> Result<Option<usize>> {
+    if buf.len() < 4 {
+        return Ok(None);
+    }
+    let len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    if len > max_size {
+        return Err(BridgeError::NativeMessaging(format!(
+            "Message too large: {} bytes (max {})",
+            len, max_size
+        )));
+    }
+    if len == 0 {
+        return Err(BridgeError::NativeMessaging("Empty message".into()));
+    }
+    Ok(Some(len as usize))
+}
+
+/// Take one whole length-prefixed frame off the front of `buf`, if it holds one.
+///
+/// The frame keeps `buf`'s allocation (no copy of the body); `buf` is left
+/// holding only the bytes after the frame, in an allocation of their size, so a
+/// large frame does not leave a large buffer behind.
+fn take_frame(buf: &mut Vec<u8>, max_size: u32) -> Result<Option<Vec<u8>>> {
+    let Some(len) = frame_body_len(buf, max_size)? else {
+        return Ok(None);
+    };
+    let end = 4 + len;
+    if buf.len() < end {
+        return Ok(None);
+    }
+    let rest = buf.split_off(end);
+    let mut frame = std::mem::replace(buf, rest);
+    frame.drain(..4);
+    Ok(Some(frame))
 }
 
 #[cfg(test)]
@@ -547,6 +650,203 @@ mod tests {
         let result = client.reconnect().await;
         assert!(matches!(result, Err(BridgeError::ReconnectionFailed(2))));
         assert_eq!(client.connection_state(), ConnectionState::Disconnected);
+    }
+
+    /// socket_task polls `recv()` inside `select!` and drops it whenever the
+    /// sidebar sends something first. A frame read half way when that happens
+    /// must not be lost: the next `recv()` has to return the whole message,
+    /// not read the middle of its body as the next length prefix.
+    #[tokio::test]
+    async fn a_recv_cancelled_mid_frame_loses_nothing() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+
+        let config = BridgeConfig::new();
+        let mut client = DaemonClient::new("test-proxy", config);
+        client.connect_to(&addr).await.unwrap();
+        let mut daemon = server.await.unwrap();
+
+        let body = serde_json::to_vec(&DaemonEnvelope {
+            proxy_id: "test-proxy".into(),
+            request_id: Some("r-1".into()),
+            channel: Channel::Chat,
+            payload: serde_json::json!({ "type": "system_response", "ok": true }),
+            timestamp_ms: 0,
+        })
+        .unwrap();
+        let len = (body.len() as u32).to_le_bytes();
+        let half = body.len() / 2;
+
+        // The length and half the body arrive; the read is then cancelled.
+        daemon.write_all(&len).await.unwrap();
+        daemon.write_all(&body[..half]).await.unwrap();
+        daemon.flush().await.unwrap();
+        let first = tokio::time::timeout(Duration::from_millis(200), client.try_recv()).await;
+        assert!(
+            first.is_err(),
+            "the first read must still be waiting for the rest"
+        );
+
+        // The rest arrives; the next read must yield the whole message.
+        daemon.write_all(&body[half..]).await.unwrap();
+        daemon.flush().await.unwrap();
+        let envelope = tokio::time::timeout(Duration::from_secs(2), client.try_recv())
+            .await
+            .expect("the second read must finish")
+            .expect("the frame must parse");
+        assert_eq!(envelope.request_id.as_deref(), Some("r-1"));
+    }
+
+    /// Same as above, but the read is cancelled after only part of the 4-byte
+    /// length prefix has arrived.
+    #[tokio::test]
+    async fn a_recv_cancelled_inside_the_length_prefix_loses_nothing() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+
+        let mut client = DaemonClient::new("test-proxy", BridgeConfig::new());
+        client.connect_to(&addr).await.unwrap();
+        let mut daemon = server.await.unwrap();
+
+        let body = serde_json::to_vec(&DaemonEnvelope::new(
+            "test-proxy",
+            Channel::Chat,
+            serde_json::json!({ "type": "system_response" }),
+        ))
+        .unwrap();
+        let len = (body.len() as u32).to_le_bytes();
+
+        daemon.write_all(&len[..2]).await.unwrap();
+        daemon.flush().await.unwrap();
+        let first = tokio::time::timeout(Duration::from_millis(200), client.try_recv()).await;
+        assert!(first.is_err(), "two bytes of prefix are not a frame yet");
+
+        daemon.write_all(&len[2..]).await.unwrap();
+        daemon.write_all(&body).await.unwrap();
+        daemon.flush().await.unwrap();
+        let envelope = tokio::time::timeout(Duration::from_secs(2), client.try_recv())
+            .await
+            .expect("the second read must finish")
+            .expect("the frame must parse");
+        assert_eq!(envelope.proxy_id, "test-proxy");
+    }
+
+    /// A multi-megabyte frame (artifact.get) must not leave a buffer of that
+    /// size behind for the rest of the connection.
+    #[tokio::test]
+    async fn a_large_frame_does_not_leave_a_large_buffer_behind() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+
+        let mut client = DaemonClient::new("test-proxy", BridgeConfig::new());
+        client.connect_to(&addr).await.unwrap();
+        let mut daemon = server.await.unwrap();
+
+        let big = "x".repeat(3 * 1024 * 1024);
+        let body = serde_json::to_vec(&DaemonEnvelope::new(
+            "test-proxy",
+            Channel::Chat,
+            serde_json::json!({ "type": "artifact", "data": big }),
+        ))
+        .unwrap();
+        let writer = tokio::spawn(async move {
+            daemon
+                .write_all(&(body.len() as u32).to_le_bytes())
+                .await
+                .unwrap();
+            daemon.write_all(&body).await.unwrap();
+            daemon.flush().await.unwrap();
+            daemon
+        });
+
+        let envelope = tokio::time::timeout(Duration::from_secs(10), client.try_recv())
+            .await
+            .expect("the read must finish")
+            .expect("the frame must parse");
+        assert_eq!(
+            envelope.payload["data"].as_str().map(str::len),
+            Some(big.len())
+        );
+        let _daemon = writer.await.unwrap();
+        assert!(
+            client.rx_buf.capacity() <= 64 * 1024,
+            "rx_buf kept {} bytes of capacity after the frame",
+            client.rx_buf.capacity()
+        );
+    }
+
+    /// socket_task drops `recv()` (and with it a reconnect running inside it)
+    /// whenever the sidebar sends first. A reconnect dropped mid-way must not
+    /// leave the client in `Reconnecting`, or every later reconnect fails with
+    /// "Already reconnecting" and the proxy dies.
+    #[tokio::test]
+    async fn a_reconnect_dropped_mid_way_does_not_block_the_next_one() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let config = BridgeConfig::new().with_data_dir(temp.path());
+        let reconnect_config = ReconnectConfig {
+            max_retries: 5,
+            initial_delay: Duration::from_secs(30),
+            max_delay: Duration::from_secs(30),
+            backoff_multiplier: 1.0,
+        };
+        let mut client =
+            DaemonClient::with_reconnect_config("test-proxy", config, reconnect_config);
+
+        // The first attempt fails (no port file) and the reconnect then sleeps
+        // 30 s; it is dropped during that sleep.
+        let dropped = tokio::time::timeout(Duration::from_millis(100), client.reconnect()).await;
+        assert!(dropped.is_err(), "the reconnect must still be sleeping");
+        assert_eq!(client.connection_state(), ConnectionState::Disconnected);
+
+        // A fresh reconnect is attempted rather than refused.
+        client.reconnect_config.max_retries = 1;
+        let result = client.reconnect().await;
+        assert!(
+            matches!(result, Err(BridgeError::ReconnectionFailed(1))),
+            "got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn take_frame_rejects_an_over_max_prefix_as_soon_as_it_arrives() {
+        let mut buf = 2048u32.to_le_bytes().to_vec();
+        let err = take_frame(&mut buf, 1024).unwrap_err();
+        assert!(err.to_string().contains("Message too large"), "{}", err);
+    }
+
+    #[test]
+    fn take_frame_rejects_an_empty_frame() {
+        let mut buf = 0u32.to_le_bytes().to_vec();
+        let err = take_frame(&mut buf, 1024).unwrap_err();
+        assert!(err.to_string().contains("Empty message"), "{}", err);
+    }
+
+    #[test]
+    fn take_frame_splits_frames_that_arrive_together_and_waits_for_the_rest() {
+        let mut buf = Vec::new();
+        for body in [&b"{\"a\":1}"[..], &b"{\"b\":2}"[..]] {
+            buf.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            buf.extend_from_slice(body);
+        }
+        buf.extend_from_slice(&7u32.to_le_bytes());
+        buf.extend_from_slice(b"{\"c\"");
+
+        assert_eq!(take_frame(&mut buf, 1024).unwrap().unwrap(), b"{\"a\":1}");
+        assert_eq!(take_frame(&mut buf, 1024).unwrap().unwrap(), b"{\"b\":2}");
+        assert_eq!(take_frame(&mut buf, 1024).unwrap(), None);
+        buf.extend_from_slice(b":3}");
+        assert_eq!(take_frame(&mut buf, 1024).unwrap().unwrap(), b"{\"c\":3}");
+        assert!(buf.is_empty());
     }
 
     #[tokio::test]
