@@ -18,6 +18,7 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+use super::agent_status::AgentStatus;
 use super::envelope::{new_challenge, InboundVerifier, OutboundSealer};
 use super::gateway::{OutboundEvent, RemoteGateway};
 use super::mcp_server::AgentMcpServer;
@@ -43,6 +44,10 @@ pub struct McpGateway {
     backend: Arc<dyn AgentToolBackend>,
     live: Mutex<Option<Live>>,
     peers: Mutex<u64>,
+    /// The relay channel id, as the status snapshot names it.
+    channel: String,
+    /// Where this channel's sessions are shown (M2b §2.3).
+    status: Arc<AgentStatus>,
 }
 
 impl McpGateway {
@@ -59,7 +64,15 @@ impl McpGateway {
             backend,
             live: Mutex::new(None),
             peers: Mutex::new(0),
+            channel: channel_id.to_string(),
+            status: super::agent_status::shared(),
         }
+    }
+
+    /// Report this channel's sessions to `status` instead of the shared one.
+    pub fn with_status(mut self, status: Arc<AgentStatus>) -> Self {
+        self.status = status;
+        self
     }
 
     /// Everything the relay hands this channel.
@@ -124,6 +137,7 @@ impl McpGateway {
                 if session.verifier.exhausted() {
                     if let Some(dead) = live.take() {
                         dead.cancel.cancel();
+                        self.status.session_ended(&self.channel);
                     }
                     tracing::warn!(target: "remote", channel = %self.id, "too many refused frames; MCP session dropped");
                 }
@@ -151,14 +165,28 @@ impl McpGateway {
     }
 
     async fn end_session(&self) {
-        if let Some(old) = self.live.lock().await.take() {
-            old.cancel.cancel();
-            tracing::info!(target: "remote", channel = %self.id, "agent MCP session ended");
+        if self.drop_session().await {
+            self.status.session_ended(&self.channel);
+        }
+    }
+
+    /// Take the live session down without telling anyone. Reports whether
+    /// there was one.
+    async fn drop_session(&self) -> bool {
+        match self.live.lock().await.take() {
+            Some(old) => {
+                old.cancel.cancel();
+                tracing::info!(target: "remote", channel = %self.id, "agent MCP session ended");
+                true
+            }
+            None => false,
         }
     }
 
     async fn start_session(&self) {
-        self.end_session().await;
+        // A rejoin replaces the session; the agent was never offline, so the
+        // desktop is not told it was.
+        self.drop_session().await;
 
         let challenge = new_challenge();
         let mut sealer = OutboundSealer::new(challenge.clone());
@@ -210,6 +238,7 @@ impl McpGateway {
             inbound: in_tx,
             cancel,
         });
+        self.status.session_started(&self.channel);
         tracing::info!(target: "remote", channel = %self.id, "agent MCP session started");
     }
 }
@@ -616,5 +645,50 @@ mod tests {
         let sink = Arc::new(Collect::default());
         let gw = McpGateway::new(KEY, sink, Arc::new(StubBrowserBackend), "abc");
         assert_eq!(RemoteGateway::id(&gw), "mcp:abc");
+    }
+
+    use crate::remote::agent_status::{testing, AgentStatus};
+
+    fn build_watched() -> (Arc<McpGateway>, Arc<AgentStatus>, Arc<testing::Captured>) {
+        let (status, seen, _clock) = testing::watched(100);
+        status.set_pairings(&[testing::agent("chan-1", 1)]);
+        let sink = Arc::new(Collect::default());
+        let gw = Arc::new(
+            McpGateway::new(KEY, sink, Arc::new(StubBrowserBackend), "chan-1")
+                .with_status(status.clone()),
+        );
+        (gw, status, seen)
+    }
+
+    fn state(status: &AgentStatus) -> String {
+        status.current()["agents"][0]["state"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_desktop_sees_a_session_come_and_go() {
+        let (gw, status, seen) = build_watched();
+        assert_eq!(state(&status), "offline");
+        gw.on_wire_in(&presence(1)).await;
+        assert_eq!(state(&status), "connected");
+        let before = seen.statuses().len();
+        // A rejoin restarts the session; the desktop never sees it flicker.
+        gw.on_wire_in(&presence(2)).await;
+        assert!(seen.statuses()[before..]
+            .iter()
+            .all(|s| s["agents"][0]["state"] == "connected"));
+        gw.on_wire_in(&presence(0)).await;
+        assert_eq!(state(&status), "offline");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropped_socket_shows_the_agent_offline() {
+        let (gw, status, _seen) = build_watched();
+        gw.on_wire_in(&presence(1)).await;
+        assert_eq!(state(&status), "connected");
+        gw.on_disconnected().await;
+        assert_eq!(state(&status), "offline");
     }
 }

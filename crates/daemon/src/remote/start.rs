@@ -588,12 +588,14 @@ pub fn relay_base() -> String {
 pub async fn open_mcp_channel(
     pairing: &super::pairing::Pairing,
     backend: Arc<dyn super::mcp_tools::AgentToolBackend>,
+    status: Arc<super::agent_status::AgentStatus>,
     registry: &Arc<Mutex<GatewayRegistry>>,
     agent_pairings: &super::pairing::PairingStore,
 ) -> Result<ChannelHandle, OpenError> {
     open_mcp_channel_with_token(
         pairing,
         backend,
+        status,
         TokenSource::stored(),
         account_base(),
         registry,
@@ -608,6 +610,7 @@ pub async fn open_mcp_channel(
 pub async fn open_mcp_channel_with_token(
     pairing: &super::pairing::Pairing,
     backend: Arc<dyn super::mcp_tools::AgentToolBackend>,
+    status: Arc<super::agent_status::AgentStatus>,
     tokens: TokenSource,
     base: String,
     registry: &Arc<Mutex<GatewayRegistry>>,
@@ -624,12 +627,10 @@ pub async fn open_mcp_channel_with_token(
 
     let channel_id = pairing.control_channel_id.clone();
     let sink = Arc::new(super::ws::WsSink::new());
-    let gateway = Arc::new(super::mcp_gateway::McpGateway::new(
-        key,
-        sink.clone(),
-        backend,
-        &channel_id,
-    ));
+    let gateway = Arc::new(
+        super::mcp_gateway::McpGateway::new(key, sink.clone(), backend, &channel_id)
+            .with_status(status),
+    );
     registry.lock().await.register(gateway.clone());
     let cancel = CancellationToken::new();
     let handle = ChannelHandle {
@@ -802,7 +803,14 @@ pub async fn open_for_pairing(
             pairing,
             deps.agent_pairings.clone(),
         ));
-        return open_mcp_channel(pairing, backend, &deps.registry, &deps.agent_pairings).await;
+        return open_mcp_channel(
+            pairing,
+            backend,
+            deps.agent_status.clone(),
+            &deps.registry,
+            &deps.agent_pairings,
+        )
+        .await;
     }
     let injector: Arc<dyn super::inject::Injector> = Arc::new(super::inject::ChannelInjector::new(
         deps.msg_tx.clone(),
@@ -1319,6 +1327,7 @@ mod tests {
         let outcome = open_mcp_channel_with_token(
             &pairing,
             Arc::new(crate::remote::mcp_tools::UnavailableBackend),
+            Arc::new(crate::remote::agent_status::AgentStatus::new()),
             file_token(&dir, "OLD"),
             srv.base.clone(),
             &registry,
@@ -1420,6 +1429,7 @@ mod tests {
         let outcome = open_mcp_channel_with_token(
             &pairing,
             Arc::new(crate::remote::mcp_tools::UnavailableBackend),
+            Arc::new(crate::remote::agent_status::AgentStatus::new()),
             no_token(&dir),
             "http://127.0.0.1:1".into(),
             &registry,
@@ -1608,6 +1618,7 @@ mod tests {
         let outcome = open_mcp_channel_with_token(
             &pairing,
             Arc::new(crate::remote::mcp_tools::UnavailableBackend),
+            Arc::new(crate::remote::agent_status::AgentStatus::new()),
             fixed_token(&dir, "token"),
             "http://127.0.0.1:1".into(),
             &registry,
@@ -1818,6 +1829,7 @@ mod tests {
         let outcome = open_mcp_channel_with_token(
             &pairing,
             Arc::new(crate::remote::mcp_tools::UnavailableBackend),
+            Arc::new(crate::remote::agent_status::AgentStatus::new()),
             tokens,
             srv.base.clone(),
             &deps.registry,
