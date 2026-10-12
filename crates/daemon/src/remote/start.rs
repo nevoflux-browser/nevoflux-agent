@@ -1574,40 +1574,6 @@ mod tests {
         }
     }
 
-    /// Points the stored-token lookup at an empty directory with no env
-    /// override, so a device's data channel refuses locally ("log in first")
-    /// and nothing is ever dialled, whoever is signed in on this machine.
-    /// Restores both variables on drop.
-    struct NoStoredToken {
-        data_dir: Option<std::ffi::OsString>,
-        service_token: Option<std::ffi::OsString>,
-    }
-
-    impl NoStoredToken {
-        fn under(dir: &std::path::Path) -> Self {
-            let guard = Self {
-                data_dir: std::env::var_os("NEVOFLUX_DATA_DIR"),
-                service_token: std::env::var_os(SERVICE_TOKEN_ENV),
-            };
-            std::env::set_var("NEVOFLUX_DATA_DIR", dir);
-            std::env::remove_var(SERVICE_TOKEN_ENV);
-            guard
-        }
-    }
-
-    impl Drop for NoStoredToken {
-        fn drop(&mut self) {
-            match &self.data_dir {
-                Some(v) => std::env::set_var("NEVOFLUX_DATA_DIR", v),
-                None => std::env::remove_var("NEVOFLUX_DATA_DIR"),
-            }
-            match &self.service_token {
-                Some(v) => std::env::set_var(SERVICE_TOKEN_ENV, v),
-                None => std::env::remove_var(SERVICE_TOKEN_ENV),
-            }
-        }
-    }
-
     #[tokio::test]
     async fn restoring_publishes_the_first_snapshot_even_with_no_agents() {
         let dir = tempfile::tempdir().unwrap();
@@ -1617,14 +1583,11 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
-    async fn the_first_snapshot_lists_every_agent_and_no_device() {
+    async fn the_first_snapshot_lists_every_agent() {
         let dir = tempfile::tempdir().unwrap();
-        let _no_token = NoStoredToken::under(dir.path());
-        assert_eq!(TokenSource::stored().current(), None, "must stay offline");
         let (deps, seen) = watched_deps(dir.path());
-        store_pairing(&deps, &device("d1")).unwrap();
-        // Keyless: the agent branch refuses it before any network is touched.
+        // Agents only, and keyless: the agent branch refuses them before any
+        // network is touched. A device row would dial with the real token.
         let keyless = crate::remote::pairing::Pairing {
             control_key: "not hex".into(),
             label: Some("Claude".into()),
@@ -1638,9 +1601,21 @@ mod tests {
         );
         assert!(open_channels().await.is_empty());
         let first = &seen.statuses()[0];
-        assert_eq!(first["agents"].as_array().unwrap().len(), 1, "devices never appear");
+        assert_eq!(first["agents"].as_array().unwrap().len(), 1, "one entry per agent");
         assert_eq!(first["agents"][0]["channel_id"], "a1");
         assert_eq!(first["agents"][0]["label"], "Claude");
         assert_eq!(first["agents"][0]["state"], "offline");
+    }
+
+    #[test]
+    fn devices_never_appear_in_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, seen) = watched_deps(dir.path());
+        store_pairing(&deps, &device("d1")).unwrap();
+        store_pairing(&deps, &agent("a1")).unwrap();
+        deps.agent_status.set_pairings(&all_pairings(&deps));
+        let first = &seen.statuses()[0];
+        assert_eq!(first["agents"].as_array().unwrap().len(), 1);
+        assert_eq!(first["agents"][0]["channel_id"], "a1");
     }
 }
