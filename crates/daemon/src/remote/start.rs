@@ -718,6 +718,7 @@ pub async fn pair_agent(
             "could not store the pairing: {e}"
         )));
     }
+    deps.agent_status.set_pairings(&all_pairings(deps));
     Ok((pairing, code))
 }
 
@@ -991,6 +992,12 @@ pub async fn unpair_device(deps: &ControlDeps, control_channel_id: &str) -> bool
             false
         });
     }
+    // Every question still open on it ends here, announced as cancelled
+    // under its label: the snapshot below no longer has the row to name it.
+    deps.agent_status.forget(control_channel_id);
+    // Its tabs are nobody's now (M2b §2.5): a later pairing starts clean.
+    super::agent_tabs::shared().forget_pairing(control_channel_id);
+    deps.agent_status.set_pairings(&all_pairings(deps));
     closed || removed
 }
 
@@ -1041,6 +1048,130 @@ pub fn set_agent_tier(
         Ok(false) => Err(SetTierError::NotFound),
         Err(e) => Err(SetTierError::Store(e.to_string())),
     }
+}
+
+/// Why an agent was not paused or resumed.
+#[derive(Debug, thiserror::Error)]
+pub enum AgentSwitchError {
+    /// No agent pairing has that control channel.
+    #[error("no paired agent has that channel")]
+    NotFound,
+    /// The store could not be read or written.
+    #[error("could not store the change: {0}")]
+    Store(String),
+}
+
+impl AgentSwitchError {
+    /// The `system_response` error code the sidebar shows.
+    pub fn code(&self) -> &'static str {
+        match self {
+            AgentSwitchError::NotFound => "NOT_FOUND",
+            AgentSwitchError::Store(_) => "STORE_FAILED",
+        }
+    }
+}
+
+fn write_paused(
+    deps: &ControlDeps,
+    control_channel_id: &str,
+    paused: bool,
+) -> Result<(), AgentSwitchError> {
+    match deps.agent_pairings.set_paused(control_channel_id, paused) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(AgentSwitchError::NotFound),
+        Err(e) => Err(AgentSwitchError::Store(e.to_string())),
+    }
+}
+
+/// Pause one agent (M2b B1, `remote.agent_pause`): the pairing is kept, its
+/// channel closes, and nothing dials it again — across restarts too — until
+/// the person resumes it. An open question ends with the session, as
+/// `approval_denied` and a "cancelled" notice.
+pub async fn pause_agent(
+    deps: &ControlDeps,
+    control_channel_id: &str,
+) -> Result<(), AgentSwitchError> {
+    pause_agent_with(deps, control_channel_id, |id| async move {
+        close_channel(&id).await;
+    })
+    .await
+}
+
+/// [`pause_agent`] with the closing step passed in, so its order is testable.
+///
+/// The flag is on disk before the channel closes. The other way round, an
+/// open landing between the two would find the agent not yet paused and
+/// bring it straight back; this way `open_for_pairing` finds it paused
+/// whenever it runs.
+async fn pause_agent_with<F, Fut>(
+    deps: &ControlDeps,
+    control_channel_id: &str,
+    close: F,
+) -> Result<(), AgentSwitchError>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    write_paused(deps, control_channel_id, true)?;
+    close(control_channel_id.to_string()).await;
+    deps.agent_status.set_pairings(&all_pairings(deps));
+    tracing::info!(target: "remote", channel = %control_channel_id, "agent paused");
+    Ok(())
+}
+
+/// Resume one agent (`remote.agent_resume`). Reports whether its channel is
+/// up afterwards.
+pub async fn resume_agent(
+    deps: &ControlDeps,
+    control_channel_id: &str,
+) -> Result<bool, AgentSwitchError> {
+    resume_agent_with(deps, control_channel_id, |pairing| async move {
+        // Already up (never paused, or resumed twice): a redial would drop a
+        // live session for nothing.
+        if open_channels().await.contains(&pairing.control_channel_id) {
+            return true;
+        }
+        match open_for_pairing(deps, &pairing).await {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(
+                    target: "remote",
+                    channel = %pairing.control_channel_id,
+                    "a resumed agent could not be reconnected: {e}"
+                );
+                false
+            }
+        }
+    })
+    .await
+}
+
+/// [`resume_agent`] with the opening step passed in, so its order is
+/// testable: the flag is cleared on disk first, or `open_for_pairing` would
+/// refuse the agent as still paused.
+async fn resume_agent_with<F, Fut>(
+    deps: &ControlDeps,
+    control_channel_id: &str,
+    open: F,
+) -> Result<bool, AgentSwitchError>
+where
+    F: FnOnce(super::pairing::Pairing) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    write_paused(deps, control_channel_id, false)?;
+    let pairing = deps
+        .agent_pairings
+        .load()
+        .ok()
+        .and_then(|all| {
+            all.into_iter()
+                .find(|p| p.control_channel_id == control_channel_id)
+        })
+        .ok_or(AgentSwitchError::NotFound)?;
+    let opened = open(pairing).await;
+    deps.agent_status.set_pairings(&all_pairings(deps));
+    tracing::info!(target: "remote", channel = %control_channel_id, opened, "agent resumed");
+    Ok(opened)
 }
 
 #[cfg(test)]
@@ -1843,5 +1974,196 @@ mod tests {
         assert_eq!(srv.hits(), 1, "the preflight ran");
         assert!(!open_channels().await.contains(&"race-1".to_string()));
         assert!(deps.registry.lock().await.is_empty(), "nothing left registered");
+    }
+
+    #[tokio::test]
+    async fn pausing_writes_the_flag_before_the_channel_is_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps(dir.path());
+        store_pairing(&deps, &agent("a1")).unwrap();
+        let store = deps.agent_pairings.clone();
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let s = seen.clone();
+        pause_agent_with(&deps, "a1", move |id| async move {
+            let on_disk = store.load().unwrap()[0].paused;
+            *s.lock().unwrap() = Some((id, on_disk));
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(("a1".to_string(), true)),
+            "already paused on disk when the channel closes"
+        );
+    }
+
+    #[tokio::test]
+    async fn resuming_clears_the_flag_before_the_channel_is_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps(dir.path());
+        store_pairing(
+            &deps,
+            &crate::remote::pairing::Pairing {
+                paused: true,
+                ..agent("a1")
+            },
+        )
+        .unwrap();
+        let store = deps.agent_pairings.clone();
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let s = seen.clone();
+        let opened = resume_agent_with(&deps, "a1", move |pairing| async move {
+            *s.lock().unwrap() = Some((pairing.paused, store.load().unwrap()[0].paused));
+            true
+        })
+        .await
+        .unwrap();
+        assert!(opened);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some((false, false)),
+            "both the copy handed to the open and the disk say resumed"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_a_paired_agent_can_be_paused_or_resumed() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps(dir.path());
+        store_pairing(&deps, &device("d1")).unwrap();
+        deps.pairings.add(agent("stray")).unwrap();
+        for id in ["d1", "stray", "nobody"] {
+            let e = pause_agent(&deps, id).await.unwrap_err();
+            assert!(matches!(e, AgentSwitchError::NotFound), "{id}: {e:?}");
+            assert_eq!(e.code(), "NOT_FOUND");
+            assert!(
+                matches!(resume_agent(&deps, id).await, Err(AgentSwitchError::NotFound)),
+                "{id}"
+            );
+        }
+        let text = std::fs::read_to_string(dir.path().join("pairings.json")).unwrap();
+        assert!(!text.contains("paused"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn the_desktop_sees_a_pause_and_a_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, seen) = watched_deps(dir.path());
+        let id = "m2b-pause-resume";
+        // Keyless: the resume's redial is refused before any network.
+        let keyless = crate::remote::pairing::Pairing {
+            control_key: "not hex".into(),
+            ..agent(id)
+        };
+        store_pairing(&deps, &keyless).unwrap();
+        pause_agent(&deps, id).await.unwrap();
+        assert!(deps.agent_pairings.load().unwrap()[0].paused);
+        assert_eq!(seen.statuses().last().unwrap()["agents"][0]["state"], "paused");
+        assert!(matches!(
+            err_of(open_for_pairing(&deps, &keyless).await),
+            OpenError::Paused
+        ));
+        assert!(
+            !resume_agent(&deps, id).await.unwrap(),
+            "the redial was attempted and refused"
+        );
+        assert!(!deps.agent_pairings.load().unwrap()[0].paused);
+        assert_eq!(seen.statuses().last().unwrap()["agents"][0]["state"], "offline");
+        assert!(!open_channels().await.contains(&id.to_string()));
+    }
+
+    #[tokio::test]
+    async fn pausing_mid_question_cancels_it_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, seen) = watched_deps(dir.path());
+        let id = "m2b-pause-mid-question";
+        let pairing = crate::remote::pairing::Pairing {
+            label: Some("Desk Muse".into()),
+            ..agent(id)
+        };
+        store_pairing(&deps, &pairing).unwrap();
+        deps.agent_status.set_pairings(&all_pairings(&deps));
+        // Stands in for the agent's session: its call holds the question
+        // until the channel is cancelled, and is then dropped mid-question.
+        let cancel = CancellationToken::new();
+        let watch = deps
+            .agent_status
+            .approval_started(id, "browser_click", "click in example.com");
+        let call = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                cancel.cancelled().await;
+                drop(watch);
+            })
+        };
+        channels().lock().await.insert(
+            id.to_string(),
+            ChannelHandle {
+                gateway_id: format!("mcp:{id}"),
+                portal: None,
+                cancel,
+                registry: deps.registry.clone(),
+            },
+        );
+        pause_agent(&deps, id).await.unwrap();
+        call.await.unwrap();
+        let notices = seen.notifications();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert_eq!(notices[0]["outcome"], "cancelled");
+        assert_eq!(
+            notices[0]["title"],
+            "Approval cancelled — Desk Muse disconnected"
+        );
+        assert!(!open_channels().await.contains(&id.to_string()));
+        let last = seen.statuses().last().unwrap().clone();
+        assert_eq!(last["agents"][0]["state"], "paused");
+        assert!(last["agents"][0]["approval"].is_null(), "{last}");
+    }
+
+    #[tokio::test]
+    async fn unpairing_forgets_the_agents_tabs_and_republishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, seen) = watched_deps(dir.path());
+        let id = "m2b-unpair-tabs";
+        store_pairing(&deps, &agent(id)).unwrap();
+        crate::remote::agent_tabs::shared().record_opened(id, "proxy-x", 7, None);
+        assert!(unpair_device(&deps, id).await);
+        assert!(crate::remote::agent_tabs::shared()
+            .primary(id, "proxy-x")
+            .is_none());
+        assert_eq!(
+            seen.statuses().last().unwrap(),
+            &serde_json::json!({ "agents": [] })
+        );
+    }
+
+    #[tokio::test]
+    async fn unpairing_mid_question_cancels_it_once_under_the_agents_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, seen) = watched_deps(dir.path());
+        let id = "m2b-unpair-question";
+        let pairing = crate::remote::pairing::Pairing {
+            label: Some("Desk Muse".into()),
+            ..agent(id)
+        };
+        store_pairing(&deps, &pairing).unwrap();
+        deps.agent_status.set_pairings(&all_pairings(&deps));
+        let watch = deps
+            .agent_status
+            .approval_started(id, "browser_click", "click in example.com");
+        assert!(unpair_device(&deps, id).await);
+        // The call ends after the pairing is gone: nothing more is announced.
+        drop(watch);
+        let notices = seen.notifications();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert_eq!(notices[0]["outcome"], "cancelled");
+        assert_eq!(
+            notices[0]["title"],
+            "Approval cancelled — Desk Muse disconnected"
+        );
+        assert_eq!(
+            seen.statuses().last().unwrap(),
+            &serde_json::json!({ "agents": [] })
+        );
     }
 }
