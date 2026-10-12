@@ -799,10 +799,13 @@ pub async fn open_for_pairing(
             return Err(OpenError::Paused);
         }
         // M2: real tools, capped by the tier stored with this pairing.
-        let backend = Arc::new(super::agent_backend::DesktopBrowserBackend::for_pairing(
-            pairing,
-            deps.agent_pairings.clone(),
-        ));
+        let backend = Arc::new(
+            super::agent_backend::DesktopBrowserBackend::for_pairing(
+                pairing,
+                deps.agent_pairings.clone(),
+            )
+            .with_status(deps.agent_status.clone()),
+        );
         return open_mcp_channel(
             pairing,
             backend,

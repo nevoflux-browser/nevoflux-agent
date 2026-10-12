@@ -34,6 +34,7 @@ use nevoflux_protocol::session_event::{SessionEventPayload, ToolOrigin};
 use nevoflux_protocol::ExecutionTier;
 use serde_json::{json, Value};
 
+use super::agent_status::AgentStatus;
 use super::agent_tabs::AgentTabs;
 use super::mcp_tools::{
     is_allowed, AgentError, AgentToolBackend, Approval, Approver, REASON_APPROVAL_FAILED,
@@ -470,6 +471,22 @@ pub fn approval_message(
     format!("{action}\nTab: {target}\nWhy: {}", why.join("\n"))
 }
 
+/// What the desktop is shown about an open question (M2b §2.3): the action
+/// and the tab, never a value the agent typed, filled or pressed.
+///
+/// Not `approval_message` without its "Why" line: `describe_tool_action`
+/// quotes those values, which is right for the agent's own client (it sent
+/// them) and wrong for a status bar and a system notification.
+pub fn approval_summary(tool: &str, arguments: &Value, target: &str) -> String {
+    let action = match tool {
+        "browser_fill" | "browser_fill_by_id" => "Fill a form field".to_string(),
+        "browser_type" | "browser_type_by_id" => "Type text".to_string(),
+        "browser_key_press" => "Press a key".to_string(),
+        _ => crate::wasm::mcp_tool_executor::describe_tool_action(tool, &arguments.to_string()),
+    };
+    format!("{action} in {target}")
+}
+
 /// Runs an agent pairing's tool calls against the desktop browser.
 pub struct DesktopBrowserBackend {
     channel_id: String,
@@ -479,6 +496,8 @@ pub struct DesktopBrowserBackend {
     judge: Arc<dyn Judge>,
     services: ServicesFn,
     target: TargetFn,
+    /// Where this agent's calls and questions are shown (M2b §2.3).
+    status: Arc<AgentStatus>,
 }
 
 impl DesktopBrowserBackend {
@@ -498,7 +517,14 @@ impl DesktopBrowserBackend {
             judge,
             services,
             target,
+            status: super::agent_status::shared(),
         }
+    }
+
+    /// Report to `status` instead of the shared registry.
+    pub fn with_status(mut self, status: Arc<AgentStatus>) -> Self {
+        self.status = status;
+        self
     }
 
     /// The production backend for one agent pairing.
@@ -618,7 +644,16 @@ impl DesktopBrowserBackend {
                 };
                 let target = self.tab_label(plan, &effective);
                 let message = approval_message(name, &effective, &target, &prompts);
-                match approver.ask(message).await {
+                // On the desktop while it is open, announced once when it
+                // ends — also if this future is dropped mid-question.
+                let watch = self.status.approval_started(
+                    &self.channel_id,
+                    name,
+                    &approval_summary(name, &effective, &target),
+                );
+                let answer = approver.ask(message).await;
+                watch.finish(answer);
+                match answer {
                     Approval::Approved => effective,
                     Approval::Declined => {
                         return Err(AgentError::ApprovalDenied {
@@ -778,6 +813,9 @@ impl AgentToolBackend for DesktopBrowserBackend {
                 tab_url: None,
             });
         }
+        // Shown until this call is over, however it ends. Only a whitelisted
+        // name is ever shown.
+        let _running = is_allowed(name).then(|| self.status.tool_started(&self.channel_id, name));
         let started = Instant::now();
         let outcome = self.run(name, arguments, approver, services).await;
         let duration_ms = started.elapsed().as_millis() as u64;
@@ -2599,6 +2637,196 @@ mod tests {
                 1,
                 "{name}: one content block"
             );
+        }
+    }
+
+    use crate::remote::agent_status::testing;
+
+    #[test]
+    fn the_desktop_summary_never_carries_what_was_typed() {
+        for (tool, args, want) in [
+            ("browser_fill", json!({ "selector": "#pw", "value": "hunter2" }), "Fill a form field in tab 3"),
+            ("browser_fill_by_id", json!({ "element_id": "e1", "value": "hunter2" }), "Fill a form field in tab 3"),
+            ("browser_type", json!({ "selector": "#q", "text": "hunter2" }), "Type text in tab 3"),
+            ("browser_type_by_id", json!({ "element_id": "e1", "text": "hunter2" }), "Type text in tab 3"),
+            ("browser_key_press", json!({ "key": "h" }), "Press a key in tab 3"),
+            ("browser_click", json!({ "selector": "#go" }), "Click on element '#go' in tab 3"),
+            ("browser_navigate", json!({ "url": "https://x.example/" }), "Navigate to: https://x.example/ in tab 3"),
+        ] {
+            assert_eq!(approval_summary(tool, &args, "tab 3"), want, "{tool}");
+        }
+    }
+
+    fn watched_rig(
+        tier: ExecutionTier,
+        judgement: Judgement,
+    ) -> (Rig, Arc<AgentStatus>, Arc<testing::Captured>) {
+        let (status, seen, _clock) = testing::watched(500);
+        status.set_pairings(&[testing::agent(CHANNEL, 1)]);
+        seen.clear();
+        let r = rig_with(tier, judgement, |s| s);
+        let r = Rig {
+            backend: r.backend.with_status(status.clone()),
+            ..r
+        };
+        (r, status, seen)
+    }
+
+    #[tokio::test]
+    async fn the_desktop_sees_which_tool_runs_and_when_it_stops() {
+        let (r, _status, seen) = watched_rig(ExecutionTier::ReadOnly, Judgement::Allow);
+        call(&r, "browser_navigate", json!({ "url": "https://muse.example/" })).await;
+        let tools: Vec<Value> = seen
+            .statuses()
+            .iter()
+            .map(|s| s["agents"][0]["tool"].clone())
+            .collect();
+        assert_eq!(tools, vec![json!("browser_navigate"), Value::Null]);
+        assert!(seen.notifications().is_empty(), "nothing was asked");
+        seen.clear();
+        call(&r, "bash", json!({ "command": "id" })).await;
+        assert!(seen.statuses().is_empty(), "an off-whitelist name is never shown");
+    }
+
+    #[tokio::test]
+    async fn a_question_shows_on_the_desktop_while_it_is_open_without_what_was_typed() {
+        struct Peeks {
+            status: Arc<AgentStatus>,
+            during: Mutex<Option<Value>>,
+        }
+        #[async_trait]
+        impl Approver for Peeks {
+            async fn ask(&self, _message: String) -> Approval {
+                *self.during.lock().unwrap() = Some(self.status.current());
+                Approval::Approved
+            }
+        }
+        let (r, status, seen) = watched_rig(ExecutionTier::BrowserAuto, ask("why"));
+        r.tabs.record_listed(CHANNEL, SIDEBAR, &[1]);
+        let a = Peeks {
+            status: status.clone(),
+            during: Mutex::new(None),
+        };
+        let out = r
+            .backend
+            .call(
+                "browser_fill_by_id",
+                json!({ "element_id": "pw", "value": "hunter2-secret", "tab_id": 1 }),
+                &a,
+            )
+            .await
+            .unwrap();
+        assert_eq!(serde_json::to_value(&out).unwrap()["isError"], false);
+        let during = a.during.lock().unwrap().clone().expect("asked");
+        assert_eq!(during["agents"][0]["tool"], "browser_fill_by_id");
+        assert_eq!(
+            during["agents"][0]["approval"],
+            json!({ "summary": "Fill a form field in tab 1", "started_at": 500 })
+        );
+        let after = status.current();
+        assert!(after["agents"][0]["approval"].is_null());
+        assert!(after["agents"][0]["tool"].is_null());
+        let notes = seen.notifications();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0]["body"], "Fill a form field in tab 1");
+        let everything = format!("{:?}{:?}", seen.statuses(), notes);
+        assert!(!everything.contains("hunter2-secret"), "{everything}");
+    }
+
+    /// A password filled, text typed, a key pressed: the agent's own client
+    /// is still asked about the value (it sent it), the desktop never sees it
+    /// — not in the open question, the status snapshots, or the notice.
+    #[tokio::test]
+    async fn what_was_typed_reaches_the_agents_client_and_never_the_desktop() {
+        struct Peeks {
+            status: Arc<AgentStatus>,
+            during: Mutex<Option<Value>>,
+            asked: Mutex<Vec<String>>,
+        }
+        #[async_trait]
+        impl Approver for Peeks {
+            async fn ask(&self, message: String) -> Approval {
+                *self.during.lock().unwrap() = Some(self.status.current());
+                self.asked.lock().unwrap().push(message);
+                Approval::Approved
+            }
+        }
+        for (tool, args, secret, summary) in [
+            (
+                "browser_fill",
+                json!({ "selector": "#pw", "value": "Pa55w0rd!-zq81", "tab_id": 1 }),
+                "Pa55w0rd!-zq81",
+                "Fill a form field in tab 1",
+            ),
+            (
+                "browser_type_by_id",
+                json!({ "element_id": "e1", "text": "my-typed-zq82", "tab_id": 1 }),
+                "my-typed-zq82",
+                "Type text in tab 1",
+            ),
+            (
+                "browser_key_press",
+                json!({ "key": "PageDown", "tab_id": 1 }),
+                "PageDown",
+                "Press a key in tab 1",
+            ),
+        ] {
+            let (r, status, seen) = watched_rig(ExecutionTier::BrowserAuto, ask("why"));
+            r.tabs.record_listed(CHANNEL, SIDEBAR, &[1]);
+            let a = Peeks {
+                status: status.clone(),
+                during: Mutex::new(None),
+                asked: Mutex::new(Vec::new()),
+            };
+            r.backend.call(tool, args.clone(), &a).await.unwrap();
+            let target = "tab 1".to_string();
+            let prompts = vec![AskPrompt {
+                stage: "site_policy",
+                prompt: "why".into(),
+            }];
+            let asked = a.asked.lock().unwrap().clone();
+            assert_eq!(
+                asked,
+                vec![approval_message(tool, &args, &target, &prompts)],
+                "{tool}: the agent's client is asked exactly as before"
+            );
+            assert!(asked[0].contains(secret), "{tool}: {}", asked[0]);
+            let during = a.during.lock().unwrap().clone().expect("asked");
+            assert_eq!(during["agents"][0]["approval"]["summary"], summary, "{tool}");
+            let notes = seen.notifications();
+            assert_eq!(notes.len(), 1, "{tool}");
+            assert_eq!(notes[0]["body"], summary, "{tool}");
+            let everything = format!(
+                "{:?}{:?}{:?}{:?}",
+                during,
+                seen.statuses(),
+                notes,
+                status.current()
+            );
+            assert!(!everything.contains(secret), "{tool}: {everything}");
+        }
+    }
+
+    #[tokio::test]
+    async fn every_way_a_question_ends_is_announced_once() {
+        for (answer, outcome, title) in [
+            (Approval::Approved, "approved", "Muse approved"),
+            (Approval::Declined, "declined", "Muse declined"),
+            (Approval::TimedOut, "timed_out", "Muse did not answer within 60 s — denied"),
+            (Approval::Unsupported, "cancelled", "Approval cancelled — Muse disconnected"),
+            (Approval::Failed, "cancelled", "Approval cancelled — Muse disconnected"),
+        ] {
+            let (r, status, seen) = watched_rig(ExecutionTier::BrowserAuto, ask("why"));
+            r.tabs.record_listed(CHANNEL, SIDEBAR, &[1]);
+            let a = approver(answer);
+            call_with(&r, &a, "browser_click", json!({ "selector": "#go", "tab_id": 1 })).await;
+            let notes = seen.notifications();
+            assert_eq!(notes.len(), 1, "{answer:?}");
+            assert_eq!(notes[0]["source"], "agent_approval", "{answer:?}");
+            assert_eq!(notes[0]["outcome"], outcome, "{answer:?}");
+            assert_eq!(notes[0]["title"], title, "{answer:?}");
+            assert_eq!(notes[0]["body"], "Click on element '#go' in tab 1", "{answer:?}");
+            assert!(status.current()["agents"][0]["approval"].is_null(), "{answer:?}");
         }
     }
 }
