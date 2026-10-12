@@ -221,6 +221,8 @@ pub fn approval_notification(
 
 /// Where the registry's events go.
 pub trait StatusSink: Send + Sync {
+    /// Called with the registry's lock held: must not call back into
+    /// [`AgentStatus`].
     fn send(&self, event: BusEvent);
 }
 
@@ -338,12 +340,35 @@ impl AgentStatus {
         self.publish(&mut inner);
     }
 
-    /// Drop everything known about `channel` (its pairing is gone). Publishes
-    /// nothing: the caller republishes with [`Self::set_pairings`]. A watch
-    /// still running on it ends without bringing the entry back, and an open
-    /// question on it ends without a notice.
+    /// Drop everything known about `channel` (its pairing is gone). Every
+    /// question still open on it is announced as cancelled, once; no snapshot
+    /// is sent: the caller republishes with [`Self::set_pairings`]. A watch
+    /// still running on it ends later without bringing the entry back or
+    /// announcing anything.
+    ///
+    /// Call this BEFORE `set_pairings` drops the channel's row, so the
+    /// notices still carry the pairing's label.
     pub fn forget(&self, channel: &str) {
-        self.lock().channels.remove(channel);
+        let mut inner = self.lock();
+        let Some(ch) = inner.channels.remove(channel) else {
+            return;
+        };
+        let label = inner
+            .rows
+            .iter()
+            .find(|r| r.channel_id == channel)
+            .and_then(|r| r.label.clone());
+        for pending in ch.approvals {
+            self.send(BusEvent::ephemeral(
+                TOPIC_NOTIFICATION,
+                approval_notification(
+                    ApprovalOutcome::Cancelled,
+                    label.as_deref(),
+                    &pending.summary,
+                ),
+                PublisherIdentity::Internal,
+            ));
+        }
     }
 
     pub fn session_started(&self, channel: &str) {
@@ -691,24 +716,47 @@ mod tests {
     #[test]
     fn a_forgotten_channel_comes_back_with_a_fresh_state() {
         let (status, seen, clock) = testing::watched(100);
-        status.set_pairings(&[testing::agent("a", 1)]);
+        let labelled = Pairing {
+            label: Some("Claude".into()),
+            ..testing::agent("a", 1)
+        };
+        status.set_pairings(&[labelled]);
         status.session_started("a");
         let running = status.tool_started("a", "browser_snapshot");
         let asking = status.approval_started("a", "browser_click", "Click");
-        status.set_pairings(&[]);
+        seen.clear();
         status.forget("a");
+        assert!(
+            seen.statuses().is_empty(),
+            "forgetting publishes no snapshot"
+        );
+        let notes = seen.notifications();
+        assert_eq!(notes.len(), 1, "the open question is announced once");
+        assert_eq!(notes[0]["outcome"], "cancelled");
+        assert_eq!(
+            notes[0]["title"],
+            "Approval cancelled — Claude disconnected"
+        );
+        assert_eq!(notes[0]["body"], "Click");
+        status.set_pairings(&[]);
         seen.clear();
         status.forget("a");
         assert!(seen.statuses().is_empty(), "forgetting publishes nothing");
+        assert!(seen.notifications().is_empty(), "nothing left to announce");
         clock.store(200, Ordering::SeqCst);
         status.set_pairings(&[testing::agent("a", 1)]);
         let fresh = json!({ "channel_id": "a", "label": null, "state": "offline",
                             "since": 200, "tool": null, "approval": null });
         assert_eq!(status.current()["agents"][0], fresh);
         // Watches from before the forget end without bringing anything back.
+        seen.clear();
         drop(running);
         drop(asking);
         assert_eq!(status.current()["agents"][0], fresh);
+        assert!(
+            seen.notifications().is_empty(),
+            "a question forgotten is not announced again"
+        );
     }
 
     #[tokio::test]
