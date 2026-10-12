@@ -14,11 +14,13 @@
 //! (`agent_backend::approval_summary`).
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 
 use serde_json::{json, Value};
 
 use super::mcp_tools::Approval;
 use super::pairing::Pairing;
+use crate::event_bus::{BusEvent, EventBus, PublisherIdentity};
 
 /// The sticky snapshot topic (contract §1).
 pub const TOPIC_STATUS: &str = "system:agent:status";
@@ -217,6 +219,293 @@ pub fn approval_notification(
     })
 }
 
+/// Where the registry's events go.
+pub trait StatusSink: Send + Sync {
+    fn send(&self, event: BusEvent);
+}
+
+/// The daemon's event bus, fed through one task.
+///
+/// One task, not a spawn per event: two spawned publishes can land in either
+/// order, and a stale snapshot landing last would be what every later
+/// subscriber replays as the current state.
+pub struct BusSink {
+    tx: tokio::sync::mpsc::UnboundedSender<BusEvent>,
+}
+
+impl BusSink {
+    /// Must be called inside the runtime.
+    pub fn spawn(bus: Arc<EventBus>) -> Self {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<BusEvent>();
+        tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                let topic = event.topic.clone();
+                if let Err(e) = bus.publish(event).await {
+                    tracing::warn!(target: "remote", "could not publish {topic}: {e}");
+                }
+            }
+        });
+        Self { tx }
+    }
+}
+
+impl StatusSink for BusSink {
+    fn send(&self, event: BusEvent) {
+        let _ = self.tx.send(event);
+    }
+}
+
+#[derive(Default)]
+struct Inner {
+    rows: Vec<AgentRow>,
+    channels: HashMap<String, ChannelState>,
+    next_call: u64,
+}
+
+/// What every agent channel is doing, published whole on every change.
+pub struct AgentStatus {
+    inner: Mutex<Inner>,
+    sink: RwLock<Option<Arc<dyn StatusSink>>>,
+    clock: Box<dyn Fn() -> i64 + Send + Sync>,
+}
+
+impl Default for AgentStatus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AgentStatus {
+    /// A registry that sends nothing until [`Self::attach`] gives it a sink.
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::default(),
+            sink: RwLock::new(None),
+            clock: Box::new(unix_now),
+        }
+    }
+
+    pub fn with_sink(self, sink: Arc<dyn StatusSink>) -> Self {
+        self.attach(sink);
+        self
+    }
+
+    pub fn with_clock(mut self, clock: impl Fn() -> i64 + Send + Sync + 'static) -> Self {
+        self.clock = Box::new(clock);
+        self
+    }
+
+    /// Start (or redirect) publishing.
+    pub fn attach(&self, sink: Arc<dyn StatusSink>) {
+        *self.sink.write().unwrap_or_else(|p| p.into_inner()) = Some(sink);
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn send(&self, event: BusEvent) {
+        if let Some(sink) = self.sink.read().unwrap_or_else(|p| p.into_inner()).as_ref() {
+            sink.send(event);
+        }
+    }
+
+    /// Recompute and send the snapshot. Called with `inner` held, so
+    /// snapshots leave in the order they were made.
+    fn publish(&self, inner: &mut Inner) {
+        let now = (self.clock)();
+        let Inner { rows, channels, .. } = inner;
+        let snap = snapshot(rows, channels, now);
+        self.send(BusEvent::sticky(
+            TOPIC_STATUS,
+            snap,
+            PublisherIdentity::Internal,
+        ));
+    }
+
+    /// The snapshot as it stands, without sending it.
+    pub fn current(&self) -> Value {
+        let now = (self.clock)();
+        let mut inner = self.lock();
+        let Inner { rows, channels, .. } = &mut *inner;
+        snapshot(rows, channels, now)
+    }
+
+    /// The pairings changed (startup, a new pairing, pause, resume, unpair).
+    pub fn set_pairings(&self, pairings: &[Pairing]) {
+        let mut inner = self.lock();
+        inner.rows = AgentRow::from_pairings(pairings);
+        self.publish(&mut inner);
+    }
+
+    /// Drop everything known about `channel` (its pairing is gone). Publishes
+    /// nothing: the caller republishes with [`Self::set_pairings`]. A watch
+    /// still running on it ends without bringing the entry back, and an open
+    /// question on it ends without a notice.
+    pub fn forget(&self, channel: &str) {
+        self.lock().channels.remove(channel);
+    }
+
+    pub fn session_started(&self, channel: &str) {
+        let mut inner = self.lock();
+        inner
+            .channels
+            .entry(channel.to_string())
+            .or_default()
+            .connected = true;
+        self.publish(&mut inner);
+    }
+
+    pub fn session_ended(&self, channel: &str) {
+        let mut inner = self.lock();
+        inner
+            .channels
+            .entry(channel.to_string())
+            .or_default()
+            .connected = false;
+        self.publish(&mut inner);
+    }
+
+    /// A whitelisted call began; it is shown until the watch is dropped.
+    pub fn tool_started(self: &Arc<Self>, channel: &str, tool: &str) -> ToolWatch {
+        let mut inner = self.lock();
+        inner.next_call += 1;
+        let id = inner.next_call;
+        inner
+            .channels
+            .entry(channel.to_string())
+            .or_default()
+            .tools
+            .push((id, tool.to_string()));
+        self.publish(&mut inner);
+        ToolWatch {
+            status: self.clone(),
+            channel: channel.to_string(),
+            id,
+        }
+    }
+
+    fn tool_ended(&self, channel: &str, id: u64) {
+        let mut inner = self.lock();
+        if let Some(ch) = inner.channels.get_mut(channel) {
+            ch.tools.retain(|(call, _)| *call != id);
+        }
+        self.publish(&mut inner);
+    }
+
+    /// A question was put; it is shown until the watch finishes or drops.
+    pub fn approval_started(
+        self: &Arc<Self>,
+        channel: &str,
+        tool: &str,
+        summary: &str,
+    ) -> ApprovalWatch {
+        let started_at = (self.clock)();
+        let mut inner = self.lock();
+        inner.next_call += 1;
+        let id = inner.next_call;
+        inner
+            .channels
+            .entry(channel.to_string())
+            .or_default()
+            .approvals
+            .push(PendingApproval {
+                id,
+                tool: tool.to_string(),
+                summary: summary.to_string(),
+                started_at,
+            });
+        self.publish(&mut inner);
+        ApprovalWatch {
+            status: self.clone(),
+            channel: channel.to_string(),
+            id,
+            finished: false,
+        }
+    }
+
+    /// The question ended: one notice, then the snapshot without it. A
+    /// question already ended is not announced again.
+    fn approval_ended(&self, channel: &str, id: u64, outcome: ApprovalOutcome) {
+        let mut inner = self.lock();
+        let Some(pending) = inner.channels.get_mut(channel).and_then(|ch| {
+            let at = ch.approvals.iter().position(|a| a.id == id)?;
+            Some(ch.approvals.remove(at))
+        }) else {
+            return;
+        };
+        let label = inner
+            .rows
+            .iter()
+            .find(|r| r.channel_id == channel)
+            .and_then(|r| r.label.clone());
+        self.send(BusEvent::ephemeral(
+            TOPIC_NOTIFICATION,
+            approval_notification(outcome, label.as_deref(), &pending.summary),
+            PublisherIdentity::Internal,
+        ));
+        self.publish(&mut inner);
+    }
+}
+
+/// A running call. Dropping it takes the call off the snapshot, however the
+/// call ended — returned, failed, or its future dropped.
+#[must_use]
+pub struct ToolWatch {
+    status: Arc<AgentStatus>,
+    channel: String,
+    id: u64,
+}
+
+impl Drop for ToolWatch {
+    fn drop(&mut self) {
+        self.status.tool_ended(&self.channel, self.id);
+    }
+}
+
+/// An open question. [`ApprovalWatch::finish`] announces its outcome; dropped
+/// without one — the call's future dropped mid-question — it is announced as
+/// cancelled. Either way, exactly once.
+#[must_use]
+pub struct ApprovalWatch {
+    status: Arc<AgentStatus>,
+    channel: String,
+    id: u64,
+    finished: bool,
+}
+
+impl ApprovalWatch {
+    pub fn finish(mut self, answer: Approval) {
+        self.finished = true;
+        self.status
+            .approval_ended(&self.channel, self.id, ApprovalOutcome::of(answer));
+    }
+}
+
+impl Drop for ApprovalWatch {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.status
+                .approval_ended(&self.channel, self.id, ApprovalOutcome::Cancelled);
+        }
+    }
+}
+
+/// The process's one registry. `server.rs` attaches it to the event bus at
+/// startup and hands it to `ControlDeps`; channels and backends built without
+/// one explicitly report here.
+pub fn shared() -> Arc<AgentStatus> {
+    static SHARED: OnceLock<Arc<AgentStatus>> = OnceLock::new();
+    SHARED.get_or_init(|| Arc::new(AgentStatus::new())).clone()
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 pub(crate) mod testing {
     use super::*;
@@ -237,12 +526,221 @@ pub(crate) mod testing {
             paused: false,
         }
     }
+
+    use crate::event_bus::Delivery;
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    /// Everything a registry sent, in order.
+    #[derive(Default)]
+    pub(crate) struct Captured(Mutex<Vec<BusEvent>>);
+
+    impl StatusSink for Captured {
+        fn send(&self, event: BusEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    impl Captured {
+        /// Every snapshot, oldest first; each must have been sticky.
+        pub(crate) fn statuses(&self) -> Vec<Value> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.topic == TOPIC_STATUS)
+                .map(|e| {
+                    assert_eq!(e.delivery, Delivery::Sticky, "a snapshot is sticky");
+                    e.payload.clone()
+                })
+                .collect()
+        }
+
+        /// Every approval notice, oldest first; each must have been ephemeral.
+        pub(crate) fn notifications(&self) -> Vec<Value> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.topic == TOPIC_NOTIFICATION)
+                .map(|e| {
+                    assert_eq!(e.delivery, Delivery::Ephemeral, "a notice is not replayed");
+                    e.payload.clone()
+                })
+                .collect()
+        }
+
+        pub(crate) fn clear(&self) {
+            self.0.lock().unwrap().clear();
+        }
+    }
+
+    /// A registry sending into a `Captured`, its clock reading `at` until moved.
+    pub(crate) fn watched(at: i64) -> (Arc<AgentStatus>, Arc<Captured>, Arc<AtomicI64>) {
+        let seen = Arc::new(Captured::default());
+        let clock = Arc::new(AtomicI64::new(at));
+        let c = clock.clone();
+        let status = AgentStatus::new()
+            .with_sink(seen.clone())
+            .with_clock(move || c.load(Ordering::SeqCst));
+        (Arc::new(status), seen, clock)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::remote::pairing::PairingKind;
+
+    use crate::event_bus::{BackpressurePolicy, Delivery, SubscriberIdentity, TopicPattern};
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    #[test]
+    fn every_change_publishes_a_full_sticky_snapshot() {
+        let (status, seen, clock) = testing::watched(100);
+        status.set_pairings(&[testing::agent("a", 1)]);
+        status.session_started("a");
+        clock.store(130, Ordering::SeqCst);
+        let running = status.tool_started("a", "browser_screenshot");
+        drop(running);
+        let shown: Vec<(Value, Value, Value)> = seen
+            .statuses()
+            .iter()
+            .map(|s| {
+                let a = &s["agents"][0];
+                (a["state"].clone(), a["since"].clone(), a["tool"].clone())
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            vec![
+                (json!("offline"), json!(100), Value::Null),
+                (json!("connected"), json!(100), Value::Null),
+                (json!("connected"), json!(100), json!("browser_screenshot")),
+                (json!("connected"), json!(100), Value::Null),
+            ]
+        );
+        assert!(seen.notifications().is_empty(), "no question, no notice");
+    }
+
+    #[test]
+    fn an_approval_is_announced_exactly_once() {
+        let (status, seen, clock) = testing::watched(100);
+        let labelled = Pairing {
+            label: Some("Claude".into()),
+            ..testing::agent("a", 1)
+        };
+        status.set_pairings(&[labelled]);
+        let watch =
+            status.approval_started("a", "browser_click", "Click on element '#go' in tab 1");
+        let open = status.current();
+        assert_eq!(open["agents"][0]["tool"], "browser_click");
+        assert_eq!(
+            open["agents"][0]["approval"],
+            json!({ "summary": "Click on element '#go' in tab 1", "started_at": 100 })
+        );
+        assert!(
+            seen.notifications().is_empty(),
+            "nothing is announced when a question opens"
+        );
+        clock.store(110, Ordering::SeqCst);
+        watch.finish(Approval::Approved);
+        let notes = seen.notifications();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0]["title"], "Claude approved");
+        assert_eq!(notes[0]["body"], "Click on element '#go' in tab 1");
+        assert_eq!(notes[0]["outcome"], "approved");
+        assert!(status.current()["agents"][0]["approval"].is_null());
+    }
+
+    #[test]
+    fn an_approval_dropped_unanswered_is_announced_as_cancelled() {
+        // A call's future can be dropped while its question is open (its
+        // session torn down). The desktop must still hear how it ended, once.
+        let (status, seen, _clock) = testing::watched(100);
+        status.set_pairings(&[testing::agent("a", 1)]);
+        drop(status.approval_started("a", "browser_click", "Click on element '#go' in tab 1"));
+        let notes = seen.notifications();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0]["outcome"], "cancelled");
+        assert_eq!(notes[0]["title"], "Approval cancelled — Muse disconnected");
+        assert!(status.current()["agents"][0]["approval"].is_null());
+    }
+
+    #[test]
+    fn two_calls_at_once_each_clear_only_their_own() {
+        let (status, _seen, _clock) = testing::watched(100);
+        status.set_pairings(&[testing::agent("a", 1)]);
+        let first = status.tool_started("a", "browser_snapshot");
+        let second = status.tool_started("a", "browser_screenshot");
+        drop(first);
+        assert_eq!(status.current()["agents"][0]["tool"], "browser_screenshot");
+        drop(second);
+        assert!(status.current()["agents"][0]["tool"].is_null());
+    }
+
+    #[test]
+    fn without_a_sink_nothing_is_sent_and_nothing_breaks() {
+        let status = Arc::new(AgentStatus::new());
+        status.set_pairings(&[testing::agent("a", 1)]);
+        status.session_started("a");
+        drop(status.approval_started("a", "browser_click", "Click"));
+        assert_eq!(status.current()["agents"][0]["state"], "connected");
+    }
+
+    #[test]
+    fn a_forgotten_channel_comes_back_with_a_fresh_state() {
+        let (status, seen, clock) = testing::watched(100);
+        status.set_pairings(&[testing::agent("a", 1)]);
+        status.session_started("a");
+        let running = status.tool_started("a", "browser_snapshot");
+        let asking = status.approval_started("a", "browser_click", "Click");
+        status.set_pairings(&[]);
+        status.forget("a");
+        seen.clear();
+        status.forget("a");
+        assert!(seen.statuses().is_empty(), "forgetting publishes nothing");
+        clock.store(200, Ordering::SeqCst);
+        status.set_pairings(&[testing::agent("a", 1)]);
+        let fresh = json!({ "channel_id": "a", "label": null, "state": "offline",
+                            "since": 200, "tool": null, "approval": null });
+        assert_eq!(status.current()["agents"][0], fresh);
+        // Watches from before the forget end without bringing anything back.
+        drop(running);
+        drop(asking);
+        assert_eq!(status.current()["agents"][0], fresh);
+    }
+
+    #[tokio::test]
+    async fn the_bus_replays_the_latest_snapshot_to_a_late_subscriber() {
+        let bus = Arc::new(EventBus::new());
+        let status = AgentStatus::new().with_sink(Arc::new(BusSink::spawn(bus.clone())));
+        status.set_pairings(&[testing::agent("a", 1)]);
+        status.session_started("a");
+        for _ in 0..200 {
+            if bus.total_published() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(bus.total_published(), 2);
+        let mut late = bus
+            .subscribe(
+                TopicPattern::exact(TOPIC_STATUS),
+                SubscriberIdentity::Extension {
+                    proxy_id: "sidebar".into(),
+                },
+                BackpressurePolicy::DropOldest,
+                256,
+            )
+            .expect("system:* is open to the extension");
+        let mut last = None;
+        while let Ok(ev) = late.rx.try_recv() {
+            assert_eq!(ev.delivery, Delivery::Sticky);
+            last = Some(ev.payload);
+        }
+        assert_eq!(last.expect("replayed")["agents"][0]["state"], "connected");
+    }
 
     #[test]
     fn a_snapshot_lists_agents_oldest_first_and_never_a_device() {
