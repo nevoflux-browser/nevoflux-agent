@@ -9653,6 +9653,79 @@ async fn handle_chat_message(
                     }
                 }
 
+                // --- Pause one agent (M2b §2.2): pairing kept, channel closed,
+                //     not dialled again until resumed. Local only, like
+                //     `remote.agent_set_tier`: absent from `PORTAL_QUERIES`, so
+                //     nothing arriving over a relay can pause or resume one.
+                "remote.agent_pause" => {
+                    let channel = params
+                        .get("control_channel_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let fail = |code: &str, message: String| {
+                        serde_json::json!({
+                            "type": "system_response",
+                            "payload": {
+                                "request_id": request_id,
+                                "command": "remote.agent_pause",
+                                "success": false,
+                                "error": { "code": code, "message": message }
+                            }
+                        })
+                    };
+                    match crate::remote::start::control_deps() {
+                        None => fail("NOT_READY", "the daemon is still starting".into()),
+                        Some(deps) => match crate::remote::start::pause_agent(deps, &channel).await {
+                            Err(e) => fail(e.code(), e.to_string()),
+                            Ok(()) => serde_json::json!({
+                                "type": "system_response",
+                                "payload": {
+                                    "request_id": request_id,
+                                    "command": "remote.agent_pause",
+                                    "success": true,
+                                    "data": { "paused": true }
+                                }
+                            }),
+                        },
+                    }
+                }
+
+                // --- Resume a paused agent (M2b §2.2). Local only.
+                "remote.agent_resume" => {
+                    let channel = params
+                        .get("control_channel_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let fail = |code: &str, message: String| {
+                        serde_json::json!({
+                            "type": "system_response",
+                            "payload": {
+                                "request_id": request_id,
+                                "command": "remote.agent_resume",
+                                "success": false,
+                                "error": { "code": code, "message": message }
+                            }
+                        })
+                    };
+                    match crate::remote::start::control_deps() {
+                        None => fail("NOT_READY", "the daemon is still starting".into()),
+                        Some(deps) => match crate::remote::start::resume_agent(deps, &channel).await {
+                            Err(e) => fail(e.code(), e.to_string()),
+                            Ok(opened) => serde_json::json!({
+                                "type": "system_response",
+                                "payload": {
+                                    "request_id": request_id,
+                                    "command": "remote.agent_resume",
+                                    "success": true,
+                                    "data": { "paused": false, "opened": opened }
+                                }
+                            }),
+                        },
+                    }
+                }
+
                 // --- Remote-gateway S5: start a portal session. Mints a DO JWT
                 // from the stored account token, generates a channel id + a
                 // human-speakable pairing code (the E2E secret), registers a
