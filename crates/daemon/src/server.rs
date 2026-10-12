@@ -9742,6 +9742,9 @@ async fn handle_chat_message(
                                 Err(e @ crate::remote::start::OpenError::JwtMint(_)) => {
                                     fail("JWT_MINT_ERROR", e.to_string())
                                 }
+                                Err(e @ crate::remote::start::OpenError::Paused) => {
+                                    fail("PAUSED", e.to_string())
+                                }
                             }
                         }
                         _ => fail("REMOTE_NOT_WIRED", "remote gateway not configured".into()),

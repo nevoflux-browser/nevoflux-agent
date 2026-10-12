@@ -52,6 +52,10 @@ pub enum OpenError {
     /// The account service refused to mint a relay JWT.
     #[error("{0}")]
     JwtMint(String),
+    /// The person paused this agent on the desktop (M2b B1). Not a fault:
+    /// nothing is dialled until they resume it.
+    #[error("this agent is paused on the desktop")]
+    Paused,
 }
 
 /// A live channel, and the means to end it.
@@ -585,6 +589,7 @@ pub async fn open_mcp_channel(
     pairing: &super::pairing::Pairing,
     backend: Arc<dyn super::mcp_tools::AgentToolBackend>,
     registry: &Arc<Mutex<GatewayRegistry>>,
+    agent_pairings: &super::pairing::PairingStore,
 ) -> Result<ChannelHandle, OpenError> {
     open_mcp_channel_with_token(
         pairing,
@@ -592,18 +597,21 @@ pub async fn open_mcp_channel(
         TokenSource::stored(),
         account_base(),
         registry,
+        agent_pairings,
     )
     .await
 }
 
 /// The sequence itself, with the token source and account origin passed in so
-/// it is testable.
+/// it is testable. `agent_pairings` is read once the channel is filed, to catch
+/// a pause that landed while the preflight was in flight.
 pub async fn open_mcp_channel_with_token(
     pairing: &super::pairing::Pairing,
     backend: Arc<dyn super::mcp_tools::AgentToolBackend>,
     tokens: TokenSource,
     base: String,
     registry: &Arc<Mutex<GatewayRegistry>>,
+    agent_pairings: &super::pairing::PairingStore,
 ) -> Result<ChannelHandle, OpenError> {
     // An agent channel has no plaintext mode (design §5.1): without a key
     // there is nothing to open, and nothing is registered or dialled.
@@ -611,6 +619,8 @@ pub async fn open_mcp_channel_with_token(
         .control_key()
         .ok_or_else(|| OpenError::JwtMint("the agent pairing has no usable key".into()))?;
     preflight(&base, &tokens).await?;
+    #[cfg(test)]
+    test_hooks::preflight_passed(&pairing.control_channel_id);
 
     let channel_id = pairing.control_channel_id.clone();
     let sink = Arc::new(super::ws::WsSink::new());
@@ -640,10 +650,53 @@ pub async fn open_mcp_channel_with_token(
             super::ws::run_mcp_socket(&relay, &ch, base, tokens, sink, gw, cancel).await;
         });
     }
-    if let Some(previous) = channels().lock().await.insert(channel_id, handle.clone()) {
+    if let Some(previous) = channels()
+        .lock()
+        .await
+        .insert(channel_id.clone(), handle.clone())
+    {
         previous.close().await;
     }
+    // A pause that landed during the preflight wrote the disk, then found no
+    // channel to close. Now that this one is filed, look again: from here on a
+    // pause either shows up in this read or finds the channel and closes it.
+    if paused_on_disk(agent_pairings, &channel_id) {
+        close_channel(&channel_id).await;
+        handle.close().await;
+        return Err(OpenError::Paused);
+    }
     Ok(handle)
+}
+
+/// A hook run once the preflight has passed, so a test can land a pause in
+/// the window before the channel is filed. Keyed by channel id: tests run side
+/// by side and each must only ever meet its own.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    type Hook = Box<dyn FnOnce() + Send>;
+
+    fn hooks() -> &'static Mutex<HashMap<String, Hook>> {
+        static H: OnceLock<Mutex<HashMap<String, Hook>>> = OnceLock::new();
+        H.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Run `hook` the next time a channel with this id passes its preflight.
+    pub(crate) fn on_preflight_passed(channel_id: &str, hook: impl FnOnce() + Send + 'static) {
+        hooks()
+            .lock()
+            .unwrap()
+            .insert(channel_id.to_string(), Box::new(hook));
+    }
+
+    pub(super) fn preflight_passed(channel_id: &str) {
+        let hook = hooks().lock().unwrap().remove(channel_id);
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
 }
 
 /// Pair an AI agent: mint one channel, bring it up, persist it.
@@ -700,6 +753,36 @@ pub fn all_pairings(deps: &ControlDeps) -> Vec<super::pairing::Pairing> {
     all
 }
 
+/// Whether the store on disk has this agent paused.
+///
+/// Fails closed: a store that cannot be read cannot say the person did not
+/// pause the agent, so it is kept away. The error names the file, never what
+/// is in it.
+fn paused_on_disk(agent_pairings: &super::pairing::PairingStore, channel_id: &str) -> bool {
+    match agent_pairings.load() {
+        Ok(all) => all
+            .iter()
+            .any(|p| p.control_channel_id == channel_id && p.paused),
+        Err(e) => {
+            tracing::warn!(
+                target: "remote",
+                channel = %channel_id,
+                "treating the agent as paused: {e}"
+            );
+            true
+        }
+    }
+}
+
+/// Whether an agent is paused, by the copy in hand or by what is on disk.
+///
+/// The disk is the authority: `pause_agent` writes it before closing the
+/// channel, so an open racing the pause finds it here whichever copy it was
+/// handed.
+fn is_paused(deps: &ControlDeps, pairing: &super::pairing::Pairing) -> bool {
+    pairing.paused || paused_on_disk(&deps.agent_pairings, &pairing.control_channel_id)
+}
+
 /// Bring up one pairing's control channel.
 pub async fn open_for_pairing(
     deps: &ControlDeps,
@@ -708,12 +791,18 @@ pub async fn open_for_pairing(
     // Routed by kind wherever the row came from: an agent row found in the
     // device store is still served as an agent, never as a device.
     if pairing.is_agent() {
+        // Paused on the desktop (M2b B1): never dialled, so the agent sees a
+        // desktop that is not there. Every open — startup, pairing, resume —
+        // comes through here.
+        if is_paused(deps, pairing) {
+            return Err(OpenError::Paused);
+        }
         // M2: real tools, capped by the tier stored with this pairing.
         let backend = Arc::new(super::agent_backend::DesktopBrowserBackend::for_pairing(
             pairing,
             deps.agent_pairings.clone(),
         ));
-        return open_mcp_channel(pairing, backend, &deps.registry).await;
+        return open_mcp_channel(pairing, backend, &deps.registry, &deps.agent_pairings).await;
     }
     let injector: Arc<dyn super::inject::Injector> = Arc::new(super::inject::ChannelInjector::new(
         deps.msg_tx.clone(),
@@ -832,10 +921,12 @@ pub async fn restore_pairings(deps: &ControlDeps) -> usize {
     if pairings.is_empty() {
         return 0;
     }
-    let mut up = 0;
+    let (mut up, mut paused) = (0, 0);
     for pairing in &pairings {
         match open_for_pairing(deps, pairing).await {
             Ok(_) => up += 1,
+            // Not a failure: the person asked for this agent to stay away.
+            Err(OpenError::Paused) => paused += 1,
             Err(e) => tracing::error!(
                 target: "remote",
                 channel = %pairing.control_channel_id,
@@ -843,7 +934,11 @@ pub async fn restore_pairings(deps: &ControlDeps) -> usize {
             ),
         }
     }
-    tracing::info!(target: "remote", "{up} of {} paired devices reconnected", pairings.len());
+    tracing::info!(
+        target: "remote",
+        "{up} of {} paired devices reconnected, {paused} paused",
+        pairings.len()
+    );
     up
 }
 
@@ -1227,6 +1322,9 @@ mod tests {
             file_token(&dir, "OLD"),
             srv.base.clone(),
             &registry,
+            &crate::remote::pairing::PairingStore::new(
+                dir.path().join("agent-pairings.json"),
+            ),
         )
         .await;
         assert!(matches!(err_of(outcome), OpenError::NotLoggedIn));
@@ -1325,6 +1423,9 @@ mod tests {
             no_token(&dir),
             "http://127.0.0.1:1".into(),
             &registry,
+            &crate::remote::pairing::PairingStore::new(
+                dir.path().join("agent-pairings.json"),
+            ),
         )
         .await;
         assert!(matches!(outcome, Err(OpenError::NotLoggedIn)));
@@ -1510,6 +1611,9 @@ mod tests {
             fixed_token(&dir, "token"),
             "http://127.0.0.1:1".into(),
             &registry,
+            &crate::remote::pairing::PairingStore::new(
+                dir.path().join("agent-pairings.json"),
+            ),
         )
         .await;
         match err_of(outcome) {
@@ -1599,7 +1703,7 @@ mod tests {
             deps.registry.lock().await.is_empty(),
             "no gateway was registered, so nothing was dialled"
         );
-        assert!(open_channels().await.is_empty());
+        assert!(!open_channels().await.contains(&"a1".to_string()));
         let first = &seen.statuses()[0];
         assert_eq!(first["agents"].as_array().unwrap().len(), 1, "one entry per agent");
         assert_eq!(first["agents"][0]["channel_id"], "a1");
@@ -1617,5 +1721,112 @@ mod tests {
         let first = &seen.statuses()[0];
         assert_eq!(first["agents"].as_array().unwrap().len(), 1);
         assert_eq!(first["agents"][0]["channel_id"], "a1");
+    }
+
+    #[test]
+    fn paused_reads_as_a_reason_not_a_fault() {
+        assert_eq!(OpenError::Paused.to_string(), "this agent is paused on the desktop");
+    }
+
+    #[tokio::test]
+    async fn a_paused_agent_is_not_dialled() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps(dir.path());
+        // Keyless too: were it dialled, the refusal would be the missing key.
+        let paused = crate::remote::pairing::Pairing {
+            paused: true,
+            control_key: "not hex".into(),
+            ..agent("a1")
+        };
+        assert!(matches!(err_of(open_for_pairing(&deps, &paused).await), OpenError::Paused));
+        assert!(deps.registry.lock().await.is_empty(), "nothing registered");
+    }
+
+    #[tokio::test]
+    async fn a_pairing_paused_on_disk_is_not_dialled_even_from_a_stale_copy() {
+        // A copy loaded before the person pressed Pause must not bring the
+        // agent back.
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps(dir.path());
+        let stale = crate::remote::pairing::Pairing {
+            control_key: "not hex".into(),
+            ..agent("a1")
+        };
+        store_pairing(&deps, &stale).unwrap();
+        assert!(deps.agent_pairings.set_paused("a1", true).unwrap());
+        assert!(!stale.paused);
+        assert!(matches!(err_of(open_for_pairing(&deps, &stale).await), OpenError::Paused));
+    }
+
+    #[tokio::test]
+    async fn a_paused_agent_stays_down_through_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, seen) = watched_deps(dir.path());
+        store_pairing(
+            &deps,
+            &crate::remote::pairing::Pairing {
+                paused: true,
+                ..agent("a1")
+            },
+        )
+        .unwrap();
+        assert_eq!(restore_pairings(&deps).await, 0);
+        assert!(deps.registry.lock().await.is_empty(), "nothing dialled");
+        assert!(!open_channels().await.contains(&"a1".to_string()));
+        assert_eq!(seen.statuses()[0]["agents"][0]["state"], "paused");
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_agent_store_counts_as_paused() {
+        // Fails closed: when the store cannot say whether the person paused
+        // this agent, it is not dialled. Keyless, so a fail-open would show
+        // as the missing key rather than reach the network.
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps(dir.path());
+        std::fs::write(dir.path().join("agent-pairings.json"), "{ nope").unwrap();
+        let keyless = crate::remote::pairing::Pairing {
+            control_key: "not hex".into(),
+            ..agent("a1")
+        };
+        assert!(matches!(err_of(open_for_pairing(&deps, &keyless).await), OpenError::Paused));
+        assert!(deps.registry.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_pause_landing_while_the_channel_opens_closes_it() {
+        // The pause writes the disk, then closes whatever channel it finds.
+        // One that is still in its preflight is not findable yet, so the open
+        // has to look at the disk again once it has filed the channel.
+        let srv =
+            crate::remote::account::test_server::AccountServer::start(200, r#"{"token":"j"}"#)
+                .await;
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps(dir.path());
+        let pairing = agent("race-1");
+        store_pairing(&deps, &pairing).unwrap();
+        let tokens = file_token(&dir, "TOK");
+        let (store, token_path) = (
+            deps.agent_pairings.clone(),
+            dir.path().join("account-token"),
+        );
+        test_hooks::on_preflight_passed("race-1", move || {
+            assert!(store.set_paused("race-1", true).unwrap());
+            // Nothing left to mint with: the dialler that is about to be
+            // spawned can never reach a relay.
+            std::fs::remove_file(&token_path).unwrap();
+        });
+        let outcome = open_mcp_channel_with_token(
+            &pairing,
+            Arc::new(crate::remote::mcp_tools::UnavailableBackend),
+            tokens,
+            srv.base.clone(),
+            &deps.registry,
+            &deps.agent_pairings,
+        )
+        .await;
+        assert!(matches!(err_of(outcome), OpenError::Paused));
+        assert_eq!(srv.hits(), 1, "the preflight ran");
+        assert!(!open_channels().await.contains(&"race-1".to_string()));
+        assert!(deps.registry.lock().await.is_empty(), "nothing left registered");
     }
 }
