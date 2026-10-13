@@ -34,7 +34,7 @@ use nevoflux_protocol::session_event::{SessionEventPayload, ToolOrigin};
 use nevoflux_protocol::ExecutionTier;
 use serde_json::{json, Value};
 
-use super::agent_status::AgentStatus;
+use super::agent_status::{AgentStatus, ApprovalOutcome};
 use super::agent_tabs::AgentTabs;
 use super::mcp_tools::{
     is_allowed, AgentError, AgentToolBackend, Approval, Approver, REASON_APPROVAL_FAILED,
@@ -458,6 +458,28 @@ pub fn annotate_owned(result: &str, owned: &[i64]) -> String {
     v.to_string()
 }
 
+/// The error for a question that did not end in approval.
+fn refused(name: &str, answer: Approval) -> AgentError {
+    match answer {
+        Approval::Declined => AgentError::ApprovalDenied {
+            reason: REASON_DECLINED,
+            message: format!("the person declined {name}"),
+        },
+        Approval::Unsupported => AgentError::ApprovalDenied {
+            reason: REASON_CLIENT_CANNOT_APPROVE,
+            message: format!(
+                "{name} needs the person's approval and this client cannot ask for it"
+            ),
+        },
+        Approval::TimedOut => AgentError::ApprovalTimeout,
+        // Approved never reaches here; were it to, refusing is the safe side.
+        Approval::Failed | Approval::Approved => AgentError::ApprovalDenied {
+            reason: REASON_APPROVAL_FAILED,
+            message: format!("the approval request for {name} failed"),
+        },
+    }
+}
+
 /// The question put to the person: the action as the desktop dialog words it
 /// (`describe_tool_action`), the tab, and why it is being asked.
 pub fn approval_message(
@@ -621,11 +643,13 @@ impl DesktopBrowserBackend {
             }
         }
         // 4. The rules, judged on exactly the arguments that will run.
-        let arguments = match self.judge.judge(name, &arguments, &services).await {
-            Judgement::Allow => arguments,
+        // An approved question stays open until the tier is checked again
+        // below, so the desktop hears how the call actually ended.
+        let (arguments, approved) = match self.judge.judge(name, &arguments, &services).await {
+            Judgement::Allow => (arguments, None),
             Judgement::Rewrite {
                 arguments: rewritten,
-            } => settle(name, plan, planned_tab, rewritten)?,
+            } => (settle(name, plan, planned_tab, rewritten)?, None),
             Judgement::Deny(denial) => {
                 return Err(AgentError::ApprovalDenied {
                     reason: REASON_RULE,
@@ -652,30 +676,11 @@ impl DesktopBrowserBackend {
                     &approval_summary(name, &effective, &target),
                 );
                 let answer = approver.ask(message).await;
-                watch.finish(answer);
-                match answer {
-                    Approval::Approved => effective,
-                    Approval::Declined => {
-                        return Err(AgentError::ApprovalDenied {
-                            reason: REASON_DECLINED,
-                            message: format!("the person declined {name}"),
-                        })
-                    }
-                    Approval::Unsupported => {
-                        return Err(AgentError::ApprovalDenied {
-                            reason: REASON_CLIENT_CANNOT_APPROVE,
-                            message: format!(
-                            "{name} needs the person's approval and this client cannot ask for it"
-                        ),
-                        })
-                    }
-                    Approval::TimedOut => return Err(AgentError::ApprovalTimeout),
-                    Approval::Failed => {
-                        return Err(AgentError::ApprovalDenied {
-                            reason: REASON_APPROVAL_FAILED,
-                            message: format!("the approval request for {name} failed"),
-                        })
-                    }
+                if answer == Approval::Approved {
+                    (effective, Some(watch))
+                } else {
+                    watch.finish(answer);
+                    return Err(refused(name, answer));
                 }
             }
         };
@@ -683,10 +688,16 @@ impl DesktopBrowserBackend {
         // agent, while the question was open.
         let tier = self.tier.tier();
         if !nevoflux_protocol::tier_auto_approves(name, tier) {
+            if let Some(watch) = approved {
+                watch.finish_as(ApprovalOutcome::Stopped);
+            }
             return Err(AgentError::TierDenied {
                 tier,
                 required: nevoflux_protocol::minimum_tier(name),
             });
+        }
+        if let Some(watch) = approved {
+            watch.finish(Approval::Approved);
         }
         // The call, bounded. The browser may have changed while the rules
         // or the person were deciding, and the request is re-addressed when
@@ -2842,6 +2853,39 @@ mod tests {
             assert_eq!(notes[0]["body"], "Click on element '#go' in tab 1", "{answer:?}");
             assert!(status.current()["agents"][0]["approval"].is_null(), "{answer:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn an_approval_the_lowered_tier_overrules_is_announced_as_stopped() {
+        // Muse said yes, but the person lowered the tier while it was asked:
+        // nothing runs, so the desktop must not read "Muse approved" alone.
+        let (r, status, seen) = watched_rig(ExecutionTier::BrowserAuto, ask("why"));
+        r.tabs.record_listed(CHANNEL, SIDEBAR, &[1]);
+        let a = LowersTier {
+            tier: r.tier.clone(),
+        };
+        let out = serde_json::to_value(
+            r.backend
+                .call(
+                    "browser_click",
+                    json!({ "selector": "#go", "tab_id": 1 }),
+                    &a,
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(error(&out)["code"], "tier_denied");
+        assert!(sent(&r).is_empty());
+        let notes = seen.notifications();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0]["outcome"], "stopped");
+        assert_eq!(
+            notes[0]["title"],
+            "Muse approved — stopped: the agent's tier was lowered"
+        );
+        assert_eq!(notes[0]["body"], "Click on element '#go' in tab 1");
+        assert!(status.current()["agents"][0]["approval"].is_null());
     }
 
     /// M2b §2.2, end to end through the real gateway, backend and registry:

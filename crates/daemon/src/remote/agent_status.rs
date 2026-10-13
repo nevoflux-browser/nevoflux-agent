@@ -62,6 +62,9 @@ pub enum ApprovalOutcome {
     /// The client cannot be asked, the question could not be put, or the
     /// session went away while it was open.
     Cancelled,
+    /// Approved, but the person lowered the agent's tier while it was asked,
+    /// so the call did not run.
+    Stopped,
 }
 
 impl ApprovalOutcome {
@@ -80,6 +83,7 @@ impl ApprovalOutcome {
             ApprovalOutcome::Declined => "declined",
             ApprovalOutcome::TimedOut => "timed_out",
             ApprovalOutcome::Cancelled => "cancelled",
+            ApprovalOutcome::Stopped => "stopped",
         }
     }
 
@@ -97,6 +101,9 @@ impl ApprovalOutcome {
                 super::elicit::APPROVAL_TIMEOUT.as_secs()
             ),
             ApprovalOutcome::Cancelled => format!("Approval cancelled — {who} disconnected"),
+            ApprovalOutcome::Stopped => {
+                format!("{who} approved — stopped: the agent's tier was lowered")
+            }
         }
     }
 }
@@ -502,10 +509,13 @@ pub struct ApprovalWatch {
 }
 
 impl ApprovalWatch {
-    pub fn finish(mut self, answer: Approval) {
+    pub fn finish(self, answer: Approval) {
+        self.finish_as(ApprovalOutcome::of(answer));
+    }
+
+    pub fn finish_as(mut self, outcome: ApprovalOutcome) {
         self.finished = true;
-        self.status
-            .approval_ended(&self.channel, self.id, ApprovalOutcome::of(answer));
+        self.status.approval_ended(&self.channel, self.id, outcome);
     }
 }
 
@@ -948,6 +958,15 @@ mod tests {
             Cancelled.title(Some("Claude")),
             "Approval cancelled — Claude disconnected"
         );
+        assert_eq!(
+            Stopped.title(None),
+            "Muse approved — stopped: the agent's tier was lowered"
+        );
+        assert_eq!(
+            Stopped.title(Some("Claude")),
+            "Claude approved — stopped: the agent's tier was lowered"
+        );
+        assert_eq!(Stopped.as_str(), "stopped");
         assert_eq!(
             Declined.title(Some("  ")),
             "Muse declined",
