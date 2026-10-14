@@ -62,9 +62,18 @@ pub enum ApprovalOutcome {
     /// The client cannot be asked, the question could not be put, or the
     /// session went away while it was open.
     Cancelled,
-    /// Approved, but the person lowered the agent's tier while it was asked,
-    /// so the call did not run.
-    Stopped,
+    /// Approved, but the call did not run.
+    Stopped(StopReason),
+}
+
+/// Why an approved call did not run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// The person lowered the agent's tier while it was asked.
+    TierLowered,
+    /// Calls from the agent now go to another browser, or to none: the tab
+    /// the question named is not there to act on.
+    BrowserChanged,
 }
 
 impl ApprovalOutcome {
@@ -83,7 +92,7 @@ impl ApprovalOutcome {
             ApprovalOutcome::Declined => "declined",
             ApprovalOutcome::TimedOut => "timed_out",
             ApprovalOutcome::Cancelled => "cancelled",
-            ApprovalOutcome::Stopped => "stopped",
+            ApprovalOutcome::Stopped(_) => "stopped",
         }
     }
 
@@ -101,8 +110,11 @@ impl ApprovalOutcome {
                 super::elicit::APPROVAL_TIMEOUT.as_secs()
             ),
             ApprovalOutcome::Cancelled => format!("Approval cancelled — {who} disconnected"),
-            ApprovalOutcome::Stopped => {
+            ApprovalOutcome::Stopped(StopReason::TierLowered) => {
                 format!("{who} approved — stopped: the agent's tier was lowered")
+            }
+            ApprovalOutcome::Stopped(StopReason::BrowserChanged) => {
+                format!("{who} approved — stopped: the browser changed")
             }
         }
     }
@@ -959,14 +971,19 @@ mod tests {
             "Approval cancelled — Claude disconnected"
         );
         assert_eq!(
-            Stopped.title(None),
+            Stopped(StopReason::TierLowered).title(None),
             "Muse approved — stopped: the agent's tier was lowered"
         );
         assert_eq!(
-            Stopped.title(Some("Claude")),
+            Stopped(StopReason::TierLowered).title(Some("Claude")),
             "Claude approved — stopped: the agent's tier was lowered"
         );
-        assert_eq!(Stopped.as_str(), "stopped");
+        assert_eq!(
+            Stopped(StopReason::BrowserChanged).title(Some("Claude")),
+            "Claude approved — stopped: the browser changed"
+        );
+        assert_eq!(Stopped(StopReason::TierLowered).as_str(), "stopped");
+        assert_eq!(Stopped(StopReason::BrowserChanged).as_str(), "stopped");
         assert_eq!(
             Declined.title(Some("  ")),
             "Muse declined",

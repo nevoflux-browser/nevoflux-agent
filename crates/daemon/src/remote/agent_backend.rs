@@ -34,7 +34,7 @@ use nevoflux_protocol::session_event::{SessionEventPayload, ToolOrigin};
 use nevoflux_protocol::ExecutionTier;
 use serde_json::{json, Value};
 
-use super::agent_status::{AgentStatus, ApprovalOutcome};
+use super::agent_status::{AgentStatus, ApprovalOutcome, StopReason};
 use super::agent_tabs::AgentTabs;
 use super::mcp_tools::{
     is_allowed, AgentError, AgentToolBackend, Approval, Approver, REASON_APPROVAL_FAILED,
@@ -109,8 +109,25 @@ impl TierSource for StoredTier {
 /// Decides what the rules say about one call (step 4).
 #[async_trait]
 pub trait Judge: Send + Sync {
-    async fn judge(&self, name: &str, arguments: &Value, services: &HostServices) -> Judgement;
+    /// `tab_url` is where the tab the call will act on is now, when there is
+    /// such a tab and the browser said.
+    async fn judge(
+        &self,
+        name: &str,
+        arguments: &Value,
+        tab_url: Option<&str>,
+        services: &HostServices,
+    ) -> Judgement;
+
+    /// Whether this judge reads `tab_url`, which costs asking the browser.
+    fn reads_tab_url(&self) -> bool {
+        false
+    }
 }
+
+/// How long to wait for the browser to say where a tab is before judging on
+/// what the agent's own table remembers.
+const TAB_URL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The daemon's own judgement (spec §2.2 step 4): Jev first — the same
 /// `should_assess` / `assess` / `RISK_P` the native gate uses — then the
@@ -133,7 +150,17 @@ impl PipelineJudge {
 
 #[async_trait]
 impl Judge for PipelineJudge {
-    async fn judge(&self, name: &str, arguments: &Value, services: &HostServices) -> Judgement {
+    fn reads_tab_url(&self) -> bool {
+        true
+    }
+
+    async fn judge(
+        &self,
+        name: &str,
+        arguments: &Value,
+        tab_url: Option<&str>,
+        services: &HostServices,
+    ) -> Judgement {
         let mut jev = Vec::new();
         // The tier already lets this call through without asking, which is
         // exactly the case Jev exists for (`would_auto = true`).
@@ -166,6 +193,7 @@ impl Judge for PipelineJudge {
         let gate = crate::wasm::mcp_tool_executor::judge_mcp_call(
             name,
             arguments,
+            tab_url.map(str::to_string),
             services,
             &self.packs_dir,
         );
@@ -429,6 +457,18 @@ fn listed_tab_id(tab: &Value) -> Option<i64> {
         .and_then(Value::as_i64)
 }
 
+/// Where a `browser_get_tabs` result says tab `id` is, if it lists it.
+pub fn listed_url(result: &str, id: i64) -> Option<String> {
+    let mut v = serde_json::from_str::<Value>(result).ok()?;
+    listed_tabs(&mut v)?
+        .iter()
+        .find(|t| listed_tab_id(t) == Some(id))?
+        .get("url")?
+        .as_str()
+        .filter(|u| !u.is_empty())
+        .map(str::to_string)
+}
+
 /// Every tab id a `browser_get_tabs` result shows.
 pub fn listed_ids(result: &str) -> Vec<i64> {
     let Ok(mut v) = serde_json::from_str::<Value>(result) else {
@@ -587,18 +627,46 @@ impl DesktopBrowserBackend {
         (self.target)(&services.proxy_id).as_deref() == Some(served_by)
     }
 
-    fn tab_label(&self, plan: TabPlan, arguments: &Value) -> String {
+    fn tab_label(&self, plan: TabPlan, arguments: &Value, tab_url: Option<&str>) -> String {
         if plan == TabPlan::OpenNew {
             return "a new tab of the agent's".to_string();
         }
         match arguments.get("tab_id").and_then(Value::as_i64) {
-            Some(id) => self
-                .tabs
-                .url_of(&self.channel_id, id)
+            Some(id) => tab_url
+                .map(str::to_string)
+                .or_else(|| self.tabs.url_of(&self.channel_id, id))
                 .map(|u| format!("{u} (tab {id})"))
                 .unwrap_or_else(|| format!("tab {id}")),
             None => "no particular tab".to_string(),
         }
+    }
+
+    /// Where the tab a call will act on is, for the rules.
+    ///
+    /// Asked of the browser when the judge reads it: the agent's table only
+    /// learns a URL when the agent navigates, and a click that followed a link
+    /// has taken the tab somewhere the table never heard of. A pack rule scoped
+    /// to that somewhere would be judged against where the tab used to be. When
+    /// the browser does not say, the table's URL is the best there is.
+    async fn tab_url(&self, services: &HostServices, served_by: &str, id: i64) -> Option<String> {
+        if self.judge.reads_tab_url() {
+            let no_arguments = json!({});
+            let lookup = crate::wasm::mcp_tool_executor::execute_agent_browser_tool(
+                "browser_get_tabs",
+                &no_arguments,
+                services,
+            );
+            if let Ok(Ok(text)) = tokio::time::timeout(TAB_URL_TIMEOUT, lookup).await {
+                if let Some(url) = listed_url(&text, id) {
+                    if self.still_served_by(services, served_by) {
+                        self.tabs
+                            .record_url(&self.channel_id, id, Some(url.clone()));
+                    }
+                    return Some(url);
+                }
+            }
+        }
+        self.tabs.url_of(&self.channel_id, id)
     }
 
     async fn run(
@@ -642,10 +710,20 @@ impl DesktopBrowserBackend {
                 return Err(AgentError::TabClosed { tab_id });
             }
         }
-        // 4. The rules, judged on exactly the arguments that will run.
-        // An approved question stays open until the tier is checked again
-        // below, so the desktop hears how the call actually ended.
-        let (arguments, approved) = match self.judge.judge(name, &arguments, &services).await {
+        // 4. The rules, judged on exactly the arguments that will run, and on
+        // where the tab they will run in is now. A new tab is nowhere yet; a
+        // navigate is judged by its own `url`.
+        // An approved question stays open until the tier and the browser are
+        // checked again below, so the desktop hears how the call actually ended.
+        let tab_url = match (plan, planned_tab) {
+            (TabPlan::OpenNew, _) | (_, None) => None,
+            (_, Some(id)) => self.tab_url(&services, &served_by, id).await,
+        };
+        let (arguments, approved) = match self
+            .judge
+            .judge(name, &arguments, tab_url.as_deref(), &services)
+            .await
+        {
             Judgement::Allow => (arguments, None),
             Judgement::Rewrite {
                 arguments: rewritten,
@@ -666,7 +744,7 @@ impl DesktopBrowserBackend {
                     Some(rewritten) => settle(name, plan, planned_tab, rewritten)?,
                     None => arguments,
                 };
-                let target = self.tab_label(plan, &effective);
+                let target = self.tab_label(plan, &effective, tab_url.as_deref());
                 let message = approval_message(name, &effective, &target, &prompts);
                 // On the desktop while it is open, announced once when it
                 // ends — also if this future is dropped mid-question.
@@ -689,21 +767,22 @@ impl DesktopBrowserBackend {
         let tier = self.tier.tier();
         if !nevoflux_protocol::tier_auto_approves(name, tier) {
             if let Some(watch) = approved {
-                watch.finish_as(ApprovalOutcome::Stopped);
+                watch.finish_as(ApprovalOutcome::Stopped(StopReason::TierLowered));
             }
             return Err(AgentError::TierDenied {
                 tier,
                 required: nevoflux_protocol::minimum_tier(name),
             });
         }
-        if let Some(watch) = approved {
-            watch.finish(Approval::Approved);
-        }
-        // The call, bounded. The browser may have changed while the rules
-        // or the person were deciding, and the request is re-addressed when
-        // it is sent: a tab number planned for the old browser could be one
-        // of the person's tabs in the new one. Nothing is sent then.
+        // 6. The browser again. It may have changed while the rules or the
+        // person were deciding, and the request is re-addressed when it is
+        // sent: a tab number planned for the old browser could be one of the
+        // person's tabs in the new one. Nothing is sent then, and an approval
+        // is announced as stopped rather than approved, since nothing runs.
         if !self.still_served_by(&services, &served_by) {
+            if let Some(watch) = approved {
+                watch.finish_as(ApprovalOutcome::Stopped(StopReason::BrowserChanged));
+            }
             return Err(match plan {
                 TabPlan::Owned(tab_id) => {
                     self.tabs.forget_pairing(&self.channel_id);
@@ -711,6 +790,9 @@ impl DesktopBrowserBackend {
                 }
                 _ => AgentError::BrowserUnavailable,
             });
+        }
+        if let Some(watch) = approved {
+            watch.finish(Approval::Approved);
         }
         let call =
             crate::wasm::mcp_tool_executor::execute_agent_browser_tool(name, &arguments, &services);
@@ -947,8 +1029,33 @@ mod tests {
     pub(super) struct FixedJudge(pub(super) Judgement);
     #[async_trait]
     impl Judge for FixedJudge {
-        async fn judge(&self, _: &str, _: &Value, _: &HostServices) -> Judgement {
+        async fn judge(&self, _: &str, _: &Value, _: Option<&str>, _: &HostServices) -> Judgement {
             self.0.clone()
+        }
+    }
+
+    /// Asks about every call, and remembers which tab URL each was judged on.
+    pub(super) struct SeesTab(pub(super) Mutex<Vec<Option<String>>>);
+    #[async_trait]
+    impl Judge for SeesTab {
+        fn reads_tab_url(&self) -> bool {
+            true
+        }
+        async fn judge(
+            &self,
+            _: &str,
+            _: &Value,
+            tab_url: Option<&str>,
+            _: &HostServices,
+        ) -> Judgement {
+            self.0.lock().unwrap().push(tab_url.map(str::to_string));
+            Judgement::Ask {
+                prompts: vec![AskPrompt {
+                    stage: "site_policy",
+                    prompt: "why".into(),
+                }],
+                arguments: None,
+            }
         }
     }
 
@@ -984,6 +1091,14 @@ mod tests {
         judgement: Judgement,
         template: impl Fn(HostServices) -> HostServices,
     ) -> Rig {
+        rig_judged(tier, Arc::new(FixedJudge(judgement)), template)
+    }
+
+    pub(super) fn rig_judged(
+        tier: ExecutionTier,
+        judge: Arc<dyn Judge>,
+        template: impl Fn(HostServices) -> HostServices,
+    ) -> Rig {
         let (tx, browser) = browser();
         let db = Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
         let services = template(HostServices::new(db.clone()).with_browser_sender(tx));
@@ -995,7 +1110,7 @@ mod tests {
             CHANNEL,
             tier.clone(),
             tabs.clone(),
-            Arc::new(FixedJudge(judgement)),
+            judge,
             Arc::new(move || Some(services.clone())),
             Arc::new(move |_sender: &str| t.lock().unwrap().clone()),
         );
@@ -1939,7 +2054,7 @@ mod tests {
             .insert("ask-guard".into());
         let judge = PipelineJudge::at(dir.path().to_path_buf());
         assert!(matches!(
-            judge.judge("browser_navigate", &json!({ "url": "https://ask.example/x" }), &services).await,
+            judge.judge("browser_navigate", &json!({ "url": "https://ask.example/x" }), None, &services).await,
             Judgement::Ask { ref prompts, .. } if prompts[0].prompt.contains("ask-guard")
         ));
         assert!(matches!(
@@ -1947,11 +2062,109 @@ mod tests {
                 .judge(
                     "browser_navigate",
                     &json!({ "url": "https://other.example/" }),
+                    None,
                     &services
                 )
                 .await,
             Judgement::Allow
         ));
+    }
+
+    #[tokio::test]
+    async fn a_url_scoped_rule_applies_to_a_click_in_a_tab_at_that_url() {
+        // M2a gap: a click carries no URL of its own, and the agent channel
+        // judged it with no tab URL either, so a rule scoped to a site never
+        // applied to the clicks, fills and typing an agent did there.
+        let dir = tempfile::tempdir().unwrap();
+        let pd = dir.path().join("bank-guard");
+        std::fs::create_dir_all(&pd).unwrap();
+        std::fs::write(
+            pd.join("pack.toml"),
+            "[pack]\nname = \"bank-guard\"\nversion = \"1.0.0\"\nprotocol = \"pack-protocol/0.2\"\nmin_nevoflux = \"0.3.0\"\n\n[[components.tool_policy]]\nscope = \"installed\"\nmatch = { url = [\"*://bank.example/*\"] }\ndeny = []\nask = [\"browser_click\"]\nmessage = \"bank.example wants a person to confirm\"\n",
+        )
+        .unwrap();
+        let services = HostServices::new(Arc::new(
+            nevoflux_storage::Database::open_in_memory().unwrap(),
+        ));
+        let judge = PipelineJudge::at(dir.path().to_path_buf());
+        let click = json!({ "selector": "#pay", "tab_id": 7 });
+        assert!(matches!(
+            judge.judge("browser_click", &click, Some("https://bank.example/pay"), &services).await,
+            Judgement::Ask { ref prompts, .. } if prompts[0].prompt.contains("bank-guard")
+        ));
+        assert!(matches!(
+            judge
+                .judge(
+                    "browser_click",
+                    &click,
+                    Some("https://other.example/"),
+                    &services
+                )
+                .await,
+            Judgement::Allow
+        ));
+        assert!(matches!(
+            judge.judge("browser_click", &click, None, &services).await,
+            Judgement::Allow
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_rules_see_where_the_tab_is_now() {
+        // The agent's own tab: the table never learned a URL for it, the
+        // browser says it is at muse.example. A tab it was only shown is
+        // judged the same way. The question names the place too.
+        let seen = Arc::new(SeesTab(Mutex::new(Vec::new())));
+        let r = rig_judged(ExecutionTier::BrowserAuto, seen.clone(), |s| s);
+        r.tabs.record_opened(CHANNEL, SIDEBAR, 100, None);
+        r.tabs.record_listed(CHANNEL, SIDEBAR, &[1]);
+        let a = approver(Approval::Approved);
+        call_with(&r, &a, "browser_click", json!({ "selector": "#go" })).await;
+        call_with(
+            &r,
+            &a,
+            "browser_click",
+            json!({ "selector": "#go", "tab_id": 1 }),
+        )
+        .await;
+        assert_eq!(
+            *seen.0.lock().unwrap(),
+            vec![
+                Some("https://muse.example/".to_string()),
+                Some("https://mine.example/".to_string())
+            ]
+        );
+        let asked = a.asked.lock().unwrap().clone();
+        assert!(
+            asked[0].contains("https://muse.example/ (tab 100)"),
+            "{}",
+            asked[0]
+        );
+        assert!(
+            asked[1].contains("https://mine.example/ (tab 1)"),
+            "{}",
+            asked[1]
+        );
+        assert_eq!(
+            r.tabs.url_of(CHANNEL, 100).as_deref(),
+            Some("https://muse.example/"),
+            "the table learns where its tab went"
+        );
+
+        // A new tab is nowhere yet, and nobody asks the browser about it.
+        let seen = Arc::new(SeesTab(Mutex::new(Vec::new())));
+        let r = rig_judged(ExecutionTier::BrowserAuto, seen.clone(), |s| s);
+        call_with(
+            &r,
+            &a,
+            "browser_navigate",
+            json!({ "url": "https://muse.example/" }),
+        )
+        .await;
+        assert_eq!(*seen.0.lock().unwrap(), vec![None]);
+        assert!(sent(&r)
+            .iter()
+            .all(|q| q.action != BrowserToolAction::ListTabs));
     }
 
     fn jev_cfg(url: &str) -> crate::config::AgentConfig {
@@ -1979,7 +2192,12 @@ mod tests {
         let judge = PipelineJudge::at(PathBuf::from("this-directory-does-not-exist"));
 
         match judge
-            .judge("browser_click", &json!({ "selector": "#pay" }), &services)
+            .judge(
+                "browser_click",
+                &json!({ "selector": "#pay" }),
+                None,
+                &services,
+            )
             .await
         {
             Judgement::Ask { prompts, .. } => assert_eq!(prompts[0].stage, "jev"),
@@ -2005,7 +2223,7 @@ mod tests {
         let before = bodies.lock().unwrap().len();
         assert!(matches!(
             judge
-                .judge("browser_snapshot", &json!({ "tab_id": 1 }), &services)
+                .judge("browser_snapshot", &json!({ "tab_id": 1 }), None, &services)
                 .await,
             Judgement::Allow
         ));
@@ -2853,6 +3071,36 @@ mod tests {
             assert_eq!(notes[0]["body"], "Click on element '#go' in tab 1", "{answer:?}");
             assert!(status.current()["agents"][0]["approval"].is_null(), "{answer:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn an_approval_the_browser_change_overrules_is_announced_as_stopped() {
+        // Muse said yes, but calls from it now go to another browser: tab 1
+        // there is somebody else's, nothing runs, and the desktop must not
+        // read "Muse approved" alone.
+        let (r, status, seen) = watched_rig(ExecutionTier::BrowserAuto, ask("why"));
+        r.tabs.record_listed(CHANNEL, SIDEBAR, &[1]);
+        let a = SwitchesBrowser {
+            target: r.target.clone(),
+            to: Some("proxy-sidebar-2".into()),
+        };
+        r.backend
+            .call(
+                "browser_click",
+                json!({ "selector": "#go", "tab_id": 1 }),
+                &a,
+            )
+            .await
+            .unwrap();
+        assert!(sent(&r).is_empty());
+        let notes = seen.notifications();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0]["outcome"], "stopped");
+        assert_eq!(
+            notes[0]["title"],
+            "Muse approved — stopped: the browser changed"
+        );
+        assert!(status.current()["agents"][0]["approval"].is_null());
     }
 
     #[tokio::test]

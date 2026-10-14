@@ -383,8 +383,9 @@ pub(crate) fn record_acp_tool_result(services: &HostServices, tool_name: &str, c
 ///   provider has no NevoFlux mode of its own. A guess here would read as fact
 ///   in a hook's request payload.
 /// - `tab_url`: this dispatcher never learns which tab a browser tool will land
-///   on. Rules that name a URL still match on the call's own `url` argument,
-///   which is also all the agent loop supplies.
+///   on. Rules that name a URL still match on the call's own `url` argument.
+///   The agent channel does know its tab, and supplies it through
+///   [`judge_mcp_call`].
 fn mcp_tool_context(services: &HostServices) -> nevoflux_builtin_wasm::ToolContext {
     nevoflux_builtin_wasm::ToolContext {
         session_id: services.session_id.clone(),
@@ -445,9 +446,14 @@ pub(crate) fn gate_pipeline(
 /// What the gate would decide about a call, without putting any question to
 /// anyone (M2a §2.4). The agent channel asks its own client instead of the
 /// desktop sidebar, so it needs the question rather than the answer.
+///
+/// `tab_url` is where the tab the call acts on is. Without it a rule scoped to
+/// a site never applies to a click, fill or keystroke there: those carry no
+/// URL of their own.
 pub(crate) fn judge_mcp_call(
     name: &str,
     arguments: &serde_json::Value,
+    tab_url: Option<String>,
     services: &HostServices,
     packs_dir: &std::path::Path,
 ) -> crate::tool_pipeline::Judgement {
@@ -458,7 +464,11 @@ pub(crate) fn judge_mcp_call(
         arguments: arguments.clone(),
         signature: None,
     };
-    gate_pipeline(services, packs_dir).judge(&call, &mcp_tool_context(services))
+    let ctx = nevoflux_builtin_wasm::ToolContext {
+        tab_url,
+        ..mcp_tool_context(services)
+    };
+    gate_pipeline(services, packs_dir).judge(&call, &ctx)
 }
 
 /// Run one agent-channel browser tool: the same browser path
@@ -3125,6 +3135,7 @@ message = "ask.example wants a person to confirm"
         match judge_mcp_call(
             "browser_navigate",
             &serde_json::json!({ "url": "https://ask.example/x" }),
+            None,
             &services,
             dir.path(),
         ) {
@@ -3140,6 +3151,7 @@ message = "ask.example wants a person to confirm"
             judge_mcp_call(
                 "browser_navigate",
                 &serde_json::json!({ "url": "https://elsewhere.example/" }),
+                None,
                 &services,
                 dir.path(),
             ),
