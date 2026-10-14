@@ -23,10 +23,16 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(nevoflux_tts::model::default_threads);
     eprintln!("threads : {threads}");
+    let ep = std::env::var("NEVOFLUX_TTS_EP")
+        .ok()
+        .and_then(|v| nevoflux_tts::ep::Ep::parse(&v))
+        .unwrap_or(nevoflux_tts::ep::Ep::Cpu);
+    eprintln!("ep      : {}", ep.name());
     let synth = match nevoflux_tts::Synthesizer::new(
         &model,
         &dir.join("kokoro-voices-v1.0.bin"),
         threads,
+        ep,
     ) {
         Ok(s) => s,
         Err(e) => {
