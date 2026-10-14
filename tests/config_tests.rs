@@ -36,7 +36,7 @@ fn test_config_defaults_are_sensible() {
     assert!(!config.logging.json_format);
 
     // LLM defaults
-    assert_eq!(config.llm.max_tokens, 4096);
+    assert_eq!(config.llm.max_tokens, 32768);
     assert_eq!(config.llm.temperature, 0.7);
     assert_eq!(config.llm.max_retries, 3);
 }
@@ -46,7 +46,7 @@ fn test_config_missing_file_returns_defaults() {
     let config = AgentConfig::load_from_path(&PathBuf::from("/nonexistent/config.toml")).unwrap();
     assert_eq!(config.daemon.port_range_start, 19500);
     assert_eq!(config.daemon.port_range_end, 19600);
-    assert_eq!(config.llm.max_tokens, 4096);
+    assert_eq!(config.llm.max_tokens, 32768);
 }
 
 #[test]
@@ -162,7 +162,7 @@ fn test_config_merge_behavior() {
 
     // Values not changed should keep defaults
     assert_eq!(base.daemon.idle_timeout_secs, 1800);
-    assert_eq!(base.llm.max_tokens, 4096);
+    assert_eq!(base.llm.max_tokens, 32768);
 }
 
 #[test]
@@ -210,7 +210,7 @@ fn test_llm_config_defaults() {
 
     assert!(config.default_provider.is_none());
     assert!(config.default_model.is_none());
-    assert_eq!(config.max_tokens, 4096);
+    assert_eq!(config.max_tokens, 32768);
     assert_eq!(config.temperature, 0.7);
     assert_eq!(config.timeout_secs, 120);
     assert_eq!(config.max_retries, 3);

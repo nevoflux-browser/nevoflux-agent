@@ -55,7 +55,24 @@ fn extract_frontmatter(full: &str) -> &str {
     &stripped[..end]
 }
 
-const VIDEO_DIR: &str = "/ai/project/nevoflux/docs/reference/skills/video";
+/// The video skill lives in the browser repo, not this one. Found through
+/// `NEVOFLUX_VIDEO_SKILL_DIR`, or in a `nevoflux` checkout beside this repo.
+/// Missing is a failure that says where to look, never a silent pass: this
+/// test is the only thing holding the two repos to the contract.
+fn video_dir() -> String {
+    if let Ok(dir) = std::env::var("NEVOFLUX_VIDEO_SKILL_DIR") {
+        return dir;
+    }
+    let sibling = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../nevoflux/docs/reference/skills/video");
+    assert!(
+        sibling.is_dir(),
+        "the video skill is not at {}; check out the nevoflux browser repo beside this one \
+         or set NEVOFLUX_VIDEO_SKILL_DIR",
+        sibling.display()
+    );
+    sibling.to_string_lossy().into_owned()
+}
 
 const SHIPPED_TEMPLATES: &[&str] = &[
     "tiktok-hook",
@@ -72,7 +89,7 @@ const SHIPPED_TEMPLATES: &[&str] = &[
 /// `DesignFrontmatter` shape matches what `DESIGN-template.md` advertises).
 #[test]
 fn design_template_reference_parses_with_google_base_plus_video_extensions() {
-    let path = format!("{VIDEO_DIR}/reference/DESIGN-template.md");
+    let path = format!("{}/reference/DESIGN-template.md", video_dir());
     let text = fs::read_to_string(&path).expect("DESIGN-template.md exists");
     let front = extract_frontmatter(&text);
     let fm: DesignFrontmatter = serde_yaml::from_str(front).expect("frontmatter parses as YAML");
@@ -107,8 +124,8 @@ fn design_template_reference_parses_with_google_base_plus_video_extensions() {
 #[test]
 fn each_shipped_template_has_a_matching_design_md() {
     for tpl in SHIPPED_TEMPLATES {
-        let html_path = format!("{VIDEO_DIR}/templates/{tpl}.html");
-        let design_path = format!("{VIDEO_DIR}/templates/{tpl}.design.md");
+        let html_path = format!("{}/templates/{tpl}.html", video_dir());
+        let design_path = format!("{}/templates/{tpl}.design.md", video_dir());
         assert!(
             fs::metadata(&html_path).is_ok(),
             "template HTML missing: {html_path}",

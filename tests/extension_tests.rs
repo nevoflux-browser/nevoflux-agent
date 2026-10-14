@@ -30,14 +30,14 @@ fn test_extension_manifest_valid_json() {
     assert!(manifest["permissions"].is_array());
 }
 
+/// The browser registers the native host itself (NevofluxNativeHostRegistrar),
+/// so what ships here are the scripts that copy the agent into it.
 #[test]
-fn test_native_host_template_exists() {
-    let template_path = project_root().join("install/native-host/com.nevoflux.agent.json.template");
-    assert!(
-        template_path.exists(),
-        "Native host template should exist at {:?}",
-        template_path
-    );
+fn test_native_host_update_scripts_exist() {
+    for script in ["update-agent.sh", "update-agent.ps1"] {
+        let path = project_root().join("install/native-host").join(script);
+        assert!(path.exists(), "{script} should exist at {:?}", path);
+    }
 }
 
 #[test]
