@@ -50,19 +50,24 @@ impl WsSink {
         *self.write.lock().await = None;
     }
 
-    /// Put a WebSocket ping on the wire.
+    /// Put the keepalive on the wire: a WebSocket ping and the relay's text
+    /// ping.
     ///
-    /// This is a protocol frame, not a message, and that distinction is the
-    /// whole reason the keepalive is affordable: Cloudflare answers protocol
-    /// pings below the hibernation layer, so the relay's Durable Object is
-    /// never woken and nothing is billed. What we get for free is a flow that
-    /// stays warm through a NAT and a pong that proves the socket still leads
-    /// somewhere.
+    /// Both are answered by Cloudflare below the hibernation layer, so the
+    /// relay's Durable Object is never woken and nothing is billed. The
+    /// protocol ping keeps the flow warm through a NAT and its pong proves the
+    /// socket still leads somewhere. The text ping is what the relay watches:
+    /// it closes a socket that has sent one and then gone quiet, which is how a
+    /// daemon that vanished stops being counted as attached (see
+    /// [`super::relay_protocol::KEEPALIVE_PING`]).
     async fn ping(&self) {
         let mut guard = self.write.lock().await;
         if let Some(w) = guard.as_mut() {
-            if let Err(e) = w.send(Message::Ping(Vec::new())).await {
-                tracing::warn!(target: "remote", "WsSink: ping failed: {e}");
+            for msg in keepalive_messages() {
+                if let Err(e) = w.send(msg).await {
+                    tracing::warn!(target: "remote", "WsSink: ping failed: {e}");
+                    return;
+                }
             }
         }
     }
@@ -104,10 +109,20 @@ pub fn wire_to_message(wire: Wire) -> Message {
     }
 }
 
+/// What one keepalive tick puts on the wire.
+fn keepalive_messages() -> [Message; 2] {
+    [
+        Message::Ping(Vec::new()),
+        Message::Text(super::relay_protocol::KEEPALIVE_PING.into()),
+    ]
+}
+
 /// tungstenite `Message` → `Wire`, or `None` for control frames (ping/pong/close
-/// — tungstenite auto-replies to pings; we don't relay them).
+/// — tungstenite auto-replies to pings; we don't relay them) and for the
+/// relay's answer to our text keepalive, which is not from the other end.
 pub fn message_to_wire(msg: Message) -> Option<Wire> {
     match msg {
+        Message::Text(s) if s == super::relay_protocol::KEEPALIVE_PONG => None,
         Message::Text(s) => Some(Wire::Text(s)),
         Message::Binary(b) => Some(Wire::Binary(b)),
         _ => None,
@@ -1017,6 +1032,19 @@ mod tests {
         // control frames are not relayed
         assert_eq!(message_to_wire(Message::Ping(vec![])), None);
         assert_eq!(message_to_wire(Message::Close(None)), None);
+        // nor is the relay's answer to our keepalive: it is not from the peer
+        assert_eq!(message_to_wire(Message::Text("pong".into())), None);
+    }
+
+    #[test]
+    fn a_keepalive_tick_sends_the_text_ping_the_relay_watches() {
+        // The relay closes sockets that sent its text ping and then went quiet.
+        // A daemon that only sent protocol pings was never recognised as gone,
+        // and stayed counted as attached for 13-16 minutes after a network drop.
+        assert_eq!(
+            keepalive_messages(),
+            [Message::Ping(vec![]), Message::Text("ping".into())]
+        );
     }
 
     // --- ⑤ channel shutdown ------------------------------------------------

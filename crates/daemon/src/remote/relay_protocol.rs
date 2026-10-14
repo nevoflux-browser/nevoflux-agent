@@ -34,6 +34,19 @@ pub enum WireMessage {
     Resync,
 }
 
+/// The keepalive the relay answers from below its hibernation layer, and the
+/// answer. Must match `KEEPALIVE_PING` / `KEEPALIVE_PONG` in the portal's
+/// `workers/portal-relay/src/relay-logic.ts` byte for byte.
+///
+/// Sent as a text message alongside the protocol ping. The protocol ping is
+/// answered by Cloudflare without anyone seeing it; this one is answered too,
+/// but the relay records when each socket last sent it, and a socket that has
+/// sent it and then stopped is one the relay closes and stops counting. Without
+/// it, a daemon that dropped off the network went on being counted as attached
+/// for a quarter of an hour.
+pub const KEEPALIVE_PING: &str = "ping";
+pub const KEEPALIVE_PONG: &str = "pong";
+
 /// How many other ends are on the channel, if this text is the relay saying so.
 ///
 /// The relay volunteers this — to a socket as it joins, to the survivors when
