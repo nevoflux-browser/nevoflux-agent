@@ -358,6 +358,9 @@ pub struct Server {
         Arc<tokio::sync::Mutex<crate::remote::gateway::GatewayRegistry>>,
         mpsc::Sender<(Vec<u8>, nevoflux_protocol::ProxyEnvelope)>,
     )>,
+    /// This server's publication of the agent services template, released
+    /// on shutdown and on drop.
+    services_template: crate::remote::agent_backend::TemplateId,
 }
 
 impl Server {
@@ -453,7 +456,7 @@ impl Server {
         // Agent channels clone their services from a process-wide template
         // that holds this server's channel senders; drop it so those channels
         // can close.
-        crate::remote::agent_backend::clear_services_template();
+        crate::remote::agent_backend::release_services_template(self.services_template);
         // The on-device engine goes down first, before anything else gets a
         // chance to wedge this path: it is a separate process holding
         // several GB of VRAM and a machine-wide lock file, and on Windows
@@ -2606,7 +2609,7 @@ pub async fn start_server(
     let process_services = services.clone();
     // Agent channels clone their per-call services from this, the fully wired
     // copy (asset server and recorder included) — M2a §2.3.
-    crate::remote::agent_backend::set_services_template(services.clone());
+    let services_template = crate::remote::agent_backend::set_services_template(services.clone());
     let process_available_browsers = available_browsers.clone();
     let process_runtime = tokio::runtime::Handle::current();
     let process_browser_registry = browser_registry.clone();
@@ -5115,7 +5118,20 @@ pub async fn start_server(
         brain_slot,
         reindex_progress: reindex_progress_slot,
         remote_wiring: Some((remote_registry.clone(), remote_msg_tx)),
+        services_template,
     })
+}
+
+impl Drop for Server {
+    /// A handle dropped without [`Server::shutdown`] must still let go of the
+    /// services template. It holds this server's channel senders, among them
+    /// the recorder's, whose writer is a blocking thread that runs until its
+    /// last sender is gone; the runtime waits for that thread before it can
+    /// finish. Every test that dropped its server instead of shutting it
+    /// down hung there.
+    fn drop(&mut self) {
+        crate::remote::agent_backend::release_services_template(self.services_template);
+    }
 }
 
 /// Background task to generate embeddings for existing entries that lack them.

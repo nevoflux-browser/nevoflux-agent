@@ -245,24 +245,41 @@ pub fn short_id(channel_id: &str) -> String {
 /// before this is set answers `browser_unavailable` until it is.
 ///
 /// A slot, not a `OnceLock`: the services hold clones of the daemon's
-/// channel senders, so a server that shuts down must drop them
-/// (`clear_services_template`) or those channels never close and the runtime
-/// cannot finish.
-static SERVICES: RwLock<Option<HostServices>> = RwLock::new(None);
+/// channel senders, so a server that goes away must drop them
+/// ([`release_services_template`]) or those channels never close and the
+/// runtime cannot finish. Each entry is tagged with the [`TemplateId`] that
+/// published it, so a server releases only its own.
+static SERVICES: RwLock<Option<(TemplateId, HostServices)>> = RwLock::new(None);
+
+/// Which publication of the services template a server owns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TemplateId(u64);
 
 /// Publish the services agent calls clone from. Called from `server.rs` once
 /// startup is done; a later server replaces an earlier one's.
-pub fn set_services_template(services: HostServices) {
-    *SERVICES.write().unwrap_or_else(|p| p.into_inner()) = Some(services);
+pub fn set_services_template(services: HostServices) -> TemplateId {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = TemplateId(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    *SERVICES.write().unwrap_or_else(|p| p.into_inner()) = Some((id, services));
+    id
 }
 
-/// Drop the published services. Called when the server shuts down.
-pub fn clear_services_template() {
-    SERVICES.write().unwrap_or_else(|p| p.into_inner()).take();
+/// Drop the published services if `id` published them. Called when the
+/// server shuts down or its handle is dropped; a server that was replaced
+/// leaves its successor's alone.
+pub fn release_services_template(id: TemplateId) {
+    let mut slot = SERVICES.write().unwrap_or_else(|p| p.into_inner());
+    if slot.as_ref().is_some_and(|(owner, _)| *owner == id) {
+        slot.take();
+    }
 }
 
 fn services_template() -> Option<HostServices> {
-    SERVICES.read().unwrap_or_else(|p| p.into_inner()).clone()
+    SERVICES
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .map(|(_, services)| services.clone())
 }
 
 /// Which tab a call runs in (spec §3.2).
@@ -2235,13 +2252,13 @@ mod tests {
     /// and the runtime cannot finish (server::tests::test_server_start_and_shutdown
     /// hung on every platform); a later server must be able to publish its own.
     #[test]
-    fn the_services_template_is_released_on_clear_and_can_be_set_again() {
+    fn the_services_template_is_released_by_its_owner_and_can_be_set_again() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let db = Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
-        set_services_template(HostServices::new(db.clone()).with_browser_sender(tx));
+        let first = set_services_template(HostServices::new(db.clone()).with_browser_sender(tx));
         assert!(services_template().is_some());
 
-        clear_services_template();
+        release_services_template(first);
         assert!(services_template().is_none());
         // Every sender is gone, so the channel reports closed instead of waiting.
         assert!(matches!(
@@ -2249,9 +2266,14 @@ mod tests {
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
         ));
 
-        set_services_template(HostServices::new(db));
+        // A server that was replaced cannot take its successor's template
+        // down with it.
+        let second = set_services_template(HostServices::new(db.clone()));
+        let third = set_services_template(HostServices::new(db));
+        release_services_template(second);
         assert!(services_template().is_some());
-        clear_services_template();
+        release_services_template(third);
+        assert!(services_template().is_none());
     }
 
     #[test]
