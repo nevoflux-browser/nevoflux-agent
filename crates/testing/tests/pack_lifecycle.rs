@@ -68,10 +68,26 @@ fn install_places_files_and_seeds() {
 
     let receipt = install(&host, &m, MANIFEST, dir.path(), &opts).unwrap();
 
-    assert_eq!(host.file_count(), 1, "one skill file placed");
+    assert_eq!(
+        host.file_count(),
+        2,
+        "one skill file placed, plus the installed manifest"
+    );
     assert!(host.has_page("demo/cv"), "seed page created");
     assert_eq!(receipt.seeded_pages, vec!["demo/cv".to_string()]);
-    assert_eq!(receipt.files.len(), 1);
+    assert_eq!(receipt.files.len(), 2);
+    // The manifest is kept where post-install readers look for it, and is in
+    // the receipt so uninstall removes it.
+    let manifest_path = PathBuf::from("/cfg/packs/demo/pack.toml");
+    let fr = receipt
+        .files
+        .iter()
+        .find(|f| f.path == manifest_path)
+        .expect("installed manifest recorded in the receipt");
+    assert_eq!(
+        fr.sha256,
+        nevoflux_pack::Receipt::sha256_hex(MANIFEST.as_bytes())
+    );
 }
 
 #[test]
@@ -124,7 +140,7 @@ fn uninstall_removes_pack_files_but_keeps_seed_by_default() {
         ..Default::default()
     };
     install(&host, &m, MANIFEST, dir.path(), &iopts).unwrap();
-    assert_eq!(host.file_count(), 1);
+    assert_eq!(host.file_count(), 2, "skill file + installed manifest");
 
     uninstall(&host, "demo", &UninstallOpts::default()).unwrap();
 
@@ -238,7 +254,7 @@ fn update_refreshes_files_keeps_user_data() {
     let receipt = update(&host, &m2, &bumped, dir.path(), "2026-06-10T00:00:00Z").unwrap();
 
     assert_eq!(receipt.version.to_string(), "0.2.0");
-    assert_eq!(host.file_count(), 1, "files refreshed, not duplicated");
+    assert_eq!(host.file_count(), 2, "files refreshed, not duplicated");
     // User edit preserved (seed is only-if-absent).
     assert!(host.has_page("demo/cv"));
 }
@@ -277,10 +293,11 @@ fn install_skips_symlinks_in_skills_dir() {
     };
     install(&host, &m, MANIFEST, dir.path(), &opts).unwrap();
 
-    // Only the one legit SKILL.md should have been placed; symlinks skipped.
+    // Only the one legit SKILL.md (plus the installed manifest) should have
+    // been placed; symlinks skipped.
     assert_eq!(
         host.file_count(),
-        1,
+        2,
         "symlinks must be skipped, only real file placed"
     );
 }

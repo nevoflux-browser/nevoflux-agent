@@ -112,6 +112,7 @@ pub fn install(
     // Run the mutating phases; on any error, roll back and abort.
     let result = (|| -> PackResult<()> {
         place_phase(host, manifest, pack_dir, &paths, &mut receipt, &mut applied)?;
+        manifest_phase(host, manifest, raw_toml, &paths, &mut receipt, &mut applied)?;
         seed_phase(host, manifest, pack_dir, &mut receipt, &mut applied)?;
         knowledge_phase(host, manifest, pack_dir, &mut receipt, &mut applied)?;
         artifact_phase(host, manifest, pack_dir, &mut receipt, &mut applied)?;
@@ -204,6 +205,33 @@ fn place_phase(
     }
     Ok(())
 }
+
+/// Keep the pack's manifest at `{packs_dir}/<name>/pack.toml`.
+///
+/// Everything that judges a pack after install reads it from there: the
+/// canvas gate (which commands and tools a pack panel declared), installed
+/// site rules, hooks, prompt ceilings and activation. Without it those readers
+/// find nothing for a real install. It is recorded in `receipt.files` like any
+/// placed file, so uninstall removes it and update replaces it.
+fn manifest_phase(
+    host: &dyn PackHost,
+    manifest: &Manifest,
+    raw_toml: &str,
+    paths: &crate::paths::ResolvedPaths,
+    receipt: &mut Receipt,
+    applied: &mut Applied,
+) -> PackResult<()> {
+    let root = paths.packs_dir().join(&manifest.pack.name);
+    let dest = root.join(MANIFEST_FILE);
+    assert_under(&dest, &paths.packs_dir())?;
+    let fr = host.place_file(&dest, raw_toml.as_bytes())?;
+    applied.files.push(fr.path.clone());
+    receipt.files.push(fr);
+    Ok(())
+}
+
+/// File name of the installed manifest under `{packs_dir}/<name>/`.
+pub const MANIFEST_FILE: &str = "pack.toml";
 
 /// Lexically assert that `dest` is contained within `root` (no FS access). The
 /// caller built `dest` by joining a relative name onto `root`, so a normalized

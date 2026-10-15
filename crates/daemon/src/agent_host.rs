@@ -1874,6 +1874,27 @@ fn expand_tilde(path: &str) -> std::path::PathBuf {
 static NETWORK_CAPTURE_ARMED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Whether `pack_activate` may activate `name`.
+///
+/// Until installs kept the manifest under `{packs_dir}/<name>/pack.toml`, no
+/// real install had one there, so activation refused every installed pack.
+/// Now that the manifest is kept, a `pack-protocol/0.1` pack would suddenly
+/// become activatable; the 0.1 behaviour is kept (refused) until that is
+/// decided deliberately. Activation only means something for 0.2 packs anyway:
+/// active-scope rules, hooks and prompt ceilings are 0.2-only fields.
+///
+/// A manifest that is there but will not parse is still accepted, exactly as
+/// the old existence check accepted it.
+fn activatable_manifest(packs_dir: &std::path::Path, name: &str) -> bool {
+    let Ok(src) = std::fs::read_to_string(packs_dir.join(name).join("pack.toml")) else {
+        return false;
+    };
+    match nevoflux_pack::manifest::Manifest::parse(&src) {
+        Ok(m) => m.pack.protocol == "pack-protocol/0.2",
+        Err(_) => true,
+    }
+}
+
 /// Whether a pack may be taken out of the session, asking the user when it is
 /// carrying guards.
 ///
@@ -2178,8 +2199,7 @@ impl HostFunctions for DaemonHostFunctions {
         // an activation that does nothing. A silent no-op here would leave the
         // model believing it had gained abilities it does not have.
         let paths = crate::paths::resolve_from_daemon();
-        let manifest_path = paths.packs_dir().join(name).join("pack.toml");
-        if !manifest_path.exists() {
+        if !activatable_manifest(&paths.packs_dir(), name) {
             return Err(HostError {
                 code: 4,
                 message: format!("pack `{name}` is not installed"),
@@ -10450,6 +10470,25 @@ message = "not here"
         )
         .unwrap();
         dir
+    }
+
+    /// Installs now keep the manifest, which would make every installed 0.1
+    /// pack activatable; until that is decided, only 0.2 packs are.
+    #[test]
+    fn only_a_0_2_installed_manifest_can_be_activated() {
+        let dir = guard_pack_dir("activatable", "active");
+        assert!(super::activatable_manifest(&dir, "bank-guard"));
+        assert!(!super::activatable_manifest(&dir, "missing"));
+
+        let pd = dir.join("old-pack");
+        std::fs::create_dir_all(&pd).unwrap();
+        std::fs::write(
+            pd.join("pack.toml"),
+            "[pack]\nname = \"old-pack\"\nversion = \"1.0.0\"\nprotocol = \"pack-protocol/0.1\"\nmin_nevoflux = \"0.0.1\"\n",
+        )
+        .unwrap();
+        assert!(!super::activatable_manifest(&dir, "old-pack"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

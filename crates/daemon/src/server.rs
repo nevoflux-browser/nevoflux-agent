@@ -12348,10 +12348,6 @@ async fn handle_skill_list(
     })
 }
 
-/// H1: report the daemon's authoritative `ResolvedPaths` (version + every path
-/// a pack install resolves against). The config/data dirs are resolved the same
-/// way the rest of the daemon resolves them, then aggregated by
-/// `crate::paths::build_resolved_paths`.
 /// The verdict for a `canvas.policy_check` that asks about a daemon command,
 /// or `None` when the request is the older browser-action check.
 fn canvas_command_policy_data(
@@ -12469,6 +12465,10 @@ fn handle_canvas_policy_check(
     })
 }
 
+/// H1: report the daemon's authoritative `ResolvedPaths` (version + every path
+/// a pack install resolves against). The config/data dirs are resolved the same
+/// way the rest of the daemon resolves them, then aggregated by
+/// `crate::paths::build_resolved_paths`.
 fn handle_daemon_info(params: &serde_json::Value) -> serde_json::Value {
     let request_id = params
         .get("request_id")

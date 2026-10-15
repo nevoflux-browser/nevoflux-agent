@@ -84,31 +84,70 @@ pub fn is_read_only_action(action: &str) -> bool {
     )
 }
 
-/// What a pack's panel declared, if the artifact belongs to a pack.
-///
-/// Returns `None` when no installed pack owns this artifact — a canvas the user
-/// or a session created is not a pack panel, so there is no declaration to
-/// enforce. It is still bound by site rules; it just has no capability list.
-fn panel_capabilities(
-    packs_dir: &std::path::Path,
-    artifact_id: &str,
-) -> Option<nevoflux_pack::manifest::DashboardCapabilities> {
-    let entries = std::fs::read_dir(packs_dir).ok()?;
-    for entry in entries.flatten() {
-        let Ok(src) = std::fs::read_to_string(entry.path().join("pack.toml")) else {
-            continue;
-        };
-        let Ok(manifest) = nevoflux_pack::manifest::Manifest::parse(&src) else {
-            continue;
-        };
-        if let Some(d) = &manifest.components.dashboard {
-            if d.artifact_id == artifact_id {
-                return Some(d.capabilities.clone());
-            }
-        }
-    }
-    None
+/// Who a panel belongs to.
+#[derive(Debug)]
+enum PanelOwner {
+    /// No installed pack lists this artifact: a canvas the user or a session
+    /// made. It has no capability list, but site rules still bind it.
+    NotAPack,
+    /// An installed pack lists this artifact in its receipt.
+    Pack {
+        /// The owning pack.
+        pack: String,
+        /// Its installed manifest, or `None` when that is missing, will not
+        /// parse, or does not describe this artifact as its dashboard.
+        manifest: Option<PanelManifest>,
+    },
 }
+
+/// The parts of an installed manifest the gate needs for one panel.
+#[derive(Debug)]
+struct PanelManifest {
+    protocol: String,
+    capabilities: nevoflux_pack::manifest::DashboardCapabilities,
+}
+
+/// Whether a panel belongs to an installed pack, and what that pack declared.
+///
+/// Ownership comes from receipts, which every install writes, not from whether
+/// a manifest happens to be on disk: packs installed before the manifest was
+/// kept at install have only a receipt, and a pack panel whose manifest is
+/// missing must not be mistaken for a generated canvas.
+fn panel_owner(packs_dir: &std::path::Path, artifact_id: &str) -> PanelOwner {
+    let Ok(entries) = std::fs::read_dir(packs_dir) else {
+        return PanelOwner::NotAPack;
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        let Ok(src) = std::fs::read_to_string(dir.join("receipt.json")) else {
+            continue;
+        };
+        let Ok(receipt) = serde_json::from_str::<nevoflux_pack::Receipt>(&src) else {
+            continue;
+        };
+        if !receipt.artifacts.iter().any(|a| a == artifact_id) {
+            continue;
+        }
+        let manifest = std::fs::read_to_string(dir.join(nevoflux_pack::lifecycle::MANIFEST_FILE))
+            .ok()
+            .and_then(|src| nevoflux_pack::manifest::Manifest::parse(&src).ok())
+            .and_then(|m| {
+                let d = m.components.dashboard.as_ref()?;
+                (d.artifact_id == artifact_id).then(|| PanelManifest {
+                    protocol: m.pack.protocol.clone(),
+                    capabilities: d.capabilities.clone(),
+                })
+            });
+        return PanelOwner::Pack {
+            pack: receipt.pack,
+            manifest,
+        };
+    }
+    PanelOwner::NotAPack
+}
+
+/// The protocol under which a panel's `call_tool` declaration is enforced.
+const CALL_TOOL_ENFORCED_PROTOCOL: &str = "pack-protocol/0.2";
 
 /// Run a panel's request through the same pipeline the model's calls use.
 ///
@@ -116,9 +155,21 @@ fn panel_capabilities(
 /// nothing means reaching nothing: a panel should have to say what it needs, so
 /// that reviewing a pack tells you what its panel can do without reading its
 /// code.
+///
+/// Only a `pack-protocol/0.2` manifest is held to its `call_tool` list. A 0.1
+/// manifest cannot declare one (parsing refuses it), so enforcing it would
+/// refuse every `callTool` from panels that were never able to declare
+/// anything; those panels, and pack panels whose manifest is missing, keep
+/// the behaviour they had before manifests were kept at install: site rules
+/// only.
 pub fn check(packs_dir: &std::path::Path, req: &CanvasRequest<'_>) -> CanvasVerdict {
-    if let Some(caps) = panel_capabilities(packs_dir, req.artifact_id) {
-        if !caps.call_tool.iter().any(|a| a == req.action) {
+    if let PanelOwner::Pack {
+        manifest: Some(m), ..
+    } = panel_owner(packs_dir, req.artifact_id)
+    {
+        if m.protocol == CALL_TOOL_ENFORCED_PROTOCOL
+            && !m.capabilities.call_tool.iter().any(|a| a == req.action)
+        {
             return CanvasVerdict::Deny {
                 code: "CAPABILITY_NOT_DECLARED".into(),
                 message: format!(
@@ -170,43 +221,14 @@ pub fn check(packs_dir: &std::path::Path, req: &CanvasRequest<'_>) -> CanvasVerd
     }
 }
 
-/// Command prefixes no panel may send, declared or not: settings, pairing,
-/// accounts, raw storage, souls, local models and the KB installer.
-const FORBIDDEN_COMMAND_PREFIXES: &[&str] = &[
-    "config.",
-    "remote.",
-    "account.",
-    "content_store.",
-    "soul.",
-    "local.",
-    "kb.wizard.",
-];
-
-/// Individual commands no panel may send, declared or not.
-const FORBIDDEN_COMMANDS: &[&str] = &[
-    "mcp.add",
-    "mcp.update",
-    "mcp.delete",
-    "mcp.connect",
-    "mcp.disconnect",
-    "pack.install",
-    "pack.update",
-    "pack.uninstall",
-    "jev.set",
-    "models.download",
-    "session.delete",
-    "session.clone",
-    "file.pick",
-];
-
 /// What a canvas no pack owns may send without declaring anything.
 const GENERATED_CANVAS_COMMANDS: &[&str] = &["daemon.info", "skill.list", "artifact.get"];
 
 /// Whether a command is off limits to every panel (design spec M3-0 §4.1).
-pub fn is_forbidden_command(command: &str) -> bool {
-    FORBIDDEN_COMMANDS.contains(&command)
-        || FORBIDDEN_COMMAND_PREFIXES.iter().any(|p| command.starts_with(p))
-}
+///
+/// The lists live in `nevoflux_pack::commands`, shared with manifest
+/// validation so a pack cannot declare what the runtime will never grant.
+pub use nevoflux_pack::commands::is_forbidden_command;
 
 fn deny(code: &str, message: String) -> CanvasVerdict {
     CanvasVerdict::Deny {
@@ -218,9 +240,10 @@ fn deny(code: &str, message: String) -> CanvasVerdict {
 /// Whether a panel may send this daemon system command.
 ///
 /// Order matters: the permanent deny list wins over any declaration, a pack
-/// panel then gets exactly what its manifest declared, and a canvas no pack
-/// owns gets the fixed read-only set. `artifact.get` is further held to the
-/// caller's own artifact whichever way it was allowed.
+/// panel then gets exactly what its manifest declared (nothing at all when its
+/// manifest is unavailable), and a canvas no pack owns gets the fixed
+/// read-only set. `artifact.get` is further held to the caller's own artifact
+/// whichever way it was allowed.
 pub fn check_command(
     packs_dir: &std::path::Path,
     artifact_id: &str,
@@ -234,9 +257,33 @@ pub fn check_command(
         );
     }
 
-    match panel_capabilities(packs_dir, artifact_id) {
-        Some(caps) => {
-            if !caps.commands.iter().any(|c| c == command) {
+    // Names are compared exactly because the dispatcher (`match command` in
+    // server.rs) matches exactly; a dispatcher that ever normalises names
+    // (trim, case, aliases) must normalise here too, or the gate opens a gap.
+    match panel_owner(packs_dir, artifact_id) {
+        PanelOwner::Pack {
+            pack,
+            manifest: None,
+        } => {
+            // Falling back to the generated-canvas set would hand a pack panel
+            // commands its pack never declared; refusing everything is the
+            // only answer that cannot exceed the declaration.
+            tracing::warn!(
+                pack = %pack,
+                artifact_id = %artifact_id,
+                "canvas gate: pack panel has no readable installed manifest; refusing its commands"
+            );
+            return deny(
+                "PACK_MANIFEST_UNAVAILABLE",
+                format!(
+                    "this panel belongs to the pack `{pack}`, whose installed manifest is missing or unreadable, so none of its commands can be allowed. Update or reinstall the pack"
+                ),
+            );
+        }
+        PanelOwner::Pack {
+            manifest: Some(m), ..
+        } => {
+            if !m.capabilities.commands.iter().any(|c| c == command) {
                 return deny(
                     "COMMAND_NOT_DECLARED",
                     format!(
@@ -245,7 +292,7 @@ pub fn check_command(
                 );
             }
         }
-        None => {
+        PanelOwner::NotAPack => {
             if !GENERATED_CANVAS_COMMANDS.contains(&command) {
                 // The message is the only guidance an agent gets when its
                 // installed app skill predates these rules (the user kept old
@@ -278,8 +325,14 @@ pub fn check_command(
 ///
 /// Always carries `"kind": "command"`: the browser treats an answer without it
 /// as coming from a daemon that predates command checks, and refuses.
-pub fn command_verdict_json(packs_dir: &std::path::Path, params: &serde_json::Value) -> serde_json::Value {
-    let artifact_id = params.get("artifact_id").and_then(|v| v.as_str()).unwrap_or("");
+pub fn command_verdict_json(
+    packs_dir: &std::path::Path,
+    params: &serde_json::Value,
+) -> serde_json::Value {
+    let artifact_id = params
+        .get("artifact_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let command = params.get("command").and_then(|v| v.as_str()).unwrap_or("");
     if artifact_id.is_empty() || command.is_empty() {
         return serde_json::json!({
@@ -421,9 +474,32 @@ message = "no automation on banking sites"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// An install receipt listing `artifacts`, as `lifecycle::install` writes.
+    fn write_receipt(dir: &std::path::Path, pack: &str, artifacts: &[&str]) {
+        let pd = dir.join(pack);
+        std::fs::create_dir_all(&pd).unwrap();
+        std::fs::write(
+            pd.join("receipt.json"),
+            serde_json::json!({
+                "receipt_version": "1",
+                "protocol": "pack-protocol/0.2",
+                "pack": pack,
+                "namespace": pack,
+                "version": "1.0.0",
+                "installed_at": "t",
+                "nevoflux_version": "0.3.0",
+                "paths_source": "daemon",
+                "artifacts": artifacts,
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
     fn write_panel_pack(dir: &std::path::Path, caps: &str) {
         let pd = dir.join("okf");
         std::fs::create_dir_all(&pd).unwrap();
+        write_receipt(dir, "okf", &["okf-dashboard"]);
         std::fs::write(
             pd.join("pack.toml"),
             format!(
@@ -552,6 +628,7 @@ capabilities = {{ call_tool = [{caps}], invoke = [] }}
     fn write_command_pack(dir: &std::path::Path, commands: &str) {
         let pd = dir.join("okf");
         std::fs::create_dir_all(&pd).unwrap();
+        write_receipt(dir, "okf", &["okf-dashboard"]);
         std::fs::write(
             pd.join("pack.toml"),
             format!(
@@ -590,6 +667,20 @@ capabilities = {{ call_tool = [], invoke = [], commands = [{commands}] }}
         assert!(is_forbidden_command("kb.wizard.install_bun"));
         assert!(is_forbidden_command("mcp.add"));
         assert!(is_forbidden_command("session.delete"));
+        // Added after the final review: each is matched exactly as the
+        // dispatcher names it.
+        for c in [
+            "status",
+            "tabs.list",
+            "usage.export_calls",
+            "brain.share_create",
+            "brain.share_import_url",
+            "skill.reload",
+        ] {
+            assert!(is_forbidden_command(c), "{c}");
+        }
+        assert!(!is_forbidden_command("brain.share_list"));
+        assert!(!is_forbidden_command("skill.list"));
         assert!(!is_forbidden_command("configure"));
         assert!(!is_forbidden_command("accounting.report"));
         assert!(!is_forbidden_command("mcp.list"));
@@ -601,8 +692,14 @@ capabilities = {{ call_tool = [], invoke = [], commands = [{commands}] }}
     fn a_generated_canvas_gets_only_the_fixed_three() {
         let dir = tmp("cmd-gen");
         let none = serde_json::json!({});
-        assert_eq!(check_command(&dir, "gen-1", "daemon.info", &none), CanvasVerdict::Allow);
-        assert_eq!(check_command(&dir, "gen-1", "skill.list", &none), CanvasVerdict::Allow);
+        assert_eq!(
+            check_command(&dir, "gen-1", "daemon.info", &none),
+            CanvasVerdict::Allow
+        );
+        assert_eq!(
+            check_command(&dir, "gen-1", "skill.list", &none),
+            CanvasVerdict::Allow
+        );
         assert_eq!(
             code_of(check_command(&dir, "gen-1", "schedule.run_now", &none)),
             "COMMAND_NOT_AVAILABLE"
@@ -655,7 +752,12 @@ capabilities = {{ call_tool = [], invoke = [], commands = [{commands}] }}
             "FORBIDDEN_COMMAND"
         );
         assert_eq!(
-            code_of(check_command(&dir, "okf-dashboard", "config.file.write", &none)),
+            code_of(check_command(
+                &dir,
+                "okf-dashboard",
+                "config.file.write",
+                &none
+            )),
             "FORBIDDEN_COMMAND"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -665,11 +767,21 @@ capabilities = {{ call_tool = [], invoke = [], commands = [{commands}] }}
     fn artifact_get_reaches_only_the_callers_own_artifact() {
         let dir = tmp("cmd-art");
         assert_eq!(
-            check_command(&dir, "gen-1", "artifact.get", &serde_json::json!({"artifact_id": "gen-1"})),
+            check_command(
+                &dir,
+                "gen-1",
+                "artifact.get",
+                &serde_json::json!({"artifact_id": "gen-1"})
+            ),
             CanvasVerdict::Allow
         );
         assert_eq!(
-            code_of(check_command(&dir, "gen-1", "artifact.get", &serde_json::json!({"artifact_id": "other"}))),
+            code_of(check_command(
+                &dir,
+                "gen-1",
+                "artifact.get",
+                &serde_json::json!({"artifact_id": "other"})
+            )),
             "NOT_OWN_ARTIFACT"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -679,7 +791,10 @@ capabilities = {{ call_tool = [], invoke = [], commands = [{commands}] }}
     fn artifact_get_without_an_id_is_refused() {
         let dir = tmp("cmd-art-none");
         for p in [serde_json::json!({}), serde_json::json!({"artifact_id": 7})] {
-            assert_eq!(code_of(check_command(&dir, "gen-1", "artifact.get", &p)), "NOT_OWN_ARTIFACT");
+            assert_eq!(
+                code_of(check_command(&dir, "gen-1", "artifact.get", &p)),
+                "NOT_OWN_ARTIFACT"
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -701,9 +816,312 @@ capabilities = {{ call_tool = [], invoke = [], commands = [{commands}] }}
         assert_eq!(denied["allow"], false);
         assert_eq!(denied["code"], "FORBIDDEN_COMMAND");
 
-        let malformed = command_verdict_json(&dir, &serde_json::json!({"kind": "command", "command": "daemon.info"}));
+        let malformed = command_verdict_json(
+            &dir,
+            &serde_json::json!({"kind": "command", "command": "daemon.info"}),
+        );
         assert_eq!(malformed["kind"], "command");
         assert_eq!(malformed["code"], "MALFORMED_REQUEST");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The own-artifact check applies however `artifact.get` was allowed --
+    /// including when a pack declared it.
+    #[test]
+    fn a_pack_declaring_artifact_get_still_reads_only_its_own_artifact() {
+        let dir = tmp("cmd-pack-art");
+        write_command_pack(&dir, "\"artifact.get\"");
+        assert_eq!(
+            check_command(
+                &dir,
+                "okf-dashboard",
+                "artifact.get",
+                &serde_json::json!({"artifact_id": "okf-dashboard"})
+            ),
+            CanvasVerdict::Allow
+        );
+        assert_eq!(
+            code_of(check_command(
+                &dir,
+                "okf-dashboard",
+                "artifact.get",
+                &serde_json::json!({"artifact_id": "other"})
+            )),
+            "NOT_OWN_ARTIFACT"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_command_is_malformed() {
+        let dir = tmp("cmd-empty");
+        let v = command_verdict_json(
+            &dir,
+            &serde_json::json!({"kind": "command", "artifact_id": "gen-1", "command": ""}),
+        );
+        assert_eq!(v["kind"], "command");
+        assert_eq!(v["allow"], false);
+        assert_eq!(v["code"], "MALFORMED_REQUEST");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_object_command_params_cannot_reach_an_artifact() {
+        let dir = tmp("cmd-nonobj");
+        for p in [
+            serde_json::json!("gen-1"),
+            serde_json::json!(["gen-1"]),
+            serde_json::json!(null),
+        ] {
+            let v = command_verdict_json(
+                &dir,
+                &serde_json::json!({"kind": "command", "artifact_id": "gen-1", "command": "artifact.get", "command_params": p}),
+            );
+            assert_eq!(v["allow"], false, "{p}");
+            assert_eq!(v["code"], "NOT_OWN_ARTIFACT", "{p}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A receipt says the panel is a pack's; without its manifest the gate
+    /// cannot know what was declared, so it refuses everything rather than
+    /// handing out the generated-canvas set.
+    #[test]
+    fn a_pack_panel_without_a_readable_manifest_gets_nothing() {
+        let dir = tmp("cmd-nomanifest");
+        write_receipt(&dir, "okf", &["okf-dashboard"]);
+        let none = serde_json::json!({});
+        for c in ["daemon.info", "skill.list", "schedule.run_now"] {
+            match check_command(&dir, "okf-dashboard", c, &none) {
+                CanvasVerdict::Deny { code, message } => {
+                    assert_eq!(code, "PACK_MANIFEST_UNAVAILABLE", "{c}");
+                    assert!(message.contains("okf"), "{message}");
+                    assert!(message.contains("reinstall"), "{message}");
+                }
+                other => panic!("expected a refusal for {c}, got {other:?}"),
+            }
+        }
+        // The deny list still names itself first.
+        assert_eq!(
+            code_of(check_command(&dir, "okf-dashboard", "remote.unpair", &none)),
+            "FORBIDDEN_COMMAND"
+        );
+
+        // An unparseable manifest is the same as a missing one.
+        std::fs::write(dir.join("okf").join("pack.toml"), "this is not toml [").unwrap();
+        assert_eq!(
+            code_of(check_command(&dir, "okf-dashboard", "daemon.info", &none)),
+            "PACK_MANIFEST_UNAVAILABLE"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A manifest with no receipt is not an installed pack: ownership comes
+    /// from receipts.
+    #[test]
+    fn a_manifest_without_a_receipt_does_not_make_a_pack_panel() {
+        let dir = tmp("cmd-noreceipt");
+        write_command_pack(&dir, "\"schedule.run_now\"");
+        std::fs::remove_file(dir.join("okf").join("receipt.json")).unwrap();
+        let none = serde_json::json!({});
+        assert_eq!(
+            code_of(check_command(
+                &dir,
+                "okf-dashboard",
+                "schedule.run_now",
+                &none
+            )),
+            "COMMAND_NOT_AVAILABLE"
+        );
+        assert_eq!(
+            check_command(&dir, "okf-dashboard", "daemon.info", &none),
+            CanvasVerdict::Allow
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `call_tool` is enforced only for 0.2 manifests. A 0.1 pack panel, or a
+    /// pack panel whose manifest is missing, keeps the pre-manifest behaviour:
+    /// no capability refusal, site rules only.
+    #[test]
+    fn call_tool_is_enforced_only_for_protocol_0_2() {
+        let dir = tmp("ct-01");
+        write_receipt(&dir, "okf", &["okf-dashboard"]);
+        std::fs::write(
+            dir.join("okf").join("pack.toml"),
+            r#"
+[pack]
+name = "okf"
+version = "1.0.0"
+protocol = "pack-protocol/0.1"
+min_nevoflux = "0.3.0"
+
+[components.dashboard]
+artifact_id  = "okf-dashboard"
+content_type = "text/html"
+files_from   = "panel"
+entry        = "index.html"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            check(&dir, &panel_req("okf-dashboard", "click")),
+            CanvasVerdict::Allow
+        );
+
+        std::fs::remove_file(dir.join("okf").join("pack.toml")).unwrap();
+        assert_eq!(
+            check(&dir, &panel_req("okf-dashboard", "click")),
+            CanvasVerdict::Allow
+        );
+
+        // Site rules still bind it.
+        write_bank_pack(&dir, "installed");
+        let mut r = panel_req("okf-dashboard", "click");
+        r.tab_url = Some("https://www.bank.com/transfer".into());
+        assert!(matches!(check(&dir, &r), CanvasVerdict::Deny { .. }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// End to end over the real install path: `lifecycle::install` through the
+    /// daemon's `PackHostImpl` keeps the manifest where the gate reads it, the
+    /// gate then honours the declaration, and uninstall takes the manifest
+    /// away again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_installed_pack_panel_gets_what_its_manifest_declared() {
+        use nevoflux_pack::lifecycle::{install, uninstall, InstallOpts, UninstallOpts};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("cfg");
+        let data = tmp.path().join("data");
+        let paths = nevoflux_pack::ResolvedPaths {
+            version: semver::Version::new(0, 3, 0),
+            config_dir: cfg.clone(),
+            skills_dir: cfg.join("skills"),
+            canvas_tools_dir: cfg.join("canvas-tools"),
+            config_file: cfg.join("config.toml"),
+            data_dir: data.clone(),
+            db_path: data.join("nevoflux.db"),
+        };
+        std::fs::create_dir_all(&paths.skills_dir).unwrap();
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        let db = std::sync::Arc::new(
+            nevoflux_storage::Database::open(paths.db_path.to_str().unwrap()).unwrap(),
+        );
+        let skills = std::sync::Arc::new(tokio::sync::RwLock::new(
+            nevoflux_skills::SkillRegistry::with_config(
+                nevoflux_skills::LoaderConfig::new().with_user_dir(paths.skills_dir.clone()),
+            ),
+        ));
+
+        let pdir = tmp.path().join("src");
+        std::fs::create_dir_all(pdir.join("panel")).unwrap();
+        std::fs::write(pdir.join("panel/index.html"), "<html></html>").unwrap();
+        let raw = r#"
+[pack]
+name = "okf"
+version = "1.0.0"
+protocol = "pack-protocol/0.2"
+min_nevoflux = "0.3.0"
+
+[components.dashboard]
+artifact_id  = "okf-dashboard"
+content_type = "text/html"
+files_from   = "panel"
+entry        = "index.html"
+capabilities = { commands = ["schedule.run_now"] }
+"#;
+        let manifest = nevoflux_pack::Manifest::parse(raw).unwrap();
+        let handle = tokio::runtime::Handle::current();
+        let host = {
+            let (paths, db, skills, handle) =
+                (paths.clone(), db.clone(), skills.clone(), handle.clone());
+            move || {
+                crate::pack::host_impl::PackHostImpl::new(
+                    paths,
+                    db,
+                    skills,
+                    None,
+                    None,
+                    handle,
+                    "test".into(),
+                )
+            }
+        };
+        let host2 = host.clone();
+        let pdir2 = pdir.clone();
+        tokio::task::spawn_blocking(move || {
+            let opts = InstallOpts {
+                now_utc: "2026-10-15T00:00:00Z".into(),
+                ..Default::default()
+            };
+            install(&host2(), &manifest, raw, &pdir2, &opts)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        let packs_dir = paths.packs_dir();
+        let installed_manifest = packs_dir.join("okf").join("pack.toml");
+        assert!(installed_manifest.exists(), "install keeps the manifest");
+
+        let none = serde_json::json!({});
+        assert_eq!(
+            check_command(&packs_dir, "okf-dashboard", "schedule.run_now", &none),
+            CanvasVerdict::Allow
+        );
+        assert_eq!(
+            code_of(check_command(
+                &packs_dir,
+                "okf-dashboard",
+                "brain.put",
+                &none
+            )),
+            "COMMAND_NOT_DECLARED"
+        );
+        assert_eq!(
+            code_of(check_command(
+                &packs_dir,
+                "okf-dashboard",
+                "daemon.info",
+                &none
+            )),
+            "COMMAND_NOT_DECLARED"
+        );
+
+        // The receipt still says the panel is the pack's; with the manifest
+        // gone the gate refuses rather than guessing.
+        let saved = std::fs::read(&installed_manifest).unwrap();
+        std::fs::remove_file(&installed_manifest).unwrap();
+        assert_eq!(
+            code_of(check_command(
+                &packs_dir,
+                "okf-dashboard",
+                "schedule.run_now",
+                &none
+            )),
+            "PACK_MANIFEST_UNAVAILABLE"
+        );
+        std::fs::write(&installed_manifest, saved).unwrap();
+
+        tokio::task::spawn_blocking(move || uninstall(&host(), "okf", &UninstallOpts::default()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !installed_manifest.exists(),
+            "uninstall removes the manifest"
+        );
+        assert!(!packs_dir.join("okf").exists(), "nothing left of the pack");
+        // No receipt any more: it is just a canvas now.
+        assert_eq!(
+            code_of(check_command(
+                &packs_dir,
+                "okf-dashboard",
+                "schedule.run_now",
+                &none
+            )),
+            "COMMAND_NOT_AVAILABLE"
+        );
     }
 }
