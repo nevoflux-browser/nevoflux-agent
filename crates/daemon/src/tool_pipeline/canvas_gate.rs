@@ -149,6 +149,11 @@ fn panel_owner(packs_dir: &std::path::Path, artifact_id: &str) -> PanelOwner {
 /// The protocol under which a panel's `call_tool` declaration is enforced.
 const CALL_TOOL_ENFORCED_PROTOCOL: &str = "pack-protocol/0.2";
 
+/// The protocol under which a panel gets exactly its declared `commands`.
+/// Panels of older manifests, which cannot declare any, get the
+/// generated-canvas set instead.
+const COMMANDS_DECLARED_PROTOCOL: &str = "pack-protocol/0.2";
+
 /// Run a panel's request through the same pipeline the model's calls use.
 ///
 /// A pack panel is checked against its declared capabilities first. Declaring
@@ -239,10 +244,11 @@ fn deny(code: &str, message: String) -> CanvasVerdict {
 
 /// Whether a panel may send this daemon system command.
 ///
-/// Order matters: the permanent deny list wins over any declaration, a pack
-/// panel then gets exactly what its manifest declared (nothing at all when its
-/// manifest is unavailable), and a canvas no pack owns gets the fixed
-/// read-only set. `artifact.get` is further held to the caller's own artifact
+/// Order matters: the permanent deny list wins over any declaration, a
+/// `pack-protocol/0.2` pack panel then gets exactly what its manifest declared
+/// (nothing at all when its manifest is unavailable), and a canvas no pack
+/// owns -- or the panel of a 0.1 pack, which cannot declare commands -- gets
+/// the fixed read-only set. `artifact.get` is further held to the caller's own artifact
 /// whichever way it was allowed.
 pub fn check_command(
     packs_dir: &std::path::Path,
@@ -282,12 +288,30 @@ pub fn check_command(
         }
         PanelOwner::Pack {
             manifest: Some(m), ..
-        } => {
+        } if m.protocol == COMMANDS_DECLARED_PROTOCOL => {
             if !m.capabilities.commands.iter().any(|c| c == command) {
                 return deny(
                     "COMMAND_NOT_DECLARED",
                     format!(
                         "this panel did not declare `{command}` in dashboard.capabilities.commands"
+                    ),
+                );
+            }
+        }
+        // A 0.1 manifest cannot declare `commands` at all, so its panel is
+        // treated like a generated canvas rather than as having declared
+        // nothing.
+        PanelOwner::Pack {
+            pack,
+            manifest: Some(m),
+        } => {
+            if !GENERATED_CANVAS_COMMANDS.contains(&command) {
+                return deny(
+                    "COMMAND_NOT_AVAILABLE",
+                    format!(
+                        "`{command}` is not available to this panel: the pack `{pack}` uses {}, which cannot declare commands, so its panel may send only {}. Use callTool or tool.invoke to run tools",
+                        m.protocol,
+                        GENERATED_CANVAS_COMMANDS.join(", ")
                     ),
                 );
             }
@@ -1123,5 +1147,96 @@ capabilities = { commands = ["schedule.run_now"] }
             )),
             "COMMAND_NOT_AVAILABLE"
         );
+    }
+
+    fn write_v01_panel_pack(dir: &std::path::Path) {
+        write_receipt(dir, "okf", &["okf-dashboard"]);
+        std::fs::write(
+            dir.join("okf").join("pack.toml"),
+            r#"
+[pack]
+name = "okf"
+version = "1.0.0"
+protocol = "pack-protocol/0.1"
+min_nevoflux = "0.3.0"
+
+[components.dashboard]
+artifact_id  = "okf-dashboard"
+content_type = "text/html"
+files_from   = "panel"
+entry        = "index.html"
+"#,
+        )
+        .unwrap();
+    }
+
+    /// A 0.1 manifest cannot declare commands, so its panel gets what a
+    /// generated canvas gets rather than nothing.
+    #[test]
+    fn a_0_1_pack_panel_gets_the_generated_canvas_set() {
+        let dir = tmp("cmd-v01");
+        write_v01_panel_pack(&dir);
+        let none = serde_json::json!({});
+        assert_eq!(
+            check_command(&dir, "okf-dashboard", "daemon.info", &none),
+            CanvasVerdict::Allow
+        );
+        assert_eq!(
+            check_command(&dir, "okf-dashboard", "skill.list", &none),
+            CanvasVerdict::Allow
+        );
+        match check_command(&dir, "okf-dashboard", "schedule.run_now", &none) {
+            CanvasVerdict::Deny { code, message } => {
+                assert_eq!(code, "COMMAND_NOT_AVAILABLE");
+                // Accurate for a pack panel: it is not a generated canvas.
+                assert!(!message.contains("generated canvas"), "{message}");
+                assert!(message.contains("okf"), "{message}");
+                assert!(message.contains("pack-protocol/0.1"), "{message}");
+                assert!(message.contains("daemon.info"), "{message}");
+                assert!(message.contains("callTool"), "{message}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert_eq!(
+            check_command(
+                &dir,
+                "okf-dashboard",
+                "artifact.get",
+                &serde_json::json!({"artifact_id": "okf-dashboard"})
+            ),
+            CanvasVerdict::Allow
+        );
+        assert_eq!(
+            code_of(check_command(
+                &dir,
+                "okf-dashboard",
+                "artifact.get",
+                &serde_json::json!({"artifact_id": "other"})
+            )),
+            "NOT_OWN_ARTIFACT"
+        );
+        // The deny list still comes first.
+        assert_eq!(
+            code_of(check_command(&dir, "okf-dashboard", "remote.unpair", &none)),
+            "FORBIDDEN_COMMAND"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A 0.2 panel that declared no commands gets none -- not the fixed set.
+    #[test]
+    fn a_0_2_pack_panel_without_commands_gets_none() {
+        let dir = tmp("cmd-v02-empty");
+        write_command_pack(&dir, "");
+        assert_eq!(
+            code_of(check_command(
+                &dir,
+                "okf-dashboard",
+                "daemon.info",
+                &serde_json::json!({})
+            )),
+            "COMMAND_NOT_DECLARED"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
