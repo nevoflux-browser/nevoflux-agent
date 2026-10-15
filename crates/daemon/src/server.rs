@@ -12352,6 +12352,18 @@ async fn handle_skill_list(
 /// a pack install resolves against). The config/data dirs are resolved the same
 /// way the rest of the daemon resolves them, then aggregated by
 /// `crate::paths::build_resolved_paths`.
+/// The verdict for a `canvas.policy_check` that asks about a daemon command,
+/// or `None` when the request is the older browser-action check.
+fn canvas_command_policy_data(
+    packs_dir: &std::path::Path,
+    params: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    if params.get("kind").and_then(|k| k.as_str()) != Some("command") {
+        return None;
+    }
+    Some(crate::tool_pipeline::canvas_gate::command_verdict_json(packs_dir, params))
+}
+
 /// `canvas.policy_check` — the verdict a Canvas panel asks for before acting.
 ///
 /// The panel runs the action itself; this only answers whether it may. Routing
@@ -12369,6 +12381,23 @@ fn handle_canvas_policy_check(
         .and_then(|r| r.as_str())
         .unwrap_or("")
         .to_string();
+
+    // A command check has its own fields (command, command_params) and its
+    // own gate; everything else is the browser-action check below, unchanged
+    // for browsers that never send `kind`.
+    if let Some(data) =
+        canvas_command_policy_data(&crate::paths::resolve_from_daemon().packs_dir(), params)
+    {
+        return serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": "canvas.policy_check",
+                "success": true,
+                "data": data
+            }
+        });
+    }
 
     let artifact_id = params
         .get("artifact_id")
@@ -14740,6 +14769,29 @@ mod usage_frame_tests {
 mod tests {
     use super::*;
     use nevoflux_protocol::PlanStep;
+
+    #[test]
+    fn a_command_kind_policy_check_is_judged_by_the_command_gate() {
+        let dir = std::env::temp_dir().join(format!("nf-pc-cmd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let params = serde_json::json!({
+            "kind": "command", "artifact_id": "gen-1", "command": "remote.unpair"
+        });
+        let data = super::canvas_command_policy_data(&dir, &params).expect("command kind");
+        assert_eq!(data["kind"], "command");
+        assert_eq!(data["code"], "FORBIDDEN_COMMAND");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_request_without_kind_is_still_a_browser_action_check() {
+        let dir = std::env::temp_dir();
+        let params = serde_json::json!({ "artifact_id": "gen-1", "action": "click" });
+        assert!(super::canvas_command_policy_data(&dir, &params).is_none());
+        let other = serde_json::json!({ "kind": "action", "artifact_id": "gen-1", "action": "click" });
+        assert!(super::canvas_command_policy_data(&dir, &other).is_none());
+    }
 
     fn meta_with(value: serde_json::Value) -> std::collections::HashMap<String, serde_json::Value> {
         let mut m = std::collections::HashMap::new();
