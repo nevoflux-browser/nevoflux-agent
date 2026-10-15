@@ -104,6 +104,12 @@ pub struct DashboardCapabilities {
     /// Whitelisted canvas tools reachable through `NevofluxSDK.tool.invoke`.
     #[serde(default)]
     pub invoke: Vec<String>,
+    /// Daemon system commands reachable through `NevofluxSDK.agent.sendCommand`.
+    ///
+    /// Still bound by the permanent deny list in the daemon's canvas gate: a
+    /// command there is refused even when declared here.
+    #[serde(default)]
+    pub commands: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -304,7 +310,9 @@ impl Manifest {
                 only_in_0_2.push("components.hooks");
             }
             if self.components.dashboard.as_ref().is_some_and(|d| {
-                !d.capabilities.call_tool.is_empty() || !d.capabilities.invoke.is_empty()
+                !d.capabilities.call_tool.is_empty()
+                    || !d.capabilities.invoke.is_empty()
+                    || !d.capabilities.commands.is_empty()
             }) {
                 only_in_0_2.push("components.dashboard.capabilities");
             }
@@ -553,6 +561,55 @@ mod tests {
         let d = m.components.dashboard.unwrap();
         assert!(d.capabilities.call_tool.is_empty());
         assert!(d.capabilities.invoke.is_empty());
+    }
+
+    #[test]
+    fn dashboard_commands_parse_and_default_to_empty() {
+        let src = format!(
+            "{V02}
+[components.dashboard]
+artifact_id=\"okf-dashboard\"
+content_type=\"text/html\"
+files_from=\"panel\"
+entry=\"index.html\"
+capabilities = {{ call_tool = [], invoke = [], commands = [\"schedule.run_now\", \"brain.save_webpage\"] }}
+"
+        );
+        let m = Manifest::parse(&src).unwrap();
+        let d = m.components.dashboard.unwrap();
+        assert_eq!(d.capabilities.commands, vec!["schedule.run_now", "brain.save_webpage"]);
+
+        let bare = format!(
+            "{V02}
+[components.dashboard]
+artifact_id=\"p\"
+content_type=\"text/html\"
+files_from=\"panel\"
+entry=\"index.html\"
+"
+        );
+        let d = Manifest::parse(&bare).unwrap().components.dashboard.unwrap();
+        assert!(d.capabilities.commands.is_empty());
+    }
+
+    #[test]
+    fn commands_require_protocol_0_2() {
+        let src = r#"
+[pack]
+name = "old"
+version = "0.1.0"
+protocol = "pack-protocol/0.1"
+min_nevoflux = "0.3.0"
+
+[components.dashboard]
+artifact_id  = "old-dashboard"
+content_type = "text/html"
+files_from   = "panel"
+entry        = "index.html"
+capabilities = { commands = ["daemon.info"] }
+"#;
+        let err = Manifest::parse(src).unwrap_err();
+        assert!(err.contains("components.dashboard.capabilities"), "{err}");
     }
 
     const HOOKS: &str = r#"
