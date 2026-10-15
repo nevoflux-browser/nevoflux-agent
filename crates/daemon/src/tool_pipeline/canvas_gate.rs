@@ -84,12 +84,15 @@ pub fn is_read_only_action(action: &str) -> bool {
     )
 }
 
-/// What a pack's panel is allowed to reach, if the artifact belongs to a pack.
+/// What a pack's panel declared, if the artifact belongs to a pack.
 ///
 /// Returns `None` when no installed pack owns this artifact — a canvas the user
 /// or a session created is not a pack panel, so there is no declaration to
 /// enforce. It is still bound by site rules; it just has no capability list.
-fn declared_capabilities(packs_dir: &std::path::Path, artifact_id: &str) -> Option<Vec<String>> {
+fn panel_capabilities(
+    packs_dir: &std::path::Path,
+    artifact_id: &str,
+) -> Option<nevoflux_pack::manifest::DashboardCapabilities> {
     let entries = std::fs::read_dir(packs_dir).ok()?;
     for entry in entries.flatten() {
         let Ok(src) = std::fs::read_to_string(entry.path().join("pack.toml")) else {
@@ -100,7 +103,7 @@ fn declared_capabilities(packs_dir: &std::path::Path, artifact_id: &str) -> Opti
         };
         if let Some(d) = &manifest.components.dashboard {
             if d.artifact_id == artifact_id {
-                return Some(d.capabilities.call_tool.clone());
+                return Some(d.capabilities.clone());
             }
         }
     }
@@ -114,8 +117,8 @@ fn declared_capabilities(packs_dir: &std::path::Path, artifact_id: &str) -> Opti
 /// that reviewing a pack tells you what its panel can do without reading its
 /// code.
 pub fn check(packs_dir: &std::path::Path, req: &CanvasRequest<'_>) -> CanvasVerdict {
-    if let Some(declared) = declared_capabilities(packs_dir, req.artifact_id) {
-        if !declared.iter().any(|a| a == req.action) {
+    if let Some(caps) = panel_capabilities(packs_dir, req.artifact_id) {
+        if !caps.call_tool.iter().any(|a| a == req.action) {
             return CanvasVerdict::Deny {
                 code: "CAPABILITY_NOT_DECLARED".into(),
                 message: format!(
@@ -164,6 +167,140 @@ pub fn check(packs_dir: &std::path::Path, req: &CanvasRequest<'_>) -> CanvasVerd
             code: d.code,
             message: d.message,
         },
+    }
+}
+
+/// Command prefixes no panel may send, declared or not: settings, pairing,
+/// accounts, raw storage, souls, local models and the KB installer.
+const FORBIDDEN_COMMAND_PREFIXES: &[&str] = &[
+    "config.",
+    "remote.",
+    "account.",
+    "content_store.",
+    "soul.",
+    "local.",
+    "kb.wizard.",
+];
+
+/// Individual commands no panel may send, declared or not.
+const FORBIDDEN_COMMANDS: &[&str] = &[
+    "mcp.add",
+    "mcp.update",
+    "mcp.delete",
+    "mcp.connect",
+    "mcp.disconnect",
+    "pack.install",
+    "pack.update",
+    "pack.uninstall",
+    "jev.set",
+    "models.download",
+    "session.delete",
+    "session.clone",
+    "file.pick",
+];
+
+/// What a canvas no pack owns may send without declaring anything.
+const GENERATED_CANVAS_COMMANDS: &[&str] = &["daemon.info", "skill.list", "artifact.get"];
+
+/// Whether a command is off limits to every panel (design spec M3-0 §4.1).
+pub fn is_forbidden_command(command: &str) -> bool {
+    FORBIDDEN_COMMANDS.contains(&command)
+        || FORBIDDEN_COMMAND_PREFIXES.iter().any(|p| command.starts_with(p))
+}
+
+fn deny(code: &str, message: String) -> CanvasVerdict {
+    CanvasVerdict::Deny {
+        code: code.into(),
+        message,
+    }
+}
+
+/// Whether a panel may send this daemon system command.
+///
+/// Order matters: the permanent deny list wins over any declaration, a pack
+/// panel then gets exactly what its manifest declared, and a canvas no pack
+/// owns gets the fixed read-only set. `artifact.get` is further held to the
+/// caller's own artifact whichever way it was allowed.
+pub fn check_command(
+    packs_dir: &std::path::Path,
+    artifact_id: &str,
+    command: &str,
+    command_params: &serde_json::Value,
+) -> CanvasVerdict {
+    if is_forbidden_command(command) {
+        return deny(
+            "FORBIDDEN_COMMAND",
+            format!("`{command}` cannot be sent from a canvas"),
+        );
+    }
+
+    match panel_capabilities(packs_dir, artifact_id) {
+        Some(caps) => {
+            if !caps.commands.iter().any(|c| c == command) {
+                return deny(
+                    "COMMAND_NOT_DECLARED",
+                    format!(
+                        "this panel did not declare `{command}` in dashboard.capabilities.commands"
+                    ),
+                );
+            }
+        }
+        None => {
+            if !GENERATED_CANVAS_COMMANDS.contains(&command) {
+                // The message is the only guidance an agent gets when its
+                // installed app skill predates these rules (the user kept old
+                // skills at the update prompt), so it names the way forward.
+                return deny(
+                    "COMMAND_NOT_AVAILABLE",
+                    format!(
+                        "`{command}` is not available to a generated canvas; it may send {}. Use callTool or tool.invoke to run tools",
+                        GENERATED_CANVAS_COMMANDS.join(", ")
+                    ),
+                );
+            }
+        }
+    }
+
+    if command == "artifact.get" {
+        let target = command_params.get("artifact_id").and_then(|v| v.as_str());
+        if target != Some(artifact_id) {
+            return deny(
+                "NOT_OWN_ARTIFACT",
+                "a canvas may only read its own artifact".into(),
+            );
+        }
+    }
+
+    CanvasVerdict::Allow
+}
+
+/// The `canvas.policy_check` answer for `kind: "command"`.
+///
+/// Always carries `"kind": "command"`: the browser treats an answer without it
+/// as coming from a daemon that predates command checks, and refuses.
+pub fn command_verdict_json(packs_dir: &std::path::Path, params: &serde_json::Value) -> serde_json::Value {
+    let artifact_id = params.get("artifact_id").and_then(|v| v.as_str()).unwrap_or("");
+    let command = params.get("command").and_then(|v| v.as_str()).unwrap_or("");
+    if artifact_id.is_empty() || command.is_empty() {
+        return serde_json::json!({
+            "kind": "command",
+            "allow": false,
+            "code": "MALFORMED_REQUEST",
+            "message": "a command check needs artifact_id and command"
+        });
+    }
+    let command_params = params
+        .get("command_params")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
+    match check_command(packs_dir, artifact_id, command, &command_params) {
+        CanvasVerdict::Allow => serde_json::json!({ "kind": "command", "allow": true }),
+        CanvasVerdict::Deny { code, message } => serde_json::json!({
+            "kind": "command",
+            "allow": false,
+            "code": code,
+            "message": message
+        }),
     }
 }
 
@@ -410,5 +547,163 @@ capabilities = {{ call_tool = [{caps}], invoke = [] }}
         ] {
             assert!(!is_read_only_action(a), "{a} should not be read-only");
         }
+    }
+
+    fn write_command_pack(dir: &std::path::Path, commands: &str) {
+        let pd = dir.join("okf");
+        std::fs::create_dir_all(&pd).unwrap();
+        std::fs::write(
+            pd.join("pack.toml"),
+            format!(
+                r#"
+[pack]
+name = "okf"
+version = "1.0.0"
+protocol = "pack-protocol/0.2"
+min_nevoflux = "0.3.0"
+
+[components.dashboard]
+artifact_id  = "okf-dashboard"
+content_type = "text/html"
+files_from   = "panel"
+entry        = "index.html"
+capabilities = {{ call_tool = [], invoke = [], commands = [{commands}] }}
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    fn code_of(v: CanvasVerdict) -> String {
+        match v {
+            CanvasVerdict::Deny { code, .. } => code,
+            CanvasVerdict::Allow => "ALLOW".into(),
+        }
+    }
+
+    #[test]
+    fn forbidden_prefixes_match_whole_segments_only() {
+        assert!(is_forbidden_command("config.llm.set"));
+        assert!(is_forbidden_command("remote.agent_set_tier"));
+        assert!(is_forbidden_command("account.device_grant_start"));
+        assert!(is_forbidden_command("content_store.set"));
+        assert!(is_forbidden_command("kb.wizard.install_bun"));
+        assert!(is_forbidden_command("mcp.add"));
+        assert!(is_forbidden_command("session.delete"));
+        assert!(!is_forbidden_command("configure"));
+        assert!(!is_forbidden_command("accounting.report"));
+        assert!(!is_forbidden_command("mcp.list"));
+        assert!(!is_forbidden_command("session.list"));
+        assert!(!is_forbidden_command("schedule.run_now"));
+    }
+
+    #[test]
+    fn a_generated_canvas_gets_only_the_fixed_three() {
+        let dir = tmp("cmd-gen");
+        let none = serde_json::json!({});
+        assert_eq!(check_command(&dir, "gen-1", "daemon.info", &none), CanvasVerdict::Allow);
+        assert_eq!(check_command(&dir, "gen-1", "skill.list", &none), CanvasVerdict::Allow);
+        assert_eq!(
+            code_of(check_command(&dir, "gen-1", "schedule.run_now", &none)),
+            "COMMAND_NOT_AVAILABLE"
+        );
+        // An agent following an outdated installed skill learns the way
+        // forward from this message alone.
+        match check_command(&dir, "gen-1", "schedule.run_now", &none) {
+            CanvasVerdict::Deny { message, .. } => {
+                assert!(message.contains("daemon.info"), "{message}");
+                assert!(message.contains("callTool"), "{message}");
+            }
+            other => panic!("expected a denial, got {other:?}"),
+        }
+        assert_eq!(
+            code_of(check_command(&dir, "gen-1", "remote.agent_set_tier", &none)),
+            "FORBIDDEN_COMMAND"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pack_panel_gets_exactly_what_it_declared() {
+        let dir = tmp("cmd-pack");
+        write_command_pack(&dir, "\"schedule.run_now\"");
+        let none = serde_json::json!({});
+        assert_eq!(
+            check_command(&dir, "okf-dashboard", "schedule.run_now", &none),
+            CanvasVerdict::Allow
+        );
+        assert_eq!(
+            code_of(check_command(&dir, "okf-dashboard", "brain.put", &none)),
+            "COMMAND_NOT_DECLARED"
+        );
+        // A pack panel did not declare daemon.info, so the generated-canvas
+        // set does not apply to it: a pack says what it needs.
+        assert_eq!(
+            code_of(check_command(&dir, "okf-dashboard", "daemon.info", &none)),
+            "COMMAND_NOT_DECLARED"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_declared_forbidden_command_is_still_refused() {
+        let dir = tmp("cmd-forbid");
+        write_command_pack(&dir, "\"remote.unpair\", \"config.file.write\"");
+        let none = serde_json::json!({});
+        assert_eq!(
+            code_of(check_command(&dir, "okf-dashboard", "remote.unpair", &none)),
+            "FORBIDDEN_COMMAND"
+        );
+        assert_eq!(
+            code_of(check_command(&dir, "okf-dashboard", "config.file.write", &none)),
+            "FORBIDDEN_COMMAND"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn artifact_get_reaches_only_the_callers_own_artifact() {
+        let dir = tmp("cmd-art");
+        assert_eq!(
+            check_command(&dir, "gen-1", "artifact.get", &serde_json::json!({"artifact_id": "gen-1"})),
+            CanvasVerdict::Allow
+        );
+        assert_eq!(
+            code_of(check_command(&dir, "gen-1", "artifact.get", &serde_json::json!({"artifact_id": "other"}))),
+            "NOT_OWN_ARTIFACT"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn artifact_get_without_an_id_is_refused() {
+        let dir = tmp("cmd-art-none");
+        for p in [serde_json::json!({}), serde_json::json!({"artifact_id": 7})] {
+            assert_eq!(code_of(check_command(&dir, "gen-1", "artifact.get", &p)), "NOT_OWN_ARTIFACT");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn command_verdict_json_always_echoes_the_kind() {
+        let dir = tmp("cmd-json");
+        let ok = command_verdict_json(
+            &dir,
+            &serde_json::json!({"kind": "command", "artifact_id": "gen-1", "command": "daemon.info", "command_params": {}}),
+        );
+        assert_eq!(ok, serde_json::json!({"kind": "command", "allow": true}));
+
+        let denied = command_verdict_json(
+            &dir,
+            &serde_json::json!({"kind": "command", "artifact_id": "gen-1", "command": "account.status"}),
+        );
+        assert_eq!(denied["kind"], "command");
+        assert_eq!(denied["allow"], false);
+        assert_eq!(denied["code"], "FORBIDDEN_COMMAND");
+
+        let malformed = command_verdict_json(&dir, &serde_json::json!({"kind": "command", "command": "daemon.info"}));
+        assert_eq!(malformed["kind"], "command");
+        assert_eq!(malformed["code"], "MALFORMED_REQUEST");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
