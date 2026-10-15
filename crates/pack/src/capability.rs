@@ -14,6 +14,7 @@ pub enum Violation {
     SeedNotProtected { slug: String },
     PathTraversal { raw: String },
     ArtifactIdNotNamespaced { id: String },
+    DashboardCommandRejected { command: String, reason: String },
 }
 
 /// Validate a manifest against resolved paths. `raw_toml` is the original
@@ -72,12 +73,30 @@ pub fn validate(
 
     // (6) dashboard artifact id must be namespaced under the pack name, so a
     // pack can't clobber another pack's (or the platform's) artifact. The
-    // convention is `<pack-name>-dashboard`; require the `<pack-name>` prefix.
+    // convention is `<pack-name>-dashboard`; require the id to be the pack
+    // name itself or to start with `<pack-name>-`. A bare prefix match would
+    // let a pack named `ok` claim `okf-dashboard`, which belongs to `okf`.
     if let Some(d) = &manifest.components.dashboard {
-        if !d.artifact_id.starts_with(&manifest.pack.name) {
+        let name = &manifest.pack.name;
+        if d.artifact_id != *name && !d.artifact_id.starts_with(&format!("{name}-")) {
             v.push(Violation::ArtifactIdNotNamespaced {
                 id: d.artifact_id.clone(),
             });
+        }
+    }
+
+    // (7) declared panel commands must be grantable: not empty, no whitespace,
+    // not on the permanent deny list (`crate::commands`). The runtime gate refuses
+    // a forbidden command even when declared; accepting the declaration would
+    // make the install review list a capability the panel will never get.
+    if let Some(d) = &manifest.components.dashboard {
+        for c in &d.capabilities.commands {
+            if let Some(reason) = crate::commands::declared_command_problem(c) {
+                v.push(Violation::DashboardCommandRejected {
+                    command: c.clone(),
+                    reason: reason.to_string(),
+                });
+            }
         }
     }
 
@@ -282,6 +301,70 @@ mod tests {
 
         let (m, raw) = manifest(
             "[components.dashboard]\nartifact_id=\"demo-dashboard\"\ncontent_type=\"text/html\"\nfiles_from=\"d\"\nentry=\"i.html\"\n",
+        );
+        assert!(validate(&m, &paths(), &raw).is_ok());
+    }
+
+    fn manifest_v02(name: &str, extra: &str) -> (Manifest, String) {
+        let src = format!(
+            "[pack]\nname=\"{name}\"\nversion=\"0.1.0\"\nprotocol=\"pack-protocol/0.2\"\nmin_nevoflux=\"0.3.0\"\n{extra}"
+        );
+        (Manifest::parse(&src).unwrap(), src)
+    }
+
+    fn dashboard(id: &str, commands: &str) -> String {
+        format!(
+            "[components.dashboard]\nartifact_id=\"{id}\"\ncontent_type=\"text/html\"\nfiles_from=\"d\"\nentry=\"i.html\"\ncapabilities={{ commands=[{commands}] }}\n"
+        )
+    }
+
+    /// A pack named `ok` must not claim `okf-dashboard`, which is `okf`'s.
+    #[test]
+    fn artifact_id_must_be_the_name_or_start_with_name_dash() {
+        let (m, raw) = manifest_v02("ok", &dashboard("okf-dashboard", ""));
+        let errs = validate(&m, &paths(), &raw).unwrap_err();
+        assert!(errs.contains(&Violation::ArtifactIdNotNamespaced {
+            id: "okf-dashboard".into()
+        }));
+
+        for (name, id) in [
+            ("ok", "ok-dashboard"),
+            ("ok", "ok"),
+            ("okf", "okf-dashboard"),
+        ] {
+            let (m, raw) = manifest_v02(name, &dashboard(id, ""));
+            assert!(validate(&m, &paths(), &raw).is_ok(), "{name} / {id}");
+        }
+    }
+
+    /// Declaring a command the runtime will always refuse is a pack-author
+    /// error; it surfaces at install rather than in the install review.
+    #[test]
+    fn forbidden_empty_or_whitespace_commands_are_rejected() {
+        let (m, raw) = manifest_v02(
+            "okf",
+            &dashboard(
+                "okf-dashboard",
+                "\"schedule.run_now\", \"remote.unpair\", \"\", \"skill. list\", \"status\"",
+            ),
+        );
+        let errs = validate(&m, &paths(), &raw).unwrap_err();
+        let rejected: Vec<&str> = errs
+            .iter()
+            .filter_map(|e| match e {
+                Violation::DashboardCommandRejected { command, .. } => Some(command.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rejected, vec!["remote.unpair", "", "skill. list", "status"]);
+        assert_eq!(errs.len(), 4, "{errs:?}");
+    }
+
+    #[test]
+    fn grantable_commands_pass() {
+        let (m, raw) = manifest_v02(
+            "okf",
+            &dashboard("okf-dashboard", "\"schedule.run_now\", \"daemon.info\""),
         );
         assert!(validate(&m, &paths(), &raw).is_ok());
     }

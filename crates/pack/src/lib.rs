@@ -4,6 +4,7 @@
 
 pub mod capability;
 pub mod checklist;
+pub mod commands;
 pub mod error;
 pub mod host;
 pub mod lifecycle;
