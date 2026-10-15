@@ -94,6 +94,10 @@ enum PanelOwner {
     Pack {
         /// The owning pack.
         pack: String,
+        /// The protocol the receipt recorded at install. Every receipt has
+        /// one, so it still says what kind of pack this is when the manifest
+        /// is gone.
+        receipt_protocol: String,
         /// Its installed manifest, or `None` when that is missing, will not
         /// parse, or does not describe this artifact as its dashboard.
         manifest: Option<PanelManifest>,
@@ -140,6 +144,7 @@ fn panel_owner(packs_dir: &std::path::Path, artifact_id: &str) -> PanelOwner {
             });
         return PanelOwner::Pack {
             pack: receipt.pack,
+            receipt_protocol: receipt.protocol,
             manifest,
         };
     }
@@ -153,6 +158,26 @@ const CALL_TOOL_ENFORCED_PROTOCOL: &str = "pack-protocol/0.2";
 /// Panels of older manifests, which cannot declare any, get the
 /// generated-canvas set instead.
 const COMMANDS_DECLARED_PROTOCOL: &str = "pack-protocol/0.2";
+
+/// The protocol whose panels get the generated-canvas set even without a
+/// manifest on disk: a 0.1 pack cannot declare commands, so its receipt alone
+/// says everything the gate needs.
+const NO_COMMANDS_PROTOCOL: &str = "pack-protocol/0.1";
+
+/// The refusal for a panel of a pack whose protocol cannot declare commands,
+/// or `None` when the command is in the generated-canvas set.
+fn undeclarable_panel_refusal(pack: &str, protocol: &str, command: &str) -> Option<CanvasVerdict> {
+    if GENERATED_CANVAS_COMMANDS.contains(&command) {
+        return None;
+    }
+    Some(deny(
+        "COMMAND_NOT_AVAILABLE",
+        format!(
+            "`{command}` is not available to this panel: the pack `{pack}` uses {protocol}, which cannot declare commands, so its panel may send only {}. Use callTool or tool.invoke to run tools",
+            GENERATED_CANVAS_COMMANDS.join(", ")
+        ),
+    ))
+}
 
 /// Run a panel's request through the same pipeline the model's calls use.
 ///
@@ -247,8 +272,9 @@ fn deny(code: &str, message: String) -> CanvasVerdict {
 /// Order matters: the permanent deny list wins over any declaration, a
 /// `pack-protocol/0.2` pack panel then gets exactly what its manifest declared
 /// (nothing at all when its manifest is unavailable), and a canvas no pack
-/// owns -- or the panel of a 0.1 pack, which cannot declare commands -- gets
-/// the fixed read-only set. `artifact.get` is further held to the caller's own artifact
+/// owns -- or the panel of a 0.1 pack, which cannot declare commands, judged
+/// by its manifest or, without one, by its receipt -- gets the fixed
+/// read-only set. `artifact.get` is further held to the caller's own artifact
 /// whichever way it was allowed.
 pub fn check_command(
     packs_dir: &std::path::Path,
@@ -267,9 +293,22 @@ pub fn check_command(
     // server.rs) matches exactly; a dispatcher that ever normalises names
     // (trim, case, aliases) must normalise here too, or the gate opens a gap.
     match panel_owner(packs_dir, artifact_id) {
+        // Installed before manifests were kept (or the manifest was lost),
+        // but the receipt says 0.1: such a pack cannot declare commands, so
+        // the manifest would add nothing. Same answer a 0.1 manifest gives.
+        PanelOwner::Pack {
+            pack,
+            receipt_protocol,
+            manifest: None,
+        } if receipt_protocol == NO_COMMANDS_PROTOCOL => {
+            if let Some(refusal) = undeclarable_panel_refusal(&pack, &receipt_protocol, command) {
+                return refusal;
+            }
+        }
         PanelOwner::Pack {
             pack,
             manifest: None,
+            ..
         } => {
             // Falling back to the generated-canvas set would hand a pack panel
             // commands its pack never declared; refusing everything is the
@@ -304,16 +343,10 @@ pub fn check_command(
         PanelOwner::Pack {
             pack,
             manifest: Some(m),
+            ..
         } => {
-            if !GENERATED_CANVAS_COMMANDS.contains(&command) {
-                return deny(
-                    "COMMAND_NOT_AVAILABLE",
-                    format!(
-                        "`{command}` is not available to this panel: the pack `{pack}` uses {}, which cannot declare commands, so its panel may send only {}. Use callTool or tool.invoke to run tools",
-                        m.protocol,
-                        GENERATED_CANVAS_COMMANDS.join(", ")
-                    ),
-                );
+            if let Some(refusal) = undeclarable_panel_refusal(&pack, &m.protocol, command) {
+                return refusal;
             }
         }
         PanelOwner::NotAPack => {
@@ -500,13 +533,17 @@ message = "no automation on banking sites"
 
     /// An install receipt listing `artifacts`, as `lifecycle::install` writes.
     fn write_receipt(dir: &std::path::Path, pack: &str, artifacts: &[&str]) {
+        write_receipt_with(dir, pack, artifacts, "pack-protocol/0.2");
+    }
+
+    fn write_receipt_with(dir: &std::path::Path, pack: &str, artifacts: &[&str], protocol: &str) {
         let pd = dir.join(pack);
         std::fs::create_dir_all(&pd).unwrap();
         std::fs::write(
             pd.join("receipt.json"),
             serde_json::json!({
                 "receipt_version": "1",
-                "protocol": "pack-protocol/0.2",
+                "protocol": protocol,
                 "pack": pack,
                 "namespace": pack,
                 "version": "1.0.0",
@@ -1238,5 +1275,61 @@ entry        = "index.html"
             "COMMAND_NOT_DECLARED"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Packs installed before manifests were kept have only a receipt. A 0.1
+    /// receipt is enough to answer: such a pack cannot declare commands, so
+    /// its panel gets the generated-canvas set, as a 0.1 manifest would.
+    #[test]
+    fn a_0_1_receipt_without_a_manifest_gets_the_generated_canvas_set() {
+        let dir = tmp("cmd-v01-receipt");
+        write_receipt_with(&dir, "okf", &["okf-dashboard"], "pack-protocol/0.1");
+        let none = serde_json::json!({});
+        assert_eq!(
+            check_command(&dir, "okf-dashboard", "daemon.info", &none),
+            CanvasVerdict::Allow
+        );
+        match check_command(&dir, "okf-dashboard", "schedule.run_now", &none) {
+            CanvasVerdict::Deny { code, message } => {
+                assert_eq!(code, "COMMAND_NOT_AVAILABLE");
+                assert!(message.contains("pack-protocol/0.1"), "{message}");
+                assert!(!message.contains("generated canvas"), "{message}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert_eq!(
+            code_of(check_command(
+                &dir,
+                "okf-dashboard",
+                "artifact.get",
+                &serde_json::json!({"artifact_id": "other"})
+            )),
+            "NOT_OWN_ARTIFACT"
+        );
+        assert_eq!(
+            code_of(check_command(&dir, "okf-dashboard", "remote.unpair", &none)),
+            "FORBIDDEN_COMMAND"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A 0.2 receipt without its manifest cannot say what was declared.
+    #[test]
+    fn a_0_2_or_unknown_receipt_without_a_manifest_gets_nothing() {
+        for protocol in ["pack-protocol/0.2", "pack-protocol/9.9"] {
+            let dir = tmp("cmd-v02-receipt");
+            write_receipt_with(&dir, "okf", &["okf-dashboard"], protocol);
+            assert_eq!(
+                code_of(check_command(
+                    &dir,
+                    "okf-dashboard",
+                    "daemon.info",
+                    &serde_json::json!({})
+                )),
+                "PACK_MANIFEST_UNAVAILABLE",
+                "{protocol}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

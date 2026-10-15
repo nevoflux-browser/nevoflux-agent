@@ -255,6 +255,12 @@ fn update_refreshes_files_keeps_user_data() {
 
     assert_eq!(receipt.version.to_string(), "0.2.0");
     assert_eq!(host.file_count(), 2, "files refreshed, not duplicated");
+    // The installed manifest now holds the new version's manifest.
+    assert_eq!(
+        host.file(Path::new("/cfg/packs/demo/pack.toml")),
+        Some(bumped.as_bytes().to_vec()),
+        "update replaces the installed manifest"
+    );
     // User edit preserved (seed is only-if-absent).
     assert!(host.has_page("demo/cv"));
 }
@@ -336,4 +342,31 @@ fn failed_update_does_not_leave_stale_receipt() {
         host.read_receipt("demo").unwrap().is_none(),
         "failed update must not leave a receipt pointing at deleted files"
     );
+}
+
+/// A failed install rolls back everything it placed, the installed manifest
+/// included: a manifest left behind would make post-install readers treat a
+/// pack that is not installed as present.
+#[test]
+fn rolled_back_install_removes_the_installed_manifest() {
+    let dir = write_fixture();
+    // The seed phase runs after the manifest is placed; a missing seed source
+    // makes it fail and roll back.
+    fs::remove_file(dir.path().join("components/seed/cv.md")).unwrap();
+    let m = Manifest::parse(MANIFEST).unwrap();
+    let host = MockPackHost::new(paths());
+    let opts = InstallOpts {
+        force: false,
+        now_utc: "2026-06-09T00:00:00Z".into(),
+        ..Default::default()
+    };
+    let err = install(&host, &m, MANIFEST, dir.path(), &opts).unwrap_err();
+    assert!(matches!(err, nevoflux_pack::PackError::RolledBack { .. }));
+    assert_eq!(
+        host.file(Path::new("/cfg/packs/demo/pack.toml")),
+        None,
+        "rollback removes the installed manifest"
+    );
+    assert_eq!(host.file_count(), 0, "nothing left behind");
+    assert!(host.read_receipt("demo").unwrap().is_none());
 }

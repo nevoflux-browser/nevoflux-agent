@@ -47,6 +47,10 @@ impl MockPackHost {
     pub fn artifact_count(&self) -> usize {
         self.state.borrow().artifacts.len()
     }
+    /// The bytes placed at `path`, if any.
+    pub fn file(&self, path: &Path) -> Option<Vec<u8>> {
+        self.state.borrow().files.get(path).cloned()
+    }
     pub fn has_page(&self, slug: &str) -> bool {
         self.state.borrow().pages.contains_key(slug)
     }
