@@ -620,6 +620,12 @@ pub fn summarize_inspect(
             "canvas_tools": tools,
             "seed": manifest.components.seed.iter().map(|s| s.slug.clone()).collect::<Vec<_>>(),
             "dashboard": manifest.components.dashboard.as_ref().map(|d| d.artifact_id.clone()),
+            "dashboard_commands": manifest
+                .components
+                .dashboard
+                .as_ref()
+                .map(|d| d.capabilities.commands.clone())
+                .unwrap_or_default(),
             "knowledge": manifest.components.knowledge.is_some(),
         },
         "violations": violations,
@@ -767,6 +773,38 @@ prefixes = ["demo/"]
         assert_eq!(v["components"]["canvas_tools"][0]["binary"], "weasyprint");
         assert_eq!(v["components"]["seed"][0], "demo/cv");
         assert_eq!(v["source"], "github:u/r@v1");
+    }
+
+    #[test]
+    fn summarize_inspect_lists_the_commands_a_dashboard_declares() {
+        let src = r#"
+[pack]
+name = "okf"
+version = "0.1.0"
+protocol = "pack-protocol/0.2"
+min_nevoflux = "0.3.0"
+[components.dashboard]
+artifact_id  = "okf-dashboard"
+content_type = "text/html"
+files_from   = "panel"
+entry        = "index.html"
+capabilities = { commands = ["schedule.run_now"] }
+"#;
+        let m = nevoflux_pack::manifest::Manifest::parse(src).unwrap();
+        let v = super::summarize_inspect(&m, &[], &[], &[], None, None);
+        assert_eq!(v["components"]["dashboard_commands"][0], "schedule.run_now");
+
+        let bare = nevoflux_pack::manifest::Manifest::parse(
+            "[pack]
+name=\"b\"
+version=\"0.1.0\"
+protocol=\"pack-protocol/0.1\"
+min_nevoflux=\"0.3.0\"
+",
+        )
+        .unwrap();
+        let v = super::summarize_inspect(&bare, &[], &[], &[], None, None);
+        assert_eq!(v["components"]["dashboard_commands"], serde_json::json!([]));
     }
 }
 
