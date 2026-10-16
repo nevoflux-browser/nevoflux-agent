@@ -214,11 +214,9 @@ fn mirror_canvas_to_artifacts_table(
     }
 }
 
-/// Registry for pending browser tool requests.
-/// Maps request_id to (created_at, response_sender).
-/// Entries are cleaned up periodically to prevent unbounded growth.
-type BrowserRequestRegistry =
-    Arc<Mutex<HashMap<String, (std::time::Instant, oneshot::Sender<BrowserResponse>)>>>;
+/// Pending browser tool requests, by request_id, each with its own deadline
+/// and the connection its dialog is on (`crate::pending`).
+type BrowserRequestRegistry = Arc<crate::pending::Pending>;
 
 /// Registry for pending plan proposals.
 /// Maps session_id to the response sender.
@@ -993,7 +991,7 @@ pub async fn start_server(
     // Create browser request channel and registry
     let (browser_tx, mut browser_rx) =
         mpsc::channel::<(BrowserRequest, oneshot::Sender<BrowserResponse>)>(100);
-    let browser_registry: BrowserRequestRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let browser_registry: BrowserRequestRegistry = crate::pending::shared();
 
     // Create cancellation registry for active streaming sessions
     let cancellation_registry: CancellationRegistry = Arc::new(Mutex::new(HashMap::new()));
@@ -2434,19 +2432,24 @@ pub async fn start_server(
                 request_id, request.action, request.proxy_id, request.client_identity.len()
             );
 
-            // Store the response sender in the registry with timestamp
-            {
-                let mut registry = browser_registry_clone.lock().await;
-                registry.insert(
-                    request_id.clone(),
-                    (std::time::Instant::now(), response_sender),
-                );
-                info!(
-                    "Browser request registered: id={}, registry_size={}",
-                    request_id,
-                    registry.len()
-                );
-            }
+            // Register the waiter with its own deadline and the connection its
+            // dialog is going to, so whatever settles it can say so there.
+            browser_registry_clone.insert_browser(
+                request_id.clone(),
+                crate::pending::PendingBrowserRequest {
+                    session_id: request.session_id.clone(),
+                    proxy_id: request.proxy_id.clone(),
+                    client_identity: request.client_identity.clone(),
+                    deadline: std::time::Instant::now()
+                        + crate::pending::hold_for(&request.session_id),
+                    sender: response_sender,
+                },
+            );
+            info!(
+                "Browser request registered: id={}, registry_size={}",
+                request_id,
+                browser_registry_clone.browser_len()
+            );
 
             // Create BrowserToolRequest message to send to sidebar
             let browser_request = nevoflux_protocol::BrowserToolRequest {
@@ -2477,26 +2480,29 @@ pub async fn start_server(
         }
     });
 
-    // Spawn periodic cleanup task for stale browser request registry entries.
-    // Removes entries where the receiver has been dropped (agent cancelled) or
-    // entries older than 10 minutes (response lost / sidebar disconnected).
+    // Sweep the browser request registry. A request past its own deadline is
+    // refused, one whose waiter has gone is dropped, and either way the
+    // connection showing its dialog is told it is settled — before this, a
+    // swept dialog stayed up and answering it did nothing (M3 §3.8).
     let cleanup_browser_registry = browser_registry.clone();
+    let cleanup_response_tx = response_tx.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
         loop {
             interval.tick().await;
-            let mut registry = cleanup_browser_registry.lock().await;
-            let before = registry.len();
-            registry.retain(|_id, (created_at, sender)| {
-                !sender.is_closed() && created_at.elapsed() < std::time::Duration::from_secs(600)
-            });
-            let removed = before - registry.len();
-            if removed > 0 {
+            let settled = cleanup_browser_registry.expire(std::time::Instant::now());
+            if !settled.is_empty() {
                 info!(
-                    "Browser registry cleanup: removed {} stale entries, {} remaining",
-                    removed,
-                    registry.len()
+                    "Browser registry cleanup: settled {} entries, {} remaining",
+                    settled.len(),
+                    cleanup_browser_registry.browser_len()
                 );
+            }
+            for a in settled {
+                let env = DaemonEnvelope::new(&a.proxy_id, Channel::Chat, a.frame);
+                if let Err(e) = cleanup_response_tx.send((a.client_identity, env)).await {
+                    warn!("Failed to announce a settled browser request: {}", e);
+                }
             }
         }
     });
@@ -2846,20 +2852,16 @@ pub async fn start_server(
                         );
 
                         // Find the pending request and send the response
-                        let sender = {
-                            let mut registry = process_browser_registry.lock().await;
-                            registry.remove(&request_id).map(|(_, sender)| sender)
-                        };
+                        let entry = process_browser_registry.take_browser(&request_id);
 
-                        if let Some(sender) = sender {
-                            let session_id = response.session_id.clone();
+                        if let Some(entry) = entry {
                             let browser_response = BrowserResponse {
                                 request_id: response.request_id,
                                 success: response.success,
                                 result: response.result,
                                 error: response.error,
                             };
-                            if sender.send(browser_response).is_err() {
+                            if entry.sender.send(browser_response).is_err() {
                                 warn!("Failed to send browser response - receiver dropped");
                             } else {
                                 info!("Browser response forwarded to agent");
@@ -2870,19 +2872,20 @@ pub async fn start_server(
                             // The pending entry is a single-consumer oneshot, so
                             // whoever answered first took it, and every other
                             // surface showing the same dialog is now asking a
-                            // question that has no answer left to give. That is
-                            // the point of answering from a phone: the prompt on
-                            // the desktop has to go away too. Broadcast, because
-                            // neither end knows who else is watching.
-                            let resolved = serde_json::json!({
-                                "type": "browser_tool_resolved",
-                                "payload": {
-                                    "request_id": request_id.clone(),
-                                    "session_id": session_id,
-                                }
-                            });
-                            let env = DaemonEnvelope::new(&proxy_id, Channel::Chat, resolved);
-                            if let Err(e) = process_response_tx.send((identity.clone(), env)).await
+                            // question that has no answer left to give. Sent to
+                            // the connection the question was put to, whoever
+                            // answered it: a phone or a paired agent answering
+                            // must still take the desktop's dialog down. The M2
+                            // tap copies it to every remote gateway as well.
+                            let resolved = crate::pending::browser_resolved(
+                                &request_id,
+                                &entry.session_id,
+                                None,
+                            );
+                            let env = DaemonEnvelope::new(&entry.proxy_id, Channel::Chat, resolved);
+                            if let Err(e) = process_response_tx
+                                .send((entry.client_identity.clone(), env))
+                                .await
                             {
                                 warn!("Failed to announce browser_tool_resolved: {}", e);
                             }
