@@ -323,7 +323,8 @@ async fn execute_ask_user(
             "description": description,
             "options": options,
             "allow_custom": false,
-            "timeout_ms": 86400000
+            "timeout_ms": 86400000,
+            "purpose": crate::remote::task::PERMISSION_PURPOSE
         }),
         timeout_ms: 86_400_000, // 24 hours — wait for user decision
         client_identity: browser_ctx.client_identity.clone(),
@@ -4280,6 +4281,50 @@ message = "ask.example wants a person to confirm"
             .await
             .unwrap_err();
         assert!(err.contains("ScheduleManager"), "past the tier guard: {err}");
+    }
+
+    #[tokio::test]
+    async fn an_acp_permission_prompt_is_marked_as_a_permission() {
+        let (btx, mut brx) = tokio::sync::mpsc::channel(1);
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(run_permission_handler(rx, browser_ctx_with(btx), false, None));
+        let (req, result) = plain("run_command");
+        tx.send(req).await.unwrap();
+        let (asked, reply) = brx.recv().await.unwrap();
+        assert_eq!(asked.action, BrowserToolAction::AskUser);
+        assert_eq!(asked.params["purpose"], "permission");
+        reply
+            .send(crate::wasm::services::BrowserResponse {
+                request_id: asked.request_id,
+                success: true,
+                result: Some(serde_json::json!({"answer": "Deny"})),
+                error: None,
+            })
+            .unwrap();
+        assert_eq!(result.await.unwrap(), PermissionResponse::Reject);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_site_rule_question_is_marked_as_a_permission() {
+        let (btx, mut brx) = tokio::sync::mpsc::channel::<(
+            BrowserRequest,
+            tokio::sync::oneshot::Sender<crate::wasm::services::BrowserResponse>,
+        )>(1);
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        let services = HostServices::new(db).with_browser_sender(btx);
+        let seen = tokio::spawn(async move {
+            let (asked, reply) = brx.recv().await.unwrap();
+            let purpose = asked.params["purpose"].clone();
+            let _ = reply.send(crate::wasm::services::BrowserResponse {
+                request_id: asked.request_id,
+                success: true,
+                result: Some(serde_json::json!({"answer": "Allow"})),
+                error: None,
+            });
+            purpose
+        });
+        assert!(ask_user_allow_blocking(&services, "A rule wants a person to confirm this."));
+        assert_eq!(seen.await.unwrap(), "permission");
     }
 }
 

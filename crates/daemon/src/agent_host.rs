@@ -843,7 +843,8 @@ Do you want to allow it?",
                         "description": description,
                         "options": options,
                         "allow_custom": false,
-                        "timeout_ms": 86400000
+                        "timeout_ms": 86400000,
+                        "purpose": crate::remote::task::PERMISSION_PURPOSE
                     }),
                     timeout_ms: 86_400_000, // 24 hours — wait for user decision
                     client_identity: browser_ctx.client_identity.clone(),
@@ -1578,7 +1579,8 @@ Do you want to allow it?",
                         "description": question,
                         "options": ["Allow", "Deny"],
                         "allow_custom": false,
-                        "timeout_ms": 86400000
+                        "timeout_ms": 86400000,
+                        "purpose": crate::remote::task::PERMISSION_PURPOSE
                     }),
                     timeout_ms: 86_400_000,
                     client_identity,
@@ -13291,5 +13293,40 @@ message = "not here"
             "past the tier guard: {}",
             err.message
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_native_permission_dialog_is_marked_as_a_permission() {
+        let (host, brx) = host_with_browser();
+        let seen = answer_one_browser_request(brx, serde_json::json!({"answer": "Deny"}));
+        let ctx = host.services.as_ref().unwrap().browser_context().unwrap();
+        let _ = host.permission_dialog(
+            &ctx,
+            "q".into(),
+            "d".into(),
+            vec!["Allow".into(), "Deny".into()],
+        );
+        let (action, params, _) = seen.await.unwrap();
+        assert_eq!(action, nevoflux_protocol::BrowserToolAction::AskUser);
+        assert_eq!(params["purpose"], "permission");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_native_site_rule_question_is_marked_as_a_permission() {
+        let (host, brx) = host_with_browser();
+        let seen = answer_one_browser_request(brx, serde_json::json!({"answer": "Allow"}));
+        assert!(host.ask_user_allow("A rule wants a person to confirm this."));
+        let (_, params, _) = seen.await.unwrap();
+        assert_eq!(params["purpose"], "permission");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_models_own_question_is_not_a_permission() {
+        use super::HostFunctions;
+        let (host, brx) = host_with_browser();
+        let seen = answer_one_browser_request(brx, serde_json::json!({"answer": "Blue"}));
+        let _ = host.tool_ask_user("Which colour?", &["Blue".to_string(), "Green".to_string()]);
+        let (_, params, _) = seen.await.unwrap();
+        assert!(params.get("purpose").is_none(), "{params}");
     }
 }

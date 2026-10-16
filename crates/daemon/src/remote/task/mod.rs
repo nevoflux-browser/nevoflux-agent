@@ -9,3 +9,9 @@
 pub mod ceiling;
 pub mod limits;
 pub mod origin;
+
+/// `params.purpose` on an `ask_user` request that asks permission for an
+/// action (tier gate, Jev flag, site/pack rule, ACP permission request), as
+/// opposed to the model's own question (contract R13). The extension ignores
+/// it; the task engine reads it to tell approval kinds apart.
+pub const PERMISSION_PURPOSE: &str = "permission";
