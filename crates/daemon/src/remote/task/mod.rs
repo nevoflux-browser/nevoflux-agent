@@ -6,9 +6,11 @@
 //! which sessions a pairing started and what they may do (`origin`), and the
 //! numbers it all runs on (`limits`).
 
+pub mod answer;
 pub mod ceiling;
 pub mod limits;
 pub mod origin;
+pub mod record;
 
 /// `params.purpose` on an `ask_user` request that asks permission for an
 /// action (tier gate, Jev flag, site/pack rule, ACP permission request), as
