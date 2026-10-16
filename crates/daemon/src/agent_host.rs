@@ -903,12 +903,7 @@ Do you want to allow it?",
         {
             return Err(HostError {
                 code: 403,
-                message: format!(
-                    "Action '{}' needs the {} tier, and this task was delegated by a paired agent at {}. The person can raise the agent's tier in NevoFlux.",
-                    tool_name,
-                    nevoflux_protocol::minimum_tier(tool_name).as_setting(),
-                    tier.as_setting()
-                ),
+                message: crate::remote::task::ceiling::refusal(tool_name),
             });
         }
 
@@ -13113,24 +13108,44 @@ message = "not here"
         (host, rt, brx)
     }
 
+    /// Flags whether anyone was asked. A regression that asks would block the
+    /// call forever; dropping the reply sender makes it return instead, so the
+    /// test fails on the flag rather than hanging.
+    fn watch_for_asks(
+        mut brx: tokio::sync::mpsc::Receiver<(
+            crate::wasm::services::BrowserRequest,
+            tokio::sync::oneshot::Sender<crate::wasm::services::BrowserResponse>,
+        )>,
+    ) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = asked.clone();
+        std::thread::spawn(move || {
+            if let Some((_req, _reply)) = brx.blocking_recv() {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        asked
+    }
+
     #[test]
     fn a_delegated_turn_is_refused_above_its_tier_without_asking_anyone() {
-        let (host, _rt, mut brx) = delegated_host("s-del");
+        let (host, _rt, brx) = delegated_host("s-del");
+        let asked = watch_for_asks(brx);
         let err = host
             .check_tool_permission("write_file", "C:/notes.txt")
             .unwrap_err();
         assert_eq!(err.code, 403);
-        assert!(
-            err.message.contains("full-auto") && err.message.contains("read-only"),
-            "{}",
-            err.message
+        assert_eq!(
+            err.message,
+            "write_file needs the full-auto tier, which this paired agent does not have. The person can raise the agent's tier in NevoFlux."
         );
-        assert!(brx.try_recv().is_err(), "nobody was asked");
+        assert!(!asked.load(std::sync::atomic::Ordering::SeqCst), "nobody was asked");
     }
 
     #[test]
     fn always_allow_does_not_lift_a_delegated_ceiling() {
-        let (host, _rt, mut brx) = delegated_host("s-del");
+        let (host, _rt, brx) = delegated_host("s-del");
+        let asked = watch_for_asks(brx);
         host.services
             .as_ref()
             .unwrap()
@@ -13139,7 +13154,7 @@ message = "not here"
             .unwrap()
             .insert("write_file".to_string());
         assert!(host.check_tool_permission("write_file", "C:/notes.txt").is_err());
-        assert!(brx.try_recv().is_err());
+        assert!(!asked.load(std::sync::atomic::Ordering::SeqCst), "nobody was asked");
     }
 
     #[test]

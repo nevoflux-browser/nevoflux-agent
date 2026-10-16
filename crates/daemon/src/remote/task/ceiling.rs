@@ -39,6 +39,15 @@ pub fn ceiling_for(db: Arc<Database>, session_id: &str) -> Option<Ceiling> {
     ceiling_with(db, session_id, super::origin::production_store())
 }
 
+/// Why a delegated call above its pairing's tier is refused (contract R25.1).
+pub fn refusal(tool: &str) -> String {
+    format!(
+        "{} needs the {} tier, which this paired agent does not have. The person can raise the agent's tier in NevoFlux.",
+        tool,
+        nevoflux_protocol::minimum_tier(tool).as_setting()
+    )
+}
+
 /// A bridge tightener that sends every call above `ceiling` to the handler
 /// (past the bridge's turn-start tier and its always-allow cache) and
 /// otherwise defers to `inner` (Jev), if any.

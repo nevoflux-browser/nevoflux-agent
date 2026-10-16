@@ -66,6 +66,11 @@ pub async fn run_tool_executor(
 /// requests are auto-approved without a dialog — the loop's
 /// `allowed_tool_classes` already gates which tools the LLM is told about,
 /// and the iteration has no sidebar to display dialogs to anyway.
+///
+/// `ceiling` is set for a task a paired agent delegated (M3 §4.1): a call
+/// above it is refused without asking, and that refusal takes precedence over
+/// the iteration auto-approve; within it only a Jev-flagged call is asked
+/// about, everything else is allowed.
 pub async fn run_permission_handler(
     mut rx: mpsc::Receiver<PermissionRequest>,
     browser_ctx: BrowserContext,
@@ -4134,7 +4139,8 @@ message = "ask.example wants a person to confirm"
         tokio::spawn(run_permission_handler(rx, browser_ctx_with(btx), false, Some(within)));
         let (req, result) = flagged("run_command");
         tx.send(req).await.unwrap();
-        assert_eq!(result.await.unwrap(), PermissionResponse::Reject);
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(5), result).await;
+        assert_eq!(answer.expect("answered").unwrap(), PermissionResponse::Reject);
         assert!(brx.try_recv().is_err(), "nobody was asked");
     }
 
@@ -4146,7 +4152,8 @@ message = "ask.example wants a person to confirm"
         tokio::spawn(run_permission_handler(rx, browser_ctx_with(btx), false, Some(within)));
         let (req, result) = plain("browser_click");
         tx.send(req).await.unwrap();
-        assert_eq!(result.await.unwrap(), PermissionResponse::AllowOnce);
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(5), result).await;
+        assert_eq!(answer.expect("answered").unwrap(), PermissionResponse::AllowOnce);
         assert!(brx.try_recv().is_err());
     }
 }
