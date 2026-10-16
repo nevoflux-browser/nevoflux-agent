@@ -6,5 +6,6 @@
 //! which sessions a pairing started and what they may do (`origin`), and the
 //! numbers it all runs on (`limits`).
 
+pub mod ceiling;
 pub mod limits;
 pub mod origin;

@@ -70,8 +70,22 @@ pub async fn run_permission_handler(
     mut rx: mpsc::Receiver<PermissionRequest>,
     browser_ctx: BrowserContext,
     is_iteration: bool,
+    ceiling: Option<crate::remote::task::ceiling::Ceiling>,
 ) {
     while let Some(req) = rx.recv().await {
+        // A task a paired agent delegated (M3 §4.1): the pairing's tier, read
+        // now, is a ceiling. Above it nothing is asked; within it only a Jev
+        // flag is (`ceiling::tighten` is why the rest arrives here at all).
+        if let Some(within) = ceiling.as_ref() {
+            if !within(&req.tool_name) {
+                let _ = req.result_tx.send(PermissionResponse::Reject);
+                continue;
+            }
+            if !req.must_ask {
+                let _ = req.result_tx.send(PermissionResponse::AllowOnce);
+                continue;
+            }
+        }
         // Jev flagged it (spec §5.7, J14) and nobody is there to confirm.
         if req.must_ask && is_iteration {
             let _ = req.result_tx.send(PermissionResponse::Reject);
@@ -3812,7 +3826,7 @@ message = "ask.example wants a person to confirm"
     async fn an_unattended_handler_refuses_a_flagged_call() {
         let (btx, _brx) = tokio::sync::mpsc::channel(1);
         let (tx, rx) = tokio::sync::mpsc::channel(1);
-        tokio::spawn(run_permission_handler(rx, browser_ctx_with(btx), true));
+        tokio::spawn(run_permission_handler(rx, browser_ctx_with(btx), true, None));
         let (req, result) = flagged("run_command");
         tx.send(req).await.unwrap();
         assert_eq!(result.await.unwrap(), PermissionResponse::Reject);
@@ -3822,7 +3836,7 @@ message = "ask.example wants a person to confirm"
     async fn a_flagged_call_is_offered_allow_or_deny_only() {
         let (btx, mut brx) = tokio::sync::mpsc::channel(1);
         let (tx, rx) = tokio::sync::mpsc::channel(1);
-        tokio::spawn(run_permission_handler(rx, browser_ctx_with(btx), false));
+        tokio::spawn(run_permission_handler(rx, browser_ctx_with(btx), false, None));
         let (req, result) = flagged("run_command");
         tx.send(req).await.unwrap();
         let (asked, reply) = brx.recv().await.unwrap();
@@ -4091,6 +4105,49 @@ message = "ask.example wants a person to confirm"
         let text = "键盘输入测试：这段文本超过 50 字节，应该被安全截断。";
         let args = serde_json::json!({ "text": text });
         let _desc = describe_tool_action("computer_type_text", &args.to_string());
+    }
+
+    fn plain(
+        tool: &str,
+    ) -> (
+        PermissionRequest,
+        tokio::sync::oneshot::Receiver<PermissionResponse>,
+    ) {
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        (
+            PermissionRequest {
+                tool_name: tool.into(),
+                arguments_summary: "{}".into(),
+                result_tx,
+                must_ask: false,
+            },
+            result_rx,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_delegated_handler_refuses_above_the_ceiling_without_asking() {
+        let (btx, mut brx) = tokio::sync::mpsc::channel(1);
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let within: crate::remote::task::ceiling::Ceiling =
+            Arc::new(|tool: &str| tool == "browser_navigate");
+        tokio::spawn(run_permission_handler(rx, browser_ctx_with(btx), false, Some(within)));
+        let (req, result) = flagged("run_command");
+        tx.send(req).await.unwrap();
+        assert_eq!(result.await.unwrap(), PermissionResponse::Reject);
+        assert!(brx.try_recv().is_err(), "nobody was asked");
+    }
+
+    #[tokio::test]
+    async fn a_delegated_handler_runs_an_unflagged_call_within_the_ceiling() {
+        let (btx, mut brx) = tokio::sync::mpsc::channel(1);
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let within: crate::remote::task::ceiling::Ceiling = Arc::new(|_: &str| true);
+        tokio::spawn(run_permission_handler(rx, browser_ctx_with(btx), false, Some(within)));
+        let (req, result) = plain("browser_click");
+        tx.send(req).await.unwrap();
+        assert_eq!(result.await.unwrap(), PermissionResponse::AllowOnce);
+        assert!(brx.try_recv().is_err());
     }
 }
 

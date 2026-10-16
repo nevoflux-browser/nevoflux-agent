@@ -893,6 +893,25 @@ Do you want to allow it?",
         let tier = resolve_execution_tier(services);
         let tier_auto = nevoflux_protocol::tier_auto_approves(tool_name, tier);
 
+        // A task a paired agent delegated (M3 §4.1): the pairing's tier is a
+        // ceiling, not a question — the same rule as the agent's direct calls
+        // (M2a A1). Checked before the always-allow cache, which a person's
+        // own chat may have filled for every session.
+        if !tier_auto
+            && crate::remote::task::origin::delegated_pairing(&services.database, &services.session_id)
+                .is_some()
+        {
+            return Err(HostError {
+                code: 403,
+                message: format!(
+                    "Action '{}' needs the {} tier, and this task was delegated by a paired agent at {}. The person can raise the agent's tier in NevoFlux.",
+                    tool_name,
+                    nevoflux_protocol::minimum_tier(tool_name).as_setting(),
+                    tier.as_setting()
+                ),
+            });
+        }
+
         // Jev first (spec §5.7, J14): a call the checks below would let
         // through without asking may be flagged, and a flagged call skips
         // the tier, the always-allow cache and the unattended auto-approve.
@@ -13064,5 +13083,68 @@ message = "not here"
             super::resolve_execution_tier_with(&db, "s-del", Some(store)),
             nevoflux_protocol::ExecutionTier::ReadOnly
         );
+    }
+
+    /// A host whose services belong to delegated session `session` (pairing
+    /// `chan-1`, no pairing store installed -> read-only), with a browser
+    /// channel to prove nobody is asked.
+    fn delegated_host(
+        session: &str,
+    ) -> (
+        super::DaemonHostFunctions,
+        tokio::runtime::Runtime,
+        tokio::sync::mpsc::Receiver<(
+            crate::wasm::services::BrowserRequest,
+            tokio::sync::oneshot::Sender<crate::wasm::services::BrowserResponse>,
+        )>,
+    ) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let db = delegated_db(session, "chan-1");
+        let (btx, brx) = tokio::sync::mpsc::channel(4);
+        let services = crate::wasm::services::HostServices::new(db)
+            .with_browser_sender(btx)
+            .with_session_id(session.to_string());
+        let host = super::DaemonHostFunctions::new(
+            std::sync::Arc::new(crate::config::AgentConfig::default()),
+            rt.handle().clone(),
+        )
+        .with_services(services)
+        .with_session_id(session);
+        (host, rt, brx)
+    }
+
+    #[test]
+    fn a_delegated_turn_is_refused_above_its_tier_without_asking_anyone() {
+        let (host, _rt, mut brx) = delegated_host("s-del");
+        let err = host
+            .check_tool_permission("write_file", "C:/notes.txt")
+            .unwrap_err();
+        assert_eq!(err.code, 403);
+        assert!(
+            err.message.contains("full-auto") && err.message.contains("read-only"),
+            "{}",
+            err.message
+        );
+        assert!(brx.try_recv().is_err(), "nobody was asked");
+    }
+
+    #[test]
+    fn always_allow_does_not_lift_a_delegated_ceiling() {
+        let (host, _rt, mut brx) = delegated_host("s-del");
+        host.services
+            .as_ref()
+            .unwrap()
+            .always_allowed_tools
+            .write()
+            .unwrap()
+            .insert("write_file".to_string());
+        assert!(host.check_tool_permission("write_file", "C:/notes.txt").is_err());
+        assert!(brx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_delegated_turn_runs_what_its_tier_allows() {
+        let (host, _rt, _brx) = delegated_host("s-del");
+        assert!(host.check_tool_permission("browser_navigate", "{}").is_ok());
     }
 }

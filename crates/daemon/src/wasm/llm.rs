@@ -4258,22 +4258,34 @@ async fn stream_acp_completion(
             // override) from config and hand it to the bridge.
             tool_bridge.set_execution_tier(crate::agent_host::resolve_execution_tier(&services));
             let is_iteration = services.is_iteration;
+            // A task a paired agent delegated (M3 §4.1): its pairing's tier is
+            // a ceiling read on every call, which neither the tier set here nor
+            // the bridge's shared always-allow cache can lift.
+            let ceiling = crate::remote::task::ceiling::ceiling_for(
+                services.database.clone(),
+                &services.session_id,
+            );
             // Jev can require a confirmation the tier or cache would skip
             // (spec §5.7, J14). Nobody to ask: the iteration handler or the
             // missing handler refuses a flagged call.
-            tool_bridge.set_tightener(services.agent_config.clone().and_then(|cfg| {
+            let jev = services.agent_config.clone().and_then(|cfg| {
                 crate::jev::permission::acp_tightener(
                     cfg,
                     services.database.clone(),
                     services.session_id.clone(),
                     is_iteration || services.browser_context().is_none(),
                 )
-            }));
+            });
+            tool_bridge.set_tightener(match &ceiling {
+                Some(within) => Some(crate::remote::task::ceiling::tighten(jev, within.clone())),
+                None => jev,
+            });
             if let Some(browser_ctx) = services.browser_context() {
                 tokio::spawn(crate::wasm::mcp_tool_executor::run_permission_handler(
                     perm_rx,
                     browser_ctx,
                     is_iteration,
+                    ceiling,
                 ));
             } else if is_iteration {
                 // Iteration without browser_ctx: still spawn the handler so
@@ -4292,7 +4304,7 @@ async fn stream_acp_completion(
                         recordings_dir: services.recordings_dir.clone(),
                     };
                     tokio::spawn(crate::wasm::mcp_tool_executor::run_permission_handler(
-                        perm_rx, dummy_ctx, true,
+                        perm_rx, dummy_ctx, true, None,
                     ));
                 }
                 // If browser_sender is None too, the bridge won't work in
