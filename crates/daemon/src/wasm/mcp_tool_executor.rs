@@ -997,6 +997,12 @@ async fn execute_mcp_tool_inner(
             | "schedule_run_now"
             | "schedule_runs"
     ) {
+        // Full-auto to create one (M3 §4.3), mirroring `tool_schedule_create`.
+        if name == "schedule_create" {
+            crate::schedules::tools::guard_schedule_create(
+                crate::agent_host::resolve_execution_tier(services),
+            )?;
+        }
         let mgr = match services.schedule_manager.as_ref() {
             Some(m) => m,
             None => {
@@ -3205,6 +3211,20 @@ message = "ask.example wants a person to confirm"
         .unwrap_err()
     }
 
+    /// The delegated stage runs before the schedule guard: below full-auto a
+    /// paired agent is told it is above its tier, not that it needs full-auto.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_delegated_stage_refuses_schedule_create_before_the_tier_guard() {
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        crate::remote::task::origin::create_delegated(&db, "s-del", "chan-1").unwrap();
+        let services = HostServices::new(db).with_session_id("s-del".to_string());
+        let bridge = make_test_bridge();
+        let err =
+            refused_within_a_deadline("schedule_create", serde_json::json!({}), &services, &bridge).await;
+        assert!(err.starts_with("[DELEGATED_ABOVE_TIER]"), "{err}");
+        assert!(!err.contains("creating a schedule needs"), "{err}");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn the_mcp_gate_refuses_a_listed_tool_above_the_pairings_tier() {
         let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
@@ -4238,6 +4258,28 @@ message = "ask.example wants a person to confirm"
         let answer = tokio::time::timeout(std::time::Duration::from_secs(5), result).await;
         assert_eq!(answer.expect("answered").unwrap(), PermissionResponse::AllowOnce);
         assert!(brx.try_recv().is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_schedule_needs_full_auto_on_the_mcp_path() {
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        let services = HostServices::new(db.clone());
+        let bridge = make_test_bridge();
+        let err = execute_mcp_tool("schedule_create", &serde_json::json!({}), &services, &bridge)
+            .await
+            .unwrap_err();
+        assert!(err.contains("full-auto"), "{err}");
+
+        nevoflux_storage::ConfigRepository::new(&db)
+            .set(
+                "config:settings",
+                serde_json::json!({"general": {"agentExecution": "full-auto"}}),
+            )
+            .unwrap();
+        let err = execute_mcp_tool("schedule_create", &serde_json::json!({}), &services, &bridge)
+            .await
+            .unwrap_err();
+        assert!(err.contains("ScheduleManager"), "past the tier guard: {err}");
     }
 }
 

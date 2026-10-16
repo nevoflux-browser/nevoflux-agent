@@ -24,6 +24,21 @@ pub struct ScheduleToolContext {
 /// Dispatch one of the seven `schedule_*` tools. `args` is the tool call's
 /// JSON arguments (already parsed — callers on the direct-API surface parse
 /// the args string once before calling this).
+/// Whether the creating session's tier may create a schedule (M3 §4.3).
+///
+/// A scheduled run approves its own tools with nobody there to confirm them,
+/// so creating one needs the tier that runs anything unasked — the bound
+/// `loops::tools::guard_loop_create` already puts on `loop_create`.
+pub(crate) fn guard_schedule_create(tier: nevoflux_protocol::ExecutionTier) -> Result<(), String> {
+    if nevoflux_protocol::tier_auto_approves("run_command", tier) {
+        return Ok(());
+    }
+    Err(format!(
+        "creating a schedule needs the full-auto Agent execution tier (current: {}); a scheduled run approves its own tools with nobody there to confirm them",
+        tier.as_setting()
+    ))
+}
+
 pub async fn execute_schedule_tool(
     name: &str,
     args: &Value,
@@ -572,5 +587,25 @@ mod tests {
         assert!(err.contains("unknown schedule tool"));
 
         mgr.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+    use nevoflux_protocol::ExecutionTier;
+
+    #[test]
+    fn only_full_auto_may_create_a_schedule() {
+        for tier in [
+            ExecutionTier::ReadOnly,
+            ExecutionTier::BrowserAuto,
+            ExecutionTier::BrowserAutoLocalRead,
+        ] {
+            let err = guard_schedule_create(tier).unwrap_err();
+            assert!(err.contains("full-auto"), "{err}");
+            assert!(err.contains(tier.as_setting()), "{err}");
+        }
+        assert!(guard_schedule_create(ExecutionTier::FullAuto).is_ok());
     }
 }

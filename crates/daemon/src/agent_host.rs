@@ -7993,6 +7993,13 @@ impl HostFunctions for DaemonHostFunctions {
             code: 3,
             message: "HostServices not configured".into(),
         })?;
+        // A schedule's runs approve their own tools, so creating one needs
+        // full-auto (M3 §4.3), on this path as on the MCP one.
+        crate::schedules::tools::guard_schedule_create(resolve_execution_tier(services))
+            .map_err(|e| HostError {
+                code: 100,
+                message: e,
+            })?;
         let mgr = services
             .schedule_manager
             .as_ref()
@@ -13256,5 +13263,33 @@ message = "not here"
             "{gate:?}"
         );
         assert!(!asked.load(std::sync::atomic::Ordering::SeqCst), "nobody was asked");
+    }
+
+    #[test]
+    fn a_schedule_needs_full_auto_on_the_native_path() {
+        use super::HostFunctions;
+        let (host, _rt) = setup_host_with_services();
+        let err = host.tool_schedule_create("{}").unwrap_err();
+        assert!(err.message.contains("full-auto"), "{}", err.message);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        nevoflux_storage::ConfigRepository::new(&db)
+            .set(
+                "config:settings",
+                serde_json::json!({"general": {"agentExecution": "full-auto"}}),
+            )
+            .unwrap();
+        let host = super::DaemonHostFunctions::new(
+            std::sync::Arc::new(crate::config::AgentConfig::default()),
+            rt.handle().clone(),
+        )
+        .with_services(crate::wasm::services::HostServices::new(db));
+        let err = host.tool_schedule_create("{}").unwrap_err();
+        assert!(
+            err.message.contains("ScheduleManager not configured"),
+            "past the tier guard: {}",
+            err.message
+        );
     }
 }
