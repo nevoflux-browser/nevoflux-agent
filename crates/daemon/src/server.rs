@@ -218,9 +218,9 @@ fn mirror_canvas_to_artifacts_table(
 /// and the connection its dialog is on (`crate::pending`).
 type BrowserRequestRegistry = Arc<crate::pending::Pending>;
 
-/// Registry for pending plan proposals.
-/// Maps session_id to the response sender.
-type PlanRequestRegistry = Arc<Mutex<HashMap<String, oneshot::Sender<PlanResponse>>>>;
+/// Pending plan proposals, by session (`crate::pending`; the same registry
+/// object as `BrowserRequestRegistry`).
+type PlanRequestRegistry = Arc<crate::pending::Pending>;
 
 /// Registry for active streaming sessions that can be cancelled.
 /// Maps session_id to the cancellation token.
@@ -1014,7 +1014,7 @@ pub async fn start_server(
         Arc::new(Mutex::new(HashMap::new()));
 
     // Create plan request registry for pending plan proposals
-    let plan_registry: PlanRequestRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let plan_registry: PlanRequestRegistry = crate::pending::shared();
 
     // Create tool auth registry for pending tool authorization requests
     let tool_auth_registry: ToolAuthRegistry = Arc::new(Mutex::new(HashMap::new()));
@@ -2764,6 +2764,18 @@ pub async fn start_server(
                     }
                 };
 
+                // A turn parked on a question or a plan polls neither flag
+                // above: settle what it waits on, refused, and tell the
+                // connection showing each dialog that it is gone (M3 §5.1).
+                if !session_id.is_empty() {
+                    for a in process_browser_registry.release_session(session_id) {
+                        let env = DaemonEnvelope::new(&a.proxy_id, Channel::Chat, a.frame);
+                        if let Err(e) = process_response_tx.send((a.client_identity, env)).await {
+                            warn!("Failed to announce a released wait: {}", e);
+                        }
+                    }
+                }
+
                 // Send acknowledgment
                 let response_payload = serde_json::json!({
                     "type": "agent_state",
@@ -2916,8 +2928,8 @@ pub async fn start_server(
 
                     if let Some(response) = response {
                         info!("Plan response: {:?} for session: {}", response, session_id);
-                        if let Some(tx) = process_plan_registry.lock().await.remove(&session_id) {
-                            let _ = tx.send(response.clone());
+                        if let Some(plan) = process_plan_registry.take_plan(&session_id) {
+                            let _ = plan.sender.send(response.clone());
 
                             // Announce the plan is settled, for the same reason
                             // `browser_tool_resolved` is announced: the panel is
@@ -2926,15 +2938,12 @@ pub async fn start_server(
                             // that decide nothing. Only on the branch that took
                             // the oneshot — a second answer settles nothing and
                             // must not take anyone's panel down.
-                            let resolved = serde_json::json!({
-                                "type": "plan_resolved",
-                                "payload": {
-                                    "session_id": session_id,
-                                    "response": response,
-                                }
-                            });
-                            let env = DaemonEnvelope::new(&proxy_id, Channel::Chat, resolved);
-                            if let Err(e) = process_response_tx.send((identity.clone(), env)).await
+                            let resolved =
+                                crate::pending::plan_resolved(&session_id, &response, None);
+                            let env = DaemonEnvelope::new(&plan.proxy_id, Channel::Chat, resolved);
+                            if let Err(e) = process_response_tx
+                                .send((plan.client_identity.clone(), env))
+                                .await
                             {
                                 warn!("Failed to announce plan_resolved: {}", e);
                             }
@@ -7552,10 +7561,14 @@ async fn handle_chat_message_streaming(
                 // Register oneshot channel BEFORE sending proposal to frontend
                 // to avoid race condition if frontend responds very quickly
                 let (plan_tx, plan_rx) = oneshot::channel();
-                plan_registry
-                    .lock()
-                    .await
-                    .insert(session_id.clone(), plan_tx);
+                plan_registry.insert_plan(
+                    &session_id,
+                    crate::pending::PendingPlan {
+                        sender: plan_tx,
+                        proxy_id: proxy_id.clone(),
+                        client_identity: identity.clone(),
+                    },
+                );
 
                 // Send proposal to frontend
                 let msg = AgentMessage::PlanProposal(proposal.clone());
@@ -7574,7 +7587,22 @@ async fn handle_chat_message_streaming(
                     error!("Failed to send plan proposal: {}", e);
                 }
 
-                match plan_rx.await {
+                // Ends on an answer, on a stop (`stop_generation` settles it as
+                // cancelled), or at its hold. A local plan has none.
+                let plan_answer = match crate::pending::wait_plan(plan_rx, None).await {
+                    crate::pending::PlanWait::Answered(response) => Ok(response),
+                    crate::pending::PlanWait::TimedOut => {
+                        if let Some(a) = plan_registry.time_out_plan(&session_id) {
+                            let env = DaemonEnvelope::new(&a.proxy_id, Channel::Chat, a.frame);
+                            if let Err(e) = response_tx.send((a.client_identity, env)).await {
+                                warn!("Failed to announce a timed-out plan: {}", e);
+                            }
+                        }
+                        Ok(PlanResponse::Cancelled)
+                    }
+                    crate::pending::PlanWait::Dropped => Err(()),
+                };
+                match plan_answer {
                     Ok(PlanResponse::Confirmed) => {
                         info!(
                             "Plan confirmed for session {}, re-running agent with plan context",

@@ -114,12 +114,12 @@ impl Pending {
         };
         due.into_iter()
             .map(|(id, entry)| {
-                let reason = if entry.sender.is_closed() {
-                    REASON_STOPPED
+                let (reason, why) = if entry.sender.is_closed() {
+                    (REASON_STOPPED, "the turn stopped waiting")
                 } else {
-                    REASON_TIMEOUT
+                    (REASON_TIMEOUT, "nobody answered in time")
                 };
-                settle_browser(&id, entry, reason, "nobody answered in time")
+                settle_browser(&id, entry, reason, why)
             })
             .collect()
     }
@@ -132,6 +132,79 @@ impl Pending {
     pub fn take_plan(&self, session_id: &str) -> Option<PendingPlan> {
         guard(&self.plans).remove(session_id)
     }
+
+    /// A plan nobody answered by its hold: cancelled, and announced as a
+    /// timeout. `None` when it was already answered or released.
+    pub fn time_out_plan(&self, session_id: &str) -> Option<Announcement> {
+        self.take_plan(session_id)
+            .map(|plan| settle_plan(session_id, plan, REASON_TIMEOUT))
+    }
+
+    /// Settle everything `session_id` is waiting on, because its turn was
+    /// stopped (M3 §5.1): each question refused, its plan cancelled, and the
+    /// connection showing each dialog told it is gone. A stopped turn parked
+    /// on a question or a plan polls neither the interrupt flag nor the stream
+    /// token, so this is the only thing that ends its wait.
+    pub fn release_session(&self, session_id: &str) -> Vec<Announcement> {
+        let taken: Vec<(String, PendingBrowserRequest)> = {
+            let mut map = guard(&self.browser);
+            let ids: Vec<String> = map
+                .iter()
+                .filter(|(_, e)| e.session_id == session_id)
+                .map(|(id, _)| id.clone())
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| map.remove(&id).map(|e| (id, e)))
+                .collect()
+        };
+        let mut out: Vec<Announcement> = taken
+            .into_iter()
+            .map(|(id, entry)| settle_browser(&id, entry, REASON_STOPPED, "the turn was stopped"))
+            .collect();
+        if let Some(plan) = self.take_plan(session_id) {
+            out.push(settle_plan(session_id, plan, REASON_STOPPED));
+        }
+        out
+    }
+}
+
+/// How a wait for a plan answer ended.
+#[derive(Debug, PartialEq)]
+pub enum PlanWait {
+    Answered(PlanResponse),
+    /// `hold` passed with no answer.
+    TimedOut,
+    /// The answering side went away.
+    Dropped,
+}
+
+/// Wait for a plan answer. `None` waits as long as it takes — a local plan
+/// keeps its behaviour; a delegated one is held thirty minutes (Task 12). A
+/// stop always ends the wait, through [`Pending::release_session`].
+pub async fn wait_plan(rx: oneshot::Receiver<PlanResponse>, hold: Option<Duration>) -> PlanWait {
+    match hold {
+        None => match rx.await {
+            Ok(response) => PlanWait::Answered(response),
+            Err(_) => PlanWait::Dropped,
+        },
+        Some(hold) => match tokio::time::timeout(hold, rx).await {
+            Ok(Ok(response)) => PlanWait::Answered(response),
+            Ok(Err(_)) => PlanWait::Dropped,
+            Err(_) => PlanWait::TimedOut,
+        },
+    }
+}
+
+/// Cancel a plan already removed from the registry and build the announcement
+/// for the connection showing it. The plan counterpart of [`settle_browser`].
+fn settle_plan(session_id: &str, plan: PendingPlan, reason: &str) -> Announcement {
+    let announcement = Announcement {
+        client_identity: plan.client_identity,
+        proxy_id: plan.proxy_id,
+        frame: plan_resolved(session_id, &PlanResponse::Cancelled, Some(reason)),
+    };
+    let _ = plan.sender.send(PlanResponse::Cancelled);
+    announcement
 }
 
 /// Refuse a browser request that has already been removed from the registry
@@ -304,5 +377,118 @@ mod tests {
     fn a_question_outside_a_delegated_task_is_held_ten_minutes() {
         assert_eq!(LOCAL_HOLD, Duration::from_secs(600));
         assert_eq!(hold_for("any-session"), LOCAL_HOLD);
+    }
+
+    fn plan(session: &str) -> (PendingPlan, oneshot::Receiver<PlanResponse>) {
+        let _ = session;
+        let (tx, rx) = oneshot::channel();
+        (
+            PendingPlan {
+                sender: tx,
+                proxy_id: "sidebar-1".into(),
+                client_identity: b"sidebar-1".to_vec(),
+            },
+            rx,
+        )
+    }
+
+    #[test]
+    fn stopping_a_session_refuses_its_questions_and_announces_them() {
+        let p = Pending::new();
+        let far = Instant::now() + LOCAL_HOLD;
+        let (mine, mut mine_rx) = entry("s1", far);
+        let (other, mut other_rx) = entry("s2", far);
+        p.insert_browser("r1".into(), mine);
+        p.insert_browser("r2".into(), other);
+        let out = p.release_session("s1");
+        assert_eq!(
+            out,
+            vec![Announcement {
+                client_identity: b"sidebar-1".to_vec(),
+                proxy_id: "sidebar-1".into(),
+                frame: json!({"type": "browser_tool_resolved",
+                              "payload": {"request_id": "r1", "session_id": "s1", "reason": "stopped"}}),
+            }]
+        );
+        assert!(!mine_rx.try_recv().expect("answered").success);
+        assert!(other_rx.try_recv().is_err(), "another session's question is untouched");
+        assert!(p.take_browser("r2").is_some());
+    }
+
+    #[test]
+    fn stopping_a_session_cancels_its_plan_and_announces_it() {
+        let p = Pending::new();
+        let (pl, mut rx) = plan("s1");
+        p.insert_plan("s1", pl);
+        let out = p.release_session("s1");
+        assert_eq!(
+            out,
+            vec![Announcement {
+                client_identity: b"sidebar-1".to_vec(),
+                proxy_id: "sidebar-1".into(),
+                frame: json!({"type": "plan_resolved",
+                              "payload": {"session_id": "s1", "response": "cancelled", "reason": "stopped"}}),
+            }]
+        );
+        assert_eq!(rx.try_recv().unwrap(), PlanResponse::Cancelled);
+        assert!(p.release_session("s1").is_empty(), "nothing is left to release");
+    }
+
+    #[test]
+    fn a_plan_past_its_hold_is_cancelled_and_announced_as_a_timeout() {
+        let p = Pending::new();
+        let (pl, mut rx) = plan("s1");
+        p.insert_plan("s1", pl);
+        let a = p.time_out_plan("s1").expect("announced");
+        assert_eq!(a.frame["payload"]["reason"], "timeout");
+        assert_eq!(rx.try_recv().unwrap(), PlanResponse::Cancelled);
+        assert!(p.time_out_plan("s1").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_turn_waiting_on_its_plan_ends_when_the_session_is_stopped() {
+        let p = Arc::new(Pending::new());
+        let (pl, rx) = plan("s1");
+        p.insert_plan("s1", pl);
+        let waiting = tokio::spawn(wait_plan(rx, None));
+        tokio::task::yield_now().await;
+        p.release_session("s1");
+        assert_eq!(
+            waiting.await.unwrap(),
+            PlanWait::Answered(PlanResponse::Cancelled)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_plan_without_a_hold_waits_however_long_it_takes() {
+        let (tx, rx) = oneshot::channel();
+        let waiting = tokio::spawn(wait_plan(rx, None));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(48 * 3600)).await;
+        assert!(!waiting.is_finished());
+        tx.send(PlanResponse::Confirmed).unwrap();
+        assert_eq!(
+            waiting.await.unwrap(),
+            PlanWait::Answered(PlanResponse::Confirmed)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_plan_with_a_hold_times_out_at_it() {
+        let (_tx, rx) = oneshot::channel::<PlanResponse>();
+        let waiting = tokio::spawn(wait_plan(rx, Some(Duration::from_secs(1800))));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1799)).await;
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert_eq!(waiting.await.unwrap(), PlanWait::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn a_plan_whose_answerer_vanished_reports_dropped() {
+        let (tx, rx) = oneshot::channel::<PlanResponse>();
+        drop(tx);
+        assert_eq!(wait_plan(rx, None).await, PlanWait::Dropped);
     }
 }
