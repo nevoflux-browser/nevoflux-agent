@@ -2794,7 +2794,12 @@ impl HostFunctions for DaemonHostFunctions {
             })
             .unwrap_or_default();
         let policy_on = crate::jev::permission::policy_on(&self.config);
-        crate::tool_pipeline::default_pipeline(&packs_dir, &active, policy_on).run(
+        // A session a paired agent started gets the must-approve stage first,
+        // bounded by the pairing's tier read now.
+        let delegated = self.services.as_ref().and_then(|s| {
+            crate::remote::task::ceiling::ceiling_for(s.database.clone(), &ctx.session_id)
+        });
+        crate::tool_pipeline::default_pipeline_for(&packs_dir, &active, policy_on, delegated).run(
             call,
             ctx,
             &|prompt: &str| self.ask_user_allow(prompt),
@@ -13161,5 +13166,78 @@ message = "not here"
     fn a_delegated_turn_runs_what_its_tier_allows() {
         let (host, _rt, _brx) = delegated_host("s-del");
         assert!(host.check_tool_permission("browser_navigate", "{}").is_ok());
+    }
+
+    fn a_tool_call(name: &str) -> nevoflux_builtin_wasm::ToolCall {
+        nevoflux_builtin_wasm::ToolCall {
+            id: "c1".into(),
+            call_id: None,
+            name: name.into(),
+            arguments: serde_json::json!({}),
+            signature: None,
+        }
+    }
+
+    fn a_tool_context(session: &str) -> nevoflux_builtin_wasm::ToolContext {
+        nevoflux_builtin_wasm::ToolContext {
+            session_id: session.into(),
+            origin: "model".into(),
+            mode: nevoflux_builtin_wasm::AgentMode::Agent,
+            is_unattended: false,
+            tab_url: None,
+            allowed_tools: None,
+        }
+    }
+
+    #[test]
+    fn the_native_gate_refuses_a_listed_tool_above_the_pairings_tier_without_asking() {
+        use super::HostFunctions;
+        // No pairing store in a unit test: the pairing reads read-only, and
+        // all ten tools are bucket X.
+        let (host, _rt, brx) = delegated_host("s-del");
+        let asked = watch_for_asks(brx);
+        for name in crate::tool_pipeline::delegated::MUST_APPROVE {
+            match host.tool_pre(&a_tool_call(name), &a_tool_context("s-del")) {
+                nevoflux_builtin_wasm::ToolGate::Deny(d) => {
+                    assert_eq!(d.code, "DELEGATED_ABOVE_TIER", "{name}")
+                }
+                other => panic!("{name} was not refused: {other:?}"),
+            }
+        }
+        assert!(!asked.load(std::sync::atomic::Ordering::SeqCst), "nobody was asked");
+    }
+
+    #[test]
+    fn the_native_gate_refuses_any_tool_above_the_pairings_tier_without_asking() {
+        use super::HostFunctions;
+        // `write_file` is not on the must-approve list, but is above read-only.
+        let (host, _rt, brx) = delegated_host("s-del");
+        let asked = watch_for_asks(brx);
+        match host.tool_pre(&a_tool_call("write_file"), &a_tool_context("s-del")) {
+            nevoflux_builtin_wasm::ToolGate::Deny(d) => {
+                assert_eq!(d.code, "DELEGATED_ABOVE_TIER");
+                assert_eq!(d.message, crate::remote::task::ceiling::refusal("write_file"));
+            }
+            other => panic!("write_file was not refused: {other:?}"),
+        }
+        assert!(!asked.load(std::sync::atomic::Ordering::SeqCst), "nobody was asked");
+    }
+
+    #[test]
+    fn the_native_gate_leaves_an_ordinary_session_alone() {
+        use super::HostFunctions;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        let host = super::DaemonHostFunctions::new(
+            std::sync::Arc::new(crate::config::AgentConfig::default()),
+            rt.handle().clone(),
+        )
+        .with_services(crate::wasm::services::HostServices::new(db).with_session_id("s-own".to_string()))
+        .with_session_id("s-own");
+        let gate = host.tool_pre(&a_tool_call("schedule_create"), &a_tool_context("s-own"));
+        assert!(
+            !matches!(&gate, nevoflux_builtin_wasm::ToolGate::Deny(d) if d.code == "DELEGATED_ABOVE_TIER"),
+            "an ordinary session is not judged by a pairing: {gate:?}"
+        );
     }
 }

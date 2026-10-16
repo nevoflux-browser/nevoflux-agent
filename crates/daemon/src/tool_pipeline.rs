@@ -41,6 +41,7 @@
 
 pub mod allowlist;
 pub mod canvas_gate;
+pub mod delegated;
 pub mod pack_hook_stage;
 pub mod policy;
 pub mod site_policy;
@@ -83,6 +84,19 @@ pub fn default_pipeline(
     active_packs: &[String],
     policy_on: bool,
 ) -> Pipeline {
+    default_pipeline_for(packs_dir, active_packs, policy_on, None)
+}
+
+/// [`default_pipeline`] for a session that may have been delegated by a
+/// paired agent (M3 §4.2). `delegated` (the pairing's live tier, Task 4) puts
+/// [`delegated::DelegatedTaskStage`] first, so its refusal wins before any
+/// later stage could ask a person about a call that was never going to run.
+pub fn default_pipeline_for(
+    packs_dir: &std::path::Path,
+    active_packs: &[String],
+    policy_on: bool,
+    delegated: Option<crate::remote::task::ceiling::Ceiling>,
+) -> Pipeline {
     // Read `active`-scope rules fresh rather than from the cache: activation
     // changes within a session, which is the one change an mtime cannot see.
     let mut rules = shared_rules().get(packs_dir);
@@ -92,7 +106,11 @@ pub fn default_pipeline(
     // not, so a call a rule already refuses never pays for one.
     let hooks = shared_hooks().for_session(packs_dir, active_packs);
 
-    let mut stages: Vec<Box<dyn Stage>> = vec![Box::new(site_policy::SitePolicyStage::new(rules))];
+    let mut stages: Vec<Box<dyn Stage>> = Vec::new();
+    if let Some(ceiling) = delegated {
+        stages.push(Box::new(delegated::DelegatedTaskStage { ceiling }));
+    }
+    stages.push(Box::new(site_policy::SitePolicyStage::new(rules)));
     if policy_on {
         stages.push(Box::new(policy::PolicyStage));
     }
@@ -641,5 +659,32 @@ mod tests {
             default_pipeline(no_packs, &[], false).judge(&a_call(), &a_context(false)),
             Judgement::Allow
         ));
+    }
+
+    #[test]
+    fn a_delegated_pipeline_asks_first_and_only_the_answer_decides() {
+        let no_packs = std::path::Path::new("this-directory-does-not-exist");
+        let within: crate::remote::task::ceiling::Ceiling = std::sync::Arc::new(|_: &str| true);
+        let p = default_pipeline_for(no_packs, &[], true, Some(within));
+        assert_eq!(p.stage_names()[0], "delegated_task");
+        let call = ToolCall {
+            id: "t".into(),
+            call_id: None,
+            name: "schedule_create".into(),
+            arguments: serde_json::json!({}),
+            signature: None,
+        };
+        let asked = std::cell::Cell::new(0);
+        let gate = p.run(&call, &a_context(false), &|_: &str| {
+            asked.set(asked.get() + 1);
+            false
+        });
+        assert!(matches!(gate, ToolGate::Deny(d) if d.code == "USER_DENIED"));
+        assert_eq!(asked.get(), 1);
+        let gate = p.run(&call, &a_context(false), &|_: &str| true);
+        assert!(matches!(gate, ToolGate::Allow));
+        assert!(!default_pipeline(no_packs, &[], false)
+            .stage_names()
+            .contains(&"delegated_task"));
     }
 }

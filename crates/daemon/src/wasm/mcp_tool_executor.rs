@@ -459,7 +459,11 @@ pub(crate) fn gate_pipeline(
         .agent_config
         .as_deref()
         .is_some_and(crate::jev::permission::policy_on);
-    crate::tool_pipeline::default_pipeline(packs_dir, &active, policy_on)
+    // A session a paired agent started gets the must-approve stage first
+    // (M3 §4.2) — on this entry point as on the native loop's.
+    let delegated =
+        crate::remote::task::ceiling::ceiling_for(services.database.clone(), &services.session_id);
+    crate::tool_pipeline::default_pipeline_for(packs_dir, &active, policy_on, delegated)
 }
 
 /// What the gate would decide about a call, without putting any question to
@@ -3182,6 +3186,59 @@ message = "ask.example wants a person to confirm"
             crate::tool_pipeline::default_pipeline(dir.path(), &["ask-guard".to_string()], false)
                 .stage_names()
         );
+    }
+
+    /// `execute_mcp_tool` under a deadline: a regression that asks instead of
+    /// refusing would wait on a question nobody answers.
+    async fn refused_within_a_deadline(
+        name: &str,
+        arguments: serde_json::Value,
+        services: &HostServices,
+        bridge: &Arc<McpToolBridge>,
+    ) -> String {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            execute_mcp_tool(name, &arguments, services, bridge),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{name}: still waiting (was somebody asked?)"))
+        .unwrap_err()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_mcp_gate_refuses_a_listed_tool_above_the_pairings_tier() {
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        crate::remote::task::origin::create_delegated(&db, "s-del", "chan-1").unwrap();
+        let services = HostServices::new(db).with_session_id("s-del".to_string());
+        let bridge = make_test_bridge();
+        for name in crate::tool_pipeline::delegated::MUST_APPROVE {
+            let err = refused_within_a_deadline(name, serde_json::json!({}), &services, &bridge).await;
+            assert!(err.starts_with("[DELEGATED_ABOVE_TIER]"), "{name}: {err}");
+        }
+        let err = refused_within_a_deadline(
+            "tool_call_dynamic",
+            serde_json::json!({"tool_name": "schedule_create", "arguments": "{}"}),
+            &services,
+            &bridge,
+        )
+        .await;
+        assert!(err.starts_with("[DELEGATED_ABOVE_TIER]"), "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_mcp_gate_refuses_any_tool_above_the_pairings_tier_without_asking() {
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        crate::remote::task::origin::create_delegated(&db, "s-del", "chan-1").unwrap();
+        // A browser channel nobody answers: asking would hit the deadline.
+        let (btx, mut brx) = tokio::sync::mpsc::channel(4);
+        let services = HostServices::new(db)
+            .with_browser_sender(btx)
+            .with_session_id("s-del".to_string());
+        let bridge = make_test_bridge();
+        // `write_file` is not on the must-approve list, but is above read-only.
+        let err = refused_within_a_deadline("write_file", serde_json::json!({}), &services, &bridge).await;
+        assert!(err.starts_with("[DELEGATED_ABOVE_TIER]"), "{err}");
+        assert!(brx.try_recv().is_err(), "nobody was asked");
     }
 
     #[tokio::test]
