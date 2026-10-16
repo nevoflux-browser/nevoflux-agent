@@ -13236,8 +13236,25 @@ message = "not here"
         .with_session_id("s-own");
         let gate = host.tool_pre(&a_tool_call("schedule_create"), &a_tool_context("s-own"));
         assert!(
-            !matches!(&gate, nevoflux_builtin_wasm::ToolGate::Deny(d) if d.code == "DELEGATED_ABOVE_TIER"),
+            matches!(gate, nevoflux_builtin_wasm::ToolGate::Allow),
             "an ordinary session is not judged by a pairing: {gate:?}"
         );
+    }
+
+    #[test]
+    fn the_native_gate_lets_a_delegated_turn_make_an_artifact_but_not_write_a_file() {
+        use super::HostFunctions;
+        // Read-only pairing (no store in a unit test): output to the person
+        // inside NevoFlux is R, a file write is X.
+        let (host, _rt, brx) = delegated_host("s-del");
+        let asked = watch_for_asks(brx);
+        let gate = host.tool_pre(&a_tool_call("create_artifact"), &a_tool_context("s-del"));
+        assert!(matches!(gate, nevoflux_builtin_wasm::ToolGate::Allow), "{gate:?}");
+        let gate = host.tool_pre(&a_tool_call("write_file"), &a_tool_context("s-del"));
+        assert!(
+            matches!(&gate, nevoflux_builtin_wasm::ToolGate::Deny(d) if d.code == "DELEGATED_ABOVE_TIER"),
+            "{gate:?}"
+        );
+        assert!(!asked.load(std::sync::atomic::Ordering::SeqCst), "nobody was asked");
     }
 }

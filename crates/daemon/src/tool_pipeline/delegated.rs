@@ -40,6 +40,7 @@ pub const MUST_APPROVE: &[&str] = &[
     "system_prompt_replace",
 ];
 
+/// Whether `tool` is one of the ten that always needs the desktop's approval.
 pub fn must_approve(tool: &str) -> bool {
     MUST_APPROVE.contains(&tool)
 }

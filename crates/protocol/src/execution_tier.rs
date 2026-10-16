@@ -128,6 +128,46 @@ const R_TOOLS: &[&str] = &[
     // model retried once and gave up. Scheduled reminders fired and then died
     // there in silence — on the sidebar as well as the phone.
     "notify_user",
+    // Output to the person inside NevoFlux, and nothing else. A question, a
+    // plan proposal, an artifact or composition in the canvas: they land in
+    // the sidebar or the canvas, touch no page, file or network, and are
+    // addressed to the person who would be asked. Unclassified they were X,
+    // which a delegated (paired-agent) turn below full-auto refused, so
+    // Canvas delegation broke (M3-A Task 5).
+    "ask_user",
+    "plan",
+    "create_artifact",
+    "browser_edit_artifact",
+    "canvas_create_composition",
+    "canvas_apply_design_md",
+    // Canvas audits: load the composition into a sandbox and report.
+    "canvas_lint_composition",
+    "canvas_inspect_layout",
+    // Reads of what the browser or the agent already holds: element cache,
+    // console and captured-network buffers, an earlier tool result, the
+    // knowledge base.
+    "browser_element_info",
+    "browser_find_elements",
+    "browser_probe",
+    "browser_console_messages",
+    "browser_network_requests",
+    "recall",
+    "brain_search",
+    // Read-only listings and status of the agent's own state.
+    "goal_status",
+    "schedule_list",
+    "schedule_runs",
+    "loop_list",
+    "loop_scratchpad_get",
+    "pack_list_active",
+    "list_flows",
+    "list_agents",
+    "subagent_list",
+    "subagent_status",
+    // Runs a tool found with tool_search. Judged by the tool it names: the
+    // delegated stage unwraps it, and the ACP bridge gates the inner call on
+    // its own, so the wrapper adds no reach of its own.
+    "tool_call_dynamic",
 ];
 
 /// B1 bucket — browser interactions that change page/site state.
@@ -473,6 +513,41 @@ mod tests {
         assert_eq!(minimum_tier("never_heard_of_it"), ExecutionTier::FullAuto);
         for (tool, _) in AGENT_CHANNEL {
             assert!(tier_auto_approves(tool, minimum_tier(tool)), "{tool}");
+        }
+    }
+
+    #[test]
+    fn output_to_the_person_and_reads_of_agent_state_run_at_read_only() {
+        for t in [
+            "ask_user", "plan", "create_artifact", "browser_edit_artifact",
+            "canvas_create_composition", "canvas_apply_design_md",
+            "canvas_lint_composition", "canvas_inspect_layout", "browser_element_info",
+            "browser_find_elements", "browser_probe", "browser_console_messages",
+            "browser_network_requests", "recall", "brain_search", "goal_status",
+            "schedule_list", "schedule_runs", "loop_list", "loop_scratchpad_get",
+            "pack_list_active", "list_flows", "list_agents", "subagent_list",
+            "subagent_status", "tool_call_dynamic",
+        ] {
+            assert_eq!(classify_tool(t), RiskBucket::R, "{t}");
+            assert!(tier_auto_approves(t, ExecutionTier::ReadOnly), "{t}");
+            assert!(tier_auto_approves(&format!("mcp__nevoflux__{t}"), ExecutionTier::ReadOnly));
+        }
+    }
+
+    #[test]
+    fn anything_that_writes_runs_or_changes_behaviour_stays_full_auto() {
+        for t in [
+            "write", "edit", "bash", "act", "browser_eval_js", "browser_upload_file",
+            "memory_create", "memory_update", "memory_delete", "subagent_spawn",
+            "subagent_kill", "subagent_wait", "computer_click", "canvas_attach_asset",
+            "canvas_render_video", "canvas_eval", "canvas_extract_visual_identity",
+            "schedule_create", "schedule_cancel", "schedule_pause", "schedule_run_now",
+            "schedule_resume", "loop_create", "loop_cancel", "loop_evolve",
+            "loop_scratchpad_set", "pack_activate", "pack_deactivate", "switch_model",
+            "screencast_start", "goal_set", "goal_clear", "system_prompt_replace",
+            "system_prompt_restore", "run_flow", "tts_synthesize_api", "write_file",
+        ] {
+            assert_eq!(classify_tool(t), RiskBucket::X, "{t}");
         }
     }
 }

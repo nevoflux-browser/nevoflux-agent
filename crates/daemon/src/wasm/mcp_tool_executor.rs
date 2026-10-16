@@ -3241,6 +3241,32 @@ message = "ask.example wants a person to confirm"
         assert!(brx.try_recv().is_err(), "nobody was asked");
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_mcp_gate_lets_a_delegated_turn_make_an_artifact_but_not_write_a_file() {
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        crate::remote::task::origin::create_delegated(&db, "s-del", "chan-1").unwrap();
+        let services = HostServices::new(db).with_session_id("s-del".to_string());
+        let bridge = make_test_bridge();
+        // Read-only pairing: the call may fail later for want of a browser,
+        // but the tier gate must not be what refuses it.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            execute_mcp_tool(
+                "create_artifact",
+                &serde_json::json!({"content": "<p>hi</p>", "content_type": "html"}),
+                &services,
+                &bridge,
+            ),
+        )
+        .await
+        .expect("create_artifact: still waiting");
+        if let Err(e) = result {
+            assert!(!e.starts_with("[DELEGATED_ABOVE_TIER]"), "{e}");
+        }
+        let err = refused_within_a_deadline("write_file", serde_json::json!({}), &services, &bridge).await;
+        assert!(err.starts_with("[DELEGATED_ABOVE_TIER]"), "{err}");
+    }
+
     #[tokio::test]
     async fn local_path_reads_disk_bytes_into_resolved_asset() {
         // Real PNG header bytes — 12 bytes is enough for the magic
