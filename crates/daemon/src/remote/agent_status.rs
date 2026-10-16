@@ -171,6 +171,8 @@ pub struct ChannelState {
     pub approvals: Vec<PendingApproval>,
     /// The state last shown, and since when.
     pub shown: Option<(AgentState, i64)>,
+    /// The delegated task this agent is running (M3 contract §4), or `None`.
+    pub task: Option<Value>,
 }
 
 /// The full snapshot (contract §1).
@@ -216,6 +218,7 @@ pub fn snapshot(
                     "summary": a.summary,
                     "started_at": a.started_at,
                 })),
+                "task": ch.task.clone(),
             })
         })
         .collect();
@@ -388,6 +391,32 @@ impl AgentStatus {
                 PublisherIdentity::Internal,
             ));
         }
+    }
+
+    /// The delegated task this agent is running now, or `None` once it ended
+    /// (M3 contract §4). Republished only when it changed. Clearing an
+    /// unknown channel does not bring it back.
+    pub fn set_task(&self, channel: &str, task: Option<Value>) {
+        let mut inner = self.lock();
+        if task.is_none() && !inner.channels.contains_key(channel) {
+            return;
+        }
+        let ch = inner.channels.entry(channel.to_string()).or_default();
+        if ch.task == task {
+            return;
+        }
+        ch.task = task;
+        self.publish(&mut inner);
+    }
+
+    /// One ephemeral notice on `ui:notification:agent` (a delegated task
+    /// ended, M3 contract §9).
+    pub fn notify(&self, payload: Value) {
+        self.send(BusEvent::ephemeral(
+            TOPIC_NOTIFICATION,
+            payload,
+            PublisherIdentity::Internal,
+        ));
     }
 
     pub fn session_started(&self, channel: &str) {
@@ -770,7 +799,7 @@ mod tests {
         clock.store(200, Ordering::SeqCst);
         status.set_pairings(&[testing::agent("a", 1)]);
         let fresh = json!({ "channel_id": "a", "label": null, "state": "offline",
-                            "since": 200, "tool": null, "approval": null });
+                            "since": 200, "tool": null, "approval": null, "task": null });
         assert_eq!(status.current()["agents"][0], fresh);
         // Watches from before the forget end without bringing anything back.
         seen.clear();
@@ -850,9 +879,9 @@ mod tests {
             snap,
             json!({ "agents": [
                 { "channel_id": "early", "label": "Claude", "state": "offline",
-                  "since": 100, "tool": null, "approval": null },
+                  "since": 100, "tool": null, "approval": null, "task": null },
                 { "channel_id": "late", "label": null, "state": "offline",
-                  "since": 100, "tool": null, "approval": null },
+                  "since": 100, "tool": null, "approval": null, "task": null },
             ]})
         );
     }
@@ -931,6 +960,7 @@ mod tests {
                     started_at: 90,
                 }],
                 shown: None,
+                task: None,
             },
         );
         let snap = snapshot(&rows, &mut channels, 100);
@@ -1021,5 +1051,26 @@ mod tests {
             again["event_id"], n["event_id"],
             "every notice has its own id"
         );
+    }
+
+    #[test]
+    fn a_delegated_task_is_shown_on_its_agent_and_announced_on_its_own() {
+        let (status, seen, _clock) = testing::watched(100);
+        status.set_pairings(&[testing::agent("a", 1), testing::agent("b", 2)]);
+        let task = json!({"id": "t1", "state": "running"});
+        status.set_task("a", Some(task.clone()));
+        let snap = seen.statuses().last().cloned().unwrap();
+        assert_eq!(snap["agents"][0]["task"], task);
+        assert_eq!(snap["agents"][1]["task"], Value::Null);
+        let before = seen.statuses().len();
+        status.set_task("a", Some(task));
+        assert_eq!(seen.statuses().len(), before, "an unchanged task publishes nothing");
+        status.set_task("a", None);
+        assert_eq!(seen.statuses().last().unwrap()["agents"][0]["task"], Value::Null);
+        let before = seen.statuses().len();
+        status.set_task("gone", None);
+        assert_eq!(seen.statuses().len(), before, "clearing an unknown channel publishes nothing");
+        status.notify(json!({"source": "agent_task"}));
+        assert_eq!(seen.notifications(), vec![json!({"source": "agent_task"})]);
     }
 }

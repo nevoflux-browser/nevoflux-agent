@@ -241,6 +241,20 @@ pub enum AgentError {
     TabClosed { tab_id: i64 },
     /// The browser ran the call and it failed.
     ToolFailed { detail: String },
+    /// A task of this pairing has not ended (decision C6, contract §1.1).
+    TaskBusy { task_id: String },
+    /// Twenty starts in the trailing hour.
+    RateLimited { retry_after: u64 },
+    /// `session` is not a task session this pairing started.
+    SessionNotFound { session: String },
+    /// No such task for this pairing, or it ended over an hour ago, or the
+    /// daemon restarted since.
+    TaskNotFound { task_id: String },
+    /// The approval is not waiting for an answer (answered on the desktop,
+    /// expired, or never existed).
+    ApprovalNotFound { approval_id: String },
+    /// The person paused this agent.
+    Paused,
 }
 
 impl AgentError {
@@ -255,6 +269,12 @@ impl AgentError {
             AgentError::NoAgentTab => "no_agent_tab",
             AgentError::TabClosed { .. } => "tab_closed",
             AgentError::ToolFailed { .. } => "tool_failed",
+            AgentError::TaskBusy { .. } => "task_busy",
+            AgentError::RateLimited { .. } => "rate_limited",
+            AgentError::SessionNotFound { .. } => "session_not_found",
+            AgentError::TaskNotFound { .. } => "task_not_found",
+            AgentError::ApprovalNotFound { .. } => "approval_not_found",
+            AgentError::Paused => "paused",
         }
     }
 
@@ -298,6 +318,30 @@ impl AgentError {
                 format!("{tool} failed: {detail}"),
                 vec![("detail", json!(detail))],
             ),
+            AgentError::TaskBusy { task_id } => (
+                "another task is already running for this agent".to_string(),
+                vec![("task_id", json!(task_id))],
+            ),
+            AgentError::RateLimited { retry_after } => (
+                format!(
+                    "this agent has started {} tasks in the last hour",
+                    crate::remote::task::limits::STARTS_PER_WINDOW
+                ),
+                vec![("retry_after", json!(retry_after))],
+            ),
+            AgentError::SessionNotFound { session } => (
+                format!("no task session {session} was started by this agent"),
+                vec![("session", json!(session))],
+            ),
+            AgentError::TaskNotFound { task_id } => (
+                format!("no task {task_id} for this agent"),
+                vec![("task_id", json!(task_id))],
+            ),
+            AgentError::ApprovalNotFound { approval_id } => (
+                format!("approval {approval_id} is not waiting for an answer"),
+                vec![("approval_id", json!(approval_id))],
+            ),
+            AgentError::Paused => ("this agent is paused in NevoFlux".to_string(), vec![]),
         };
         let mut error = serde_json::Map::new();
         error.insert("code".into(), json!(self.code()));
@@ -544,7 +588,28 @@ mod tests {
             (AgentError::NoAgentTab, "no_agent_tab"),
             (AgentError::TabClosed { tab_id: 7 }, "tab_closed"),
             (AgentError::ToolFailed { detail: "-1: Element not found".into() }, "tool_failed"),
+            (AgentError::TaskBusy { task_id: "t1".into() }, "task_busy"),
+            (AgentError::RateLimited { retry_after: 1234 }, "rate_limited"),
+            (AgentError::SessionNotFound { session: "s1".into() }, "session_not_found"),
+            (AgentError::TaskNotFound { task_id: "t1".into() }, "task_not_found"),
+            (AgentError::ApprovalNotFound { approval_id: "a1".into() }, "approval_not_found"),
+            (AgentError::Paused, "paused"),
         ]
+    }
+
+    #[test]
+    fn the_task_errors_carry_the_contracts_messages_and_extras() {
+        let busy = AgentError::TaskBusy { task_id: "t1".into() }.body("nevoflux_task_start");
+        assert_eq!(busy["error"], json!({"code": "task_busy", "message": "another task is already running for this agent", "task_id": "t1"}));
+        let rate = AgentError::RateLimited { retry_after: 1234 }.body("nevoflux_task_start");
+        assert_eq!(rate["error"], json!({"code": "rate_limited", "message": "this agent has started 20 tasks in the last hour", "retry_after": 1234}));
+        let session = AgentError::SessionNotFound { session: "s1".into() }.body("nevoflux_task_start");
+        assert_eq!(session["error"], json!({"code": "session_not_found", "message": "no task session s1 was started by this agent", "session": "s1"}));
+        let task = AgentError::TaskNotFound { task_id: "t1".into() }.body("nevoflux_task_wait");
+        assert_eq!(task["error"], json!({"code": "task_not_found", "message": "no task t1 for this agent", "task_id": "t1"}));
+        let approval = AgentError::ApprovalNotFound { approval_id: "a1".into() }.body("nevoflux_task_approve");
+        assert_eq!(approval["error"], json!({"code": "approval_not_found", "message": "approval a1 is not waiting for an answer", "approval_id": "a1"}));
+        assert_eq!(AgentError::Paused.body("x")["error"], json!({"code": "paused", "message": "this agent is paused in NevoFlux"}));
     }
 
     #[test]
