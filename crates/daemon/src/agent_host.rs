@@ -1830,6 +1830,27 @@ pub(crate) fn resolve_execution_tier_for(
     database: &nevoflux_storage::Database,
     session_id: &str,
 ) -> nevoflux_protocol::ExecutionTier {
+    resolve_execution_tier_with(
+        database,
+        session_id,
+        crate::remote::task::origin::production_store(),
+    )
+}
+
+/// [`resolve_execution_tier_for`] with the agent-pairing store passed in.
+///
+/// A session a paired agent started (M3 §4.1) runs at that pairing's tier,
+/// read now: neither its own key nor the global default is consulted, so
+/// writing either cannot raise a delegated turn.
+pub(crate) fn resolve_execution_tier_with(
+    database: &nevoflux_storage::Database,
+    session_id: &str,
+    pairings: Option<std::sync::Arc<crate::remote::pairing::PairingStore>>,
+) -> nevoflux_protocol::ExecutionTier {
+    if let Some(pairing) = crate::remote::task::origin::delegated_pairing(database, session_id) {
+        return crate::remote::task::origin::pairing_tier(pairings, &pairing);
+    }
+
     use nevoflux_storage::ConfigRepository;
     let repo = ConfigRepository::new(database);
 
@@ -12964,5 +12985,84 @@ message = "not here"
         };
         let e = usage_to_event(Some(&plain)).unwrap();
         assert_eq!((e.cache_read_tokens, e.cache_write_tokens), (None, None));
+    }
+
+    /// A session a paired agent started, in a database whose own tier keys —
+    /// global and per-session — both say full-auto (M3 §8.2 item 1).
+    fn delegated_db(session: &str, pairing: &str) -> std::sync::Arc<nevoflux_storage::Database> {
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        let config = nevoflux_storage::ConfigRepository::new(&db);
+        config
+            .set(
+                "config:settings",
+                serde_json::json!({"general": {"agentExecution": "full-auto"}}),
+            )
+            .unwrap();
+        config
+            .set(
+                &format!("config:session:{session}:agentExecution"),
+                serde_json::json!("full-auto"),
+            )
+            .unwrap();
+        crate::remote::task::origin::create_delegated(&db, session, pairing).unwrap();
+        db
+    }
+
+    fn agent_store(
+        pairings: &[crate::remote::pairing::Pairing],
+    ) -> (
+        std::sync::Arc<crate::remote::pairing::PairingStore>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(crate::remote::pairing::PairingStore::new(
+            dir.path().join("agent-pairings.json"),
+        ));
+        for p in pairings {
+            store.add(p.clone()).unwrap();
+        }
+        (store, dir)
+    }
+
+    #[test]
+    fn a_delegated_session_runs_at_its_pairings_tier_whatever_its_own_keys_say() {
+        use nevoflux_protocol::ExecutionTier;
+        let db = delegated_db("s-del", "chan-1");
+        let (store, _dir) = agent_store(&[crate::remote::agent_status::testing::agent("chan-1", 1)]);
+        assert_eq!(
+            super::resolve_execution_tier_with(&db, "s-del", Some(store.clone())),
+            ExecutionTier::ReadOnly
+        );
+        store.set_tier("chan-1", ExecutionTier::BrowserAuto).unwrap();
+        assert_eq!(
+            super::resolve_execution_tier_with(&db, "s-del", Some(store)),
+            ExecutionTier::BrowserAuto,
+            "the pairing's tier, read again"
+        );
+        // The resolver both gates call. A unit test has no pairing store
+        // installed, which must narrow, never widen.
+        assert_eq!(super::resolve_execution_tier_for(&db, "s-del"), ExecutionTier::ReadOnly);
+    }
+
+    #[test]
+    fn an_ordinary_session_still_reads_its_own_keys() {
+        let db = delegated_db("s-del", "chan-1");
+        nevoflux_storage::SessionRepository::new(&db)
+            .create(nevoflux_storage::models::CreateSessionParams::new().with_id("s-own"))
+            .unwrap();
+        assert_eq!(
+            super::resolve_execution_tier_for(&db, "s-own"),
+            nevoflux_protocol::ExecutionTier::FullAuto
+        );
+    }
+
+    #[test]
+    fn an_unpaired_agents_session_runs_read_only() {
+        let db = delegated_db("s-del", "chan-gone");
+        let (store, _dir) = agent_store(&[]);
+        assert_eq!(
+            super::resolve_execution_tier_with(&db, "s-del", Some(store)),
+            nevoflux_protocol::ExecutionTier::ReadOnly
+        );
     }
 }
