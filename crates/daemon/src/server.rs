@@ -8459,6 +8459,7 @@ async fn send_artifact_stream(
     // 1. Send artifact_start (includes files/entry for project-type artifacts)
     let start_msg = AgentMessage::ArtifactStart(ArtifactStart {
         id: artifact.id.clone(),
+        session_id: session_id.to_string(),
         title: artifact.title.clone(),
         content_type: artifact.content_type.clone(),
         description: artifact.description.clone(),
@@ -8489,6 +8490,7 @@ async fn send_artifact_stream(
 
             let delta_msg = AgentMessage::ArtifactDelta(ArtifactDelta {
                 id: artifact.id.clone(),
+                session_id: session_id.to_string(),
                 delta: chunk.to_string(),
             });
             let payload = serde_json::to_value(&delta_msg).unwrap();
@@ -8505,6 +8507,7 @@ async fn send_artifact_stream(
     // 3. Send artifact_complete
     let complete_msg = AgentMessage::ArtifactComplete(ArtifactComplete {
         id: artifact.id.clone(),
+        session_id: session_id.to_string(),
     });
     let payload = serde_json::to_value(&complete_msg).unwrap();
     let envelope = DaemonEnvelope::new(proxy_id, channel, payload).with_request_id(request_id);
@@ -16437,5 +16440,30 @@ mod tests {
         .await;
         assert_eq!(reply["type"], "error");
         assert_eq!(reply["payload"]["code"], "UNKNOWN_MCP_TYPE");
+    }
+
+    #[tokio::test]
+    async fn artifact_frames_name_their_session() {
+        let sm = Arc::new(SessionManager::in_memory().unwrap());
+        sm.create_session(Some("s-art".into()), None).await.unwrap();
+        let (tx, mut rx) = mpsc::channel(16);
+        let artifact = Artifact {
+            id: "calc-1".into(),
+            title: "Calculator".into(),
+            content_type: "text/html".into(),
+            description: None,
+            content: "<p>7</p>".into(),
+            files: None,
+            entry: None,
+            is_persistent: false,
+        };
+        send_artifact_stream(&artifact, "s-art", &sm, "sidebar-1", Channel::Chat, "req-1", b"sidebar-1", &tx).await;
+        drop(tx);
+        let mut types = Vec::new();
+        while let Some((_, env)) = rx.recv().await {
+            assert_eq!(env.payload["payload"]["session_id"], "s-art", "{}", env.payload);
+            types.push(env.payload["type"].as_str().unwrap().to_string());
+        }
+        assert_eq!(types, ["artifact_start", "artifact_delta", "artifact_complete"]);
     }
 }

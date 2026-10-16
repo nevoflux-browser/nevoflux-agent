@@ -398,6 +398,11 @@ pub struct Artifact {
 pub struct ArtifactStart {
     /// Unique artifact ID.
     pub id: String,
+    /// The session the artifact belongs to (M3 contract §5), so a client can
+    /// route it to that session's view and Canvas tab. Empty from an older
+    /// sender.
+    #[serde(default)]
+    pub session_id: String,
     /// Human-readable title.
     pub title: String,
     /// MIME type (e.g., "text/html", "project").
@@ -422,6 +427,11 @@ pub struct ArtifactStart {
 pub struct ArtifactDelta {
     /// Artifact ID (matches the ArtifactStart).
     pub id: String,
+    /// The session the artifact belongs to (M3 contract §5), so a client can
+    /// route it to that session's view and Canvas tab. Empty from an older
+    /// sender.
+    #[serde(default)]
+    pub session_id: String,
     /// Content chunk.
     pub delta: String,
 }
@@ -431,6 +441,11 @@ pub struct ArtifactDelta {
 pub struct ArtifactComplete {
     /// Artifact ID.
     pub id: String,
+    /// The session the artifact belongs to (M3 contract §5), so a client can
+    /// route it to that session's view and Canvas tab. Empty from an older
+    /// sender.
+    #[serde(default)]
+    pub session_id: String,
 }
 
 // ============================================================================
@@ -1217,6 +1232,7 @@ mod tests {
     fn test_agent_message_artifact_start_tagged() {
         let msg = AgentMessage::ArtifactStart(ArtifactStart {
             id: "art-002".into(),
+            session_id: "s-1".into(),
             title: "Report".into(),
             content_type: "text/markdown".into(),
             description: None,
@@ -1242,6 +1258,7 @@ mod tests {
     fn test_agent_message_artifact_delta_tagged() {
         let msg = AgentMessage::ArtifactDelta(ArtifactDelta {
             id: "art-002".into(),
+            session_id: "s-1".into(),
             delta: "<h1>Hello</h1>".into(),
         });
 
@@ -1262,6 +1279,7 @@ mod tests {
     fn test_agent_message_artifact_complete_tagged() {
         let msg = AgentMessage::ArtifactComplete(ArtifactComplete {
             id: "art-002".into(),
+            session_id: "s-1".into(),
         });
 
         let json = serde_json::to_string(&msg).unwrap();
@@ -1602,5 +1620,23 @@ mod tests {
             normalize_cookie_store_id(DEFAULT_COOKIE_STORE_ID),
             DEFAULT_COOKIE_STORE_ID
         );
+    }
+
+    #[test]
+    fn artifact_frames_carry_their_session_and_tolerate_its_absence() {
+        let msg = AgentMessage::ArtifactComplete(ArtifactComplete {
+            id: "art-1".into(),
+            session_id: "s-1".into(),
+        });
+        let v = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v["payload"]["session_id"], "s-1");
+        let old: AgentMessage = serde_json::from_value(serde_json::json!({
+            "type": "artifact_delta", "payload": {"id": "art-1", "delta": "x"}
+        }))
+        .unwrap();
+        match old {
+            AgentMessage::ArtifactDelta(d) => assert_eq!(d.session_id, ""),
+            other => panic!("{other:?}"),
+        }
     }
 }
