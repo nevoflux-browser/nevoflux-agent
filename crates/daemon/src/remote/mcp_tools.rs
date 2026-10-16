@@ -34,8 +34,28 @@ pub const WHITELIST: &[&str] = &[
     "browser_upload_file",
 ];
 
-pub fn is_allowed(name: &str) -> bool {
+/// The delegation tools (M3 §3). The task engine answers them, never a
+/// backend; they run at every tier (contract R4).
+pub const TASK_TOOLS: &[&str] = &[
+    super::task::tools::TASK_START,
+    super::task::tools::TASK_WAIT,
+    super::task::tools::TASK_APPROVE,
+    super::task::tools::TASK_CANCEL,
+];
+
+/// One of the sixteen browser tools a backend runs.
+pub fn is_browser_tool(name: &str) -> bool {
     WHITELIST.contains(&name)
+}
+
+/// One of the delegation tools.
+pub fn is_task_tool(name: &str) -> bool {
+    TASK_TOOLS.contains(&name)
+}
+
+/// Anything the agent channel answers at all.
+pub fn is_allowed(name: &str) -> bool {
+    is_browser_tool(name) || is_task_tool(name)
 }
 
 const TAB_ID: &str = "Tab to act in. Omit it to act in your own tab (the one your last \
@@ -742,6 +762,26 @@ mod tests {
         ] {
             assert!(!is_allowed(name), "{name}");
             assert!(agent_tools().iter().all(|t| t.name != name), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_task_tools_are_on_the_channel_and_are_not_browser_tools() {
+        assert_eq!(TASK_TOOLS.len(), 4);
+        for name in TASK_TOOLS {
+            assert!(is_allowed(name) && is_task_tool(name) && !is_browser_tool(name), "{name}");
+        }
+        for name in WHITELIST {
+            assert!(is_allowed(name) && is_browser_tool(name) && !is_task_tool(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_agent_channel_cannot_answer_or_stop_a_task_as_the_desktop() {
+        for name in ["remote.task_answer", "remote.task_cancel", "remote_task_answer", "remote_task_cancel"] {
+            assert!(!is_allowed(name), "{name}");
+            assert!(agent_tools().iter().all(|t| t.name != name), "{name}");
+            assert!(crate::remote::task::tools::task_tools().iter().all(|t| t.name != name), "{name}");
         }
     }
 }

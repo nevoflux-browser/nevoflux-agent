@@ -505,7 +505,7 @@ pub(crate) async fn execute_agent_browser_tool(
     arguments: &serde_json::Value,
     services: &HostServices,
 ) -> Result<String, String> {
-    if !crate::remote::mcp_tools::is_allowed(name) {
+    if !crate::remote::mcp_tools::is_browser_tool(name) {
         return Err(format!("{name} is not an agent-channel tool"));
     }
     let action =

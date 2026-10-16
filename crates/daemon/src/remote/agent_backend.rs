@@ -37,7 +37,7 @@ use serde_json::{json, Value};
 use super::agent_status::{AgentStatus, ApprovalOutcome, StopReason};
 use super::agent_tabs::AgentTabs;
 use super::mcp_tools::{
-    is_allowed, AgentError, AgentToolBackend, Approval, Approver, REASON_APPROVAL_FAILED,
+    is_browser_tool, AgentError, AgentToolBackend, Approval, Approver, REASON_APPROVAL_FAILED,
     REASON_CLIENT_CANNOT_APPROVE, REASON_DECLINED, REASON_RULE,
 };
 use super::pairing::{Pairing, PairingStore};
@@ -694,7 +694,7 @@ impl DesktopBrowserBackend {
         services: Option<HostServices>,
     ) -> Result<String, AgentError> {
         // 0. The whitelist, again: never trust the caller to have checked.
-        if !is_allowed(name) {
+        if !is_browser_tool(name) {
             return Err(AgentError::UnknownTool);
         }
         // 1. A ceiling, not a question (decision A1).
@@ -925,7 +925,8 @@ impl AgentToolBackend for DesktopBrowserBackend {
         }
         // Shown until this call is over, however it ends. Only a whitelisted
         // name is ever shown.
-        let _running = is_allowed(name).then(|| self.status.tool_started(&self.channel_id, name));
+        let _running =
+            is_browser_tool(name).then(|| self.status.tool_started(&self.channel_id, name));
         let started = Instant::now();
         let outcome = self.run(name, arguments, approver, services).await;
         let duration_ms = started.elapsed().as_millis() as u64;

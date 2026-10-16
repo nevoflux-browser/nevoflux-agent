@@ -13,6 +13,7 @@ pub mod limits;
 pub mod origin;
 pub mod record;
 pub mod screenshot;
+pub mod tools;
 
 /// `params.purpose` on an `ask_user` request that asks permission for an
 /// action (tier gate, Jev flag, site/pack rule, ACP permission request), as

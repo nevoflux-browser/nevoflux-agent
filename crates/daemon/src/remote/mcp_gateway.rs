@@ -26,6 +26,7 @@ use super::mcp_tools::AgentToolBackend;
 use super::portal_gateway::WireSink;
 use super::relay_protocol::{peer_count, WireMessage};
 use super::session::Wire;
+use super::task::engine::TaskEngine;
 
 /// Messages buffered between the socket and rmcp, each way.
 const BUFFER: usize = 32;
@@ -48,6 +49,10 @@ pub struct McpGateway {
     channel: String,
     /// Where this channel's sessions are shown (M2b §2.3).
     status: Arc<AgentStatus>,
+    /// The task engine its sessions offer delegation through. `None` reads
+    /// the daemon's own at each session start — channels restored at
+    /// startup are built before the engine is installed.
+    tasks: Option<Arc<TaskEngine>>,
 }
 
 impl McpGateway {
@@ -66,12 +71,19 @@ impl McpGateway {
             peers: Mutex::new(0),
             channel: channel_id.to_string(),
             status: super::agent_status::shared(),
+            tasks: None,
         }
     }
 
     /// Report this channel's sessions to `status` instead of the shared one.
     pub fn with_status(mut self, status: Arc<AgentStatus>) -> Self {
         self.status = status;
+        self
+    }
+
+    /// Answer the task tools with `tasks` instead of the daemon's engine.
+    pub fn with_tasks(mut self, tasks: Option<Arc<TaskEngine>>) -> Self {
+        self.tasks = tasks;
         self
     }
 
@@ -218,8 +230,17 @@ impl McpGateway {
         }
         {
             let (backend, cancel, id) = (self.backend.clone(), cancel.clone(), self.id.clone());
+            let tasks = self
+                .tasks
+                .clone()
+                .or_else(crate::remote::task::engine)
+                .map(|engine| super::mcp_server::TaskChannel {
+                    engine,
+                    pairing: self.channel.clone(),
+                });
             tokio::spawn(async move {
                 match AgentMcpServer::new(backend)
+                    .with_tasks(tasks)
                     .serve_with_ct((out_tx, in_rx), cancel)
                     .await
                 {
@@ -690,5 +711,103 @@ mod tests {
         assert_eq!(state(&status), "connected");
         gw.on_disconnected().await;
         assert_eq!(state(&status), "offline");
+    }
+
+    fn build_with_tasks() -> (Arc<McpGateway>, Arc<Collect>, crate::remote::task::engine::testing::Rig) {
+        let rig = crate::remote::task::engine::testing::rig();
+        let sink = Arc::new(Collect::default());
+        let gw = Arc::new(
+            McpGateway::new(KEY, sink.clone(), Arc::new(StubBrowserBackend), "chan-1")
+                .with_tasks(Some(rig.engine.clone())),
+        );
+        (gw, sink, rig)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tools_list_offers_the_task_tools_where_tasks_run() {
+        let (gw, sink, _rig) = build_with_tasks();
+        let (ch, n) = handshake(&gw, &sink, 1).await;
+        gw.on_wire_in(&c2h(n, &ch, request(2, "tools/list", json!({})))).await;
+        let reply = wait_for(&sink, |f| f["m"]["id"] == json!(2)).await.expect("listed");
+        let mut names: Vec<String> = reply["m"]["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["browser_navigate", "browser_snapshot", "nevoflux_task_approve",
+                 "nevoflux_task_cancel", "nevoflux_task_start", "nevoflux_task_wait"]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delegated_task_starts_and_reports_progress_over_the_channel() {
+        use crate::remote::task::engine::testing::{ask, tool_start};
+        let (gw, sink, rig) = build_with_tasks();
+        let (ch, n) = handshake(&gw, &sink, 1).await;
+        let start = request(3, "tools/call", json!({"name": "nevoflux_task_start",
+                                                     "arguments": {"prompt": "Generate a calculator Canvas"}}));
+        gw.on_wire_in(&c2h(n, &ch, start)).await;
+        let started = wait_for(&sink, |f| f["m"]["id"] == json!(3)).await.expect("answered");
+        let task = started["m"]["result"]["structuredContent"].clone();
+        assert_eq!(task["state"], "running");
+        let session = task["session"].as_str().unwrap().to_string();
+        let wait = json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                          "params": {"name": "nevoflux_task_wait",
+                                     "arguments": {"task_id": task["task_id"], "timeout_secs": 20},
+                                     "_meta": {"progressToken": "p-1"}}});
+        gw.on_wire_in(&c2h(n + 1, &ch, wait)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        rig.engine.observe(&tool_start(&session, "toolu_01", "skill_load"));
+        rig.engine.observe(&ask(&session, "req-1", Some("permission"), &["Allow", "Deny"]));
+        let answer = wait_for(&sink, |f| f["m"]["id"] == json!(4)).await.expect("the wait returned early");
+        assert_eq!(answer["m"]["result"]["structuredContent"]["state"], "awaiting_approval");
+        let progress: Vec<Value> = sink
+            .frames()
+            .into_iter()
+            .filter(|f| f["m"]["method"] == "notifications/progress")
+            .map(|f| f["m"]["params"].clone())
+            .collect();
+        assert_eq!(progress.len(), 2, "{progress:?}");
+        assert_eq!(progress[0]["progressToken"], "p-1");
+        assert_eq!(progress[0]["message"], "Running skill_load");
+        assert_eq!(progress[1]["message"], "Waiting for approval: Create a Canvas artifact: \"Calculator\"");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_wait_without_a_progress_token_sends_no_progress() {
+        // Contract R37: progress is optional; the same events arrive as steps.
+        use crate::remote::task::engine::testing::{ask, tool_start};
+        let (gw, sink, rig) = build_with_tasks();
+        let (ch, n) = handshake(&gw, &sink, 1).await;
+        let start = request(3, "tools/call", json!({"name": "nevoflux_task_start",
+                                                     "arguments": {"prompt": "Generate a calculator Canvas"}}));
+        gw.on_wire_in(&c2h(n, &ch, start)).await;
+        let started = wait_for(&sink, |f| f["m"]["id"] == json!(3)).await.expect("answered");
+        let task = started["m"]["result"]["structuredContent"].clone();
+        let session = task["session"].as_str().unwrap().to_string();
+        rig.engine.observe(&tool_start(&session, "toolu_01", "skill_load"));
+        rig.engine.observe(&ask(&session, "req-1", Some("permission"), &["Allow", "Deny"]));
+        let wait = request(4, "tools/call", json!({"name": "nevoflux_task_wait",
+                                                    "arguments": {"task_id": task["task_id"], "timeout_secs": 20}}));
+        gw.on_wire_in(&c2h(n + 1, &ch, wait)).await;
+        let answer = wait_for(&sink, |f| f["m"]["id"] == json!(4)).await.expect("the wait returned");
+        let state = &answer["m"]["result"]["structuredContent"];
+        assert_eq!(state["state"], "awaiting_approval");
+        assert_eq!(state["steps"][0]["tool"], "skill_load");
+        assert!(sink.frames().iter().all(|f| f["m"]["method"] != "notifications/progress"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn without_an_engine_the_task_tools_are_unknown() {
+        let (gw, sink) = build();
+        let (ch, n) = handshake(&gw, &sink, 1).await;
+        let call = request(5, "tools/call", json!({"name": "nevoflux_task_start", "arguments": {"prompt": "x"}}));
+        gw.on_wire_in(&c2h(n, &ch, call)).await;
+        let reply = wait_for(&sink, |f| f["m"]["id"] == json!(5)).await.expect("answered");
+        assert_eq!(reply["m"]["result"]["structuredContent"]["error"]["code"], "unknown_tool");
     }
 }

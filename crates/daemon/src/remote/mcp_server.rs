@@ -7,30 +7,71 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use nevoflux_mcp::rmcp::handler::server::ServerHandler;
 use nevoflux_mcp::rmcp::model::{
     CallToolRequestParams, CallToolResponse, Implementation, ListToolsResult,
-    PaginatedRequestParams, ServerCapabilities, ServerInfo,
+    PaginatedRequestParams, ProgressNotificationParam, ProgressToken, ServerCapabilities,
+    ServerInfo, Tool,
 };
-use nevoflux_mcp::rmcp::service::RequestContext;
+use nevoflux_mcp::rmcp::service::{Peer, RequestContext};
 use nevoflux_mcp::rmcp::{ErrorData as McpError, RoleServer};
 use serde_json::{json, Value};
 
 use super::elicit::{call_correlation, PeerApprover, APPROVAL_TIMEOUT};
-use super::mcp_tools::{is_allowed, AgentError, AgentToolBackend};
+use super::mcp_tools::{is_browser_tool, is_task_tool, AgentError, AgentToolBackend};
+use super::task::engine::{ProgressSink, TaskEngine};
 
 /// The agent-channel protocol version. Same number as
 /// `crates/daemon/tests/fixtures/muse/PROTOCOL_VERSION` (pinned by a test).
 pub const PROTOCOL: u64 = 1;
 pub const SERVER_NAME: &str = "nevoflux-head";
 
+/// Delegation on one agent channel: the engine, and the pairing it answers for.
+#[derive(Clone)]
+pub struct TaskChannel {
+    pub engine: Arc<TaskEngine>,
+    pub pairing: String,
+}
+
 pub struct AgentMcpServer {
     backend: Arc<dyn AgentToolBackend>,
+    tasks: Option<TaskChannel>,
+    /// Names this MCP session to the task engine: each session has its own
+    /// step cursor and gets a task's image once (contract R9, R12).
+    session_key: String,
 }
 
 impl AgentMcpServer {
     pub fn new(backend: Arc<dyn AgentToolBackend>) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            tasks: None,
+            session_key: uuid::Uuid::new_v4().to_string(),
+        }
+    }
+
+    /// Offer the four task tools, answered by `tasks`.
+    pub fn with_tasks(mut self, tasks: Option<TaskChannel>) -> Self {
+        self.tasks = tasks;
+        self
+    }
+}
+
+/// `notifications/progress` for one `tools/call` (contract §2.2).
+struct PeerProgress {
+    peer: Peer<RoleServer>,
+    token: ProgressToken,
+}
+
+#[async_trait]
+impl ProgressSink for PeerProgress {
+    async fn progress(&self, count: u64, message: String) {
+        let param =
+            ProgressNotificationParam::new(self.token.clone(), count as f64).with_message(message);
+        if let Err(e) = self.peer.notify_progress(param).await {
+            tracing::debug!(target: "remote", "a progress notification was not delivered: {e}");
+        }
     }
 }
 
@@ -53,12 +94,15 @@ impl ServerHandler for AgentMcpServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        let tools = self
+        let mut tools: Vec<Tool> = self
             .backend
             .tools()
             .into_iter()
-            .filter(|t| is_allowed(&t.name))
+            .filter(|t| is_browser_tool(&t.name))
             .collect();
+        if self.tasks.is_some() {
+            tools.extend(super::task::tools::task_tools());
+        }
         Ok(ListToolsResult::with_all_items(tools))
     }
 
@@ -67,7 +111,34 @@ impl ServerHandler for AgentMcpServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
-        if !is_allowed(&request.name) {
+        if is_task_tool(&request.name) {
+            let Some(tasks) = &self.tasks else {
+                return Ok(AgentError::UnknownTool.to_result(&request.name).into());
+            };
+            let token = context
+                .meta
+                .get_progress_token()
+                .or_else(|| request.meta.as_ref().and_then(|m| m.get_progress_token()));
+            let sink = token.map(|token| PeerProgress {
+                peer: context.peer.clone(),
+                token,
+            });
+            let arguments = request
+                .arguments
+                .map(Value::Object)
+                .unwrap_or_else(|| json!({}));
+            let result = super::task::tools::call(
+                &tasks.engine,
+                &tasks.pairing,
+                &self.session_key,
+                &request.name,
+                arguments,
+                sink.as_ref().map(|s| s as &dyn ProgressSink),
+            )
+            .await;
+            return Ok(result.into());
+        }
+        if !is_browser_tool(&request.name) {
             tracing::info!(target: "remote", tool = %request.name, "agent asked for a tool off the whitelist");
             return Ok(AgentError::UnknownTool.to_result(&request.name).into());
         }
