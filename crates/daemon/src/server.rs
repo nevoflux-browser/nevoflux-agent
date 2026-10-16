@@ -7588,20 +7588,18 @@ async fn handle_chat_message_streaming(
                 }
 
                 // Ends on an answer, on a stop (`stop_generation` settles it as
-                // cancelled), or at its hold. A local plan has none.
-                let plan_answer = match crate::pending::wait_plan(plan_rx, None).await {
-                    crate::pending::PlanWait::Answered(response) => Ok(response),
-                    crate::pending::PlanWait::TimedOut => {
-                        if let Some(a) = plan_registry.time_out_plan(&session_id) {
-                            let env = DaemonEnvelope::new(&a.proxy_id, Channel::Chat, a.frame);
-                            if let Err(e) = response_tx.send((a.client_identity, env)).await {
-                                warn!("Failed to announce a timed-out plan: {}", e);
-                            }
-                        }
-                        Ok(PlanResponse::Cancelled)
+                // cancelled), or at its hold: thirty minutes in a delegated
+                // task's session; a local plan has none.
+                let hold = crate::remote::task::hold_for(&session_id);
+                let (plan_answer, timed_out) =
+                    plan_registry.await_plan(&session_id, plan_rx, hold).await;
+                if let Some(a) = timed_out {
+                    let env = DaemonEnvelope::new(&a.proxy_id, Channel::Chat, a.frame);
+                    if let Err(e) = response_tx.send((a.client_identity, env)).await {
+                        warn!("Failed to announce a timed-out plan: {}", e);
                     }
-                    crate::pending::PlanWait::Dropped => Err(()),
-                };
+                }
+                let plan_answer = plan_answer.ok_or(());
                 match plan_answer {
                     Ok(PlanResponse::Confirmed) => {
                         info!(

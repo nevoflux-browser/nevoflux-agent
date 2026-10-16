@@ -24,6 +24,7 @@ use nevoflux_storage::Database;
 use serde_json::{json, Value};
 use tokio::sync::{oneshot, watch};
 
+use super::answer::{answer_for, response_for, Answer, Choice};
 use super::limits::{
     DELEGATED_HOLD, RUNNING_PER_PAIRING, SCREENSHOT_WAIT, STARTS_PER_WINDOW, START_WINDOW_SECS,
     TERMINAL_RETENTION_SECS,
@@ -703,6 +704,93 @@ impl TaskEngine {
         Ok(cancel_result(task_id, TaskState::Cancelled))
     }
 
+    /// `nevoflux_task_approve` and `remote.task_answer` (spec §3.5, R23): the
+    /// waiting entry is taken out of `crate::pending` — the registry the
+    /// desktop's own answer, the sweeper and a stop take from too — so exactly
+    /// one answer reaches the turn and every later one gets
+    /// `ApprovalNotFound`. The connection showing the dialog is told it is
+    /// settled (R28).
+    pub async fn approve(
+        &self,
+        by: Answerer,
+        task_id: &str,
+        approval_id: &str,
+        choice: Choice,
+        text: Option<&str>,
+    ) -> Result<TaskState, ApproveError> {
+        let now = self.now();
+        let (approval, session, pairing) = {
+            let mut inner = self.lock();
+            Self::purge(&mut inner, now);
+            let task = inner
+                .tasks
+                .get(task_id)
+                .filter(|t| match &by {
+                    Answerer::Agent(pairing) => t.pairing == *pairing,
+                    Answerer::Desktop => true,
+                })
+                .ok_or(ApproveError::TaskNotFound)?;
+            let approval = task
+                .approvals
+                .iter()
+                .find(|a| a.approval_id == approval_id)
+                .cloned()
+                .ok_or(ApproveError::ApprovalNotFound)?;
+            (approval, task.session.clone(), task.pairing.clone())
+        };
+        let answer = answer_for(&approval, choice, text).map_err(ApproveError::Invalid)?;
+        let pending = self.host.pending();
+        match answer {
+            Answer::Plan(response) => {
+                let plan = pending
+                    .take_plan(&session)
+                    .ok_or(ApproveError::ApprovalNotFound)?;
+                let _ = plan.sender.send(response.clone());
+                self.host
+                    .send(
+                        &plan.proxy_id,
+                        crate::pending::plan_resolved(&session, &response, None),
+                    )
+                    .await;
+            }
+            other => {
+                let entry = pending
+                    .take_browser(&approval.approval_id)
+                    .ok_or(ApproveError::ApprovalNotFound)?;
+                let _ = entry
+                    .sender
+                    .send(response_for(&approval.approval_id, other));
+                self.host
+                    .send(
+                        &entry.proxy_id,
+                        crate::pending::browser_resolved(&approval.approval_id, &session, None),
+                    )
+                    .await;
+            }
+        }
+        let state = {
+            let mut inner = self.lock();
+            match inner.tasks.get_mut(task_id) {
+                Some(task) => {
+                    task.remove_approval(approval_id);
+                    task.state
+                }
+                None => TaskState::Running,
+            }
+        };
+        tracing::info!(
+            target: "remote",
+            task = %task_id,
+            kind = approval.kind.as_str(),
+            choice = choice.as_str(),
+            by = if matches!(by, Answerer::Desktop) { "desktop" } else { "agent" },
+            "delegated task approval answered"
+        );
+        self.publish_status(&pairing);
+        self.bump();
+        Ok(state)
+    }
+
     /// Cancel every running task of `pairing` (it was paused or unpaired).
     pub async fn cancel_for_pairing(&self, pairing: &str) {
         let running: Vec<String> = {
@@ -1075,7 +1163,6 @@ pub(crate) mod testing {
     }
 
     /// A turn waiting on `request_id`, as the browser request handler files it.
-    #[allow(dead_code)] // the approval tests of Task 12 are its first users
     pub(crate) fn waiting_request(
         rig: &Rig,
         request_id: &str,
@@ -1913,5 +2000,160 @@ mod tests {
         assert_eq!(r.engine.hold_for("someone-else"), None);
         r.engine.cancel(Some(CHANNEL), &id).await.unwrap();
         assert_eq!(r.engine.hold_for(&s), None);
+    }
+
+    use super::super::answer::Choice;
+
+    #[tokio::test]
+    async fn approving_a_tool_answers_the_waiting_turn_with_its_allow_button() {
+        let r = rig();
+        let (id, s) = r.start().await;
+        let mut rx = waiting_request(&r, "req-1", &s);
+        r.engine.observe(&ask(&s, "req-1", Some("permission"), &["Allow", "Always allow this type of action", "Deny"]));
+        let state = r
+            .engine
+            .approve(Answerer::Agent(CHANNEL.into()), &id, "req-1", Choice::Allow, None)
+            .await
+            .unwrap();
+        assert_eq!(state, TaskState::Running);
+        let answer = rx.try_recv().unwrap();
+        assert!(answer.success);
+        assert_eq!(answer.result.unwrap()["answer"], "Allow");
+        assert!(r.host.sent().contains(&(SIDEBAR.to_string(), crate::pending::browser_resolved("req-1", &s, None))),
+            "the desktop dialog is told to go away");
+    }
+
+    #[tokio::test]
+    async fn the_desktop_may_answer_always_allow() {
+        let r = rig();
+        let (id, s) = r.start().await;
+        let mut rx = waiting_request(&r, "req-1", &s);
+        r.engine.observe(&ask(&s, "req-1", Some("permission"), &["Allow", "Always allow this type of action", "Deny"]));
+        r.engine.approve(Answerer::Desktop, &id, "req-1", Choice::AllowAlways, None).await.unwrap();
+        assert_eq!(rx.try_recv().unwrap().result.unwrap()["answer"], "Always allow this type of action");
+    }
+
+    #[tokio::test]
+    async fn a_question_is_answered_with_text_or_cancelled() {
+        let r = rig();
+        let (id, s) = r.start().await;
+        let mut first = waiting_request(&r, "req-q1", &s);
+        let mut second = waiting_request(&r, "req-q2", &s);
+        r.engine.observe(&ask(&s, "req-q1", None, &["Blue", "Green"]));
+        r.engine.observe(&ask(&s, "req-q2", None, &[]));
+        assert_eq!(
+            r.engine.approve(Answerer::Agent(CHANNEL.into()), &id, "req-q1", Choice::Allow, None).await,
+            Err(ApproveError::Invalid("answer is required for a question"))
+        );
+        r.engine.approve(Answerer::Agent(CHANNEL.into()), &id, "req-q1", Choice::Allow, Some("Blue")).await.unwrap();
+        assert_eq!(first.try_recv().unwrap().result.unwrap()["answer"], "Blue");
+        r.engine.approve(Answerer::Desktop, &id, "req-q2", Choice::Deny, None).await.unwrap();
+        let cancelled = second.try_recv().unwrap();
+        assert!(!cancelled.success);
+        assert_eq!(cancelled.error.unwrap().code, 8001);
+    }
+
+    #[tokio::test]
+    async fn a_plan_is_confirmed_through_the_plan_registry() {
+        let r = rig();
+        let (id, s) = r.start().await;
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        r.host.pending.insert_plan(&s, crate::pending::PendingPlan {
+            sender: tx,
+            proxy_id: SIDEBAR.into(),
+            client_identity: SIDEBAR.as_bytes().to_vec(),
+        });
+        r.engine.observe(&json!({"type": "plan_proposal", "payload": {"session_id": s, "summary": "Build the calculator",
+                                 "steps": [{"description": "Write the HTML"}]}}));
+        let w = r.engine.wait(CHANNEL, "m1", &id, Duration::from_secs(1), None).await.unwrap();
+        let plan_id = w.state["approvals"][0]["approval_id"].as_str().unwrap().to_string();
+        assert_eq!(plan_id.len(), 36);
+        assert_eq!(
+            r.engine.approve(Answerer::Agent(CHANNEL.into()), &id, &plan_id, Choice::Allow, None).await,
+            Ok(TaskState::Running)
+        );
+        assert_eq!(rx.try_recv().unwrap(), nevoflux_protocol::PlanResponse::Confirmed);
+        assert!(r.host.sent().contains(&(
+            SIDEBAR.to_string(),
+            crate::pending::plan_resolved(&s, &nevoflux_protocol::PlanResponse::Confirmed, None)
+        )));
+    }
+
+    #[tokio::test]
+    async fn the_second_answer_finds_nothing_to_answer() {
+        let r = rig();
+        let (id, s) = r.start().await;
+        let mut rx = waiting_request(&r, "req-1", &s);
+        r.engine.observe(&ask(&s, "req-1", Some("permission"), &["Allow", "Deny"]));
+        // The desktop's dialog answered first: the message loop took the entry.
+        let desk = r.host.pending.take_browser("req-1").unwrap();
+        let _ = desk.sender.send(super::super::answer::response_for(
+            "req-1",
+            super::super::answer::Answer::Option("Deny".into()),
+        ));
+        assert_eq!(
+            r.engine.approve(Answerer::Agent(CHANNEL.into()), &id, "req-1", Choice::Allow, None).await,
+            Err(ApproveError::ApprovalNotFound)
+        );
+        assert_eq!(rx.try_recv().unwrap().result.unwrap()["answer"], "Deny", "only the first answer arrived");
+        r.engine.observe(&resolved(&s, "req-1", None));
+        assert_eq!(
+            r.engine.approve(Answerer::Desktop, &id, "req-1", Choice::Allow, None).await,
+            Err(ApproveError::ApprovalNotFound),
+            "and once its resolution passed the tap it is gone for everyone"
+        );
+        assert_eq!(
+            r.engine.approve(Answerer::Agent("chan-2".into()), &id, "req-1", Choice::Allow, None).await,
+            Err(ApproveError::TaskNotFound)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_answer_after_the_deadline_or_a_stop_finds_nothing_to_answer() {
+        let r = rig();
+        let (id, s) = r.start().await;
+        let mut expired = waiting_request(&r, "req-1", &s);
+        r.engine.observe(&ask(&s, "req-1", Some("permission"), &["Allow", "Deny"]));
+        let (tx, mut plan_rx) = tokio::sync::oneshot::channel();
+        r.host.pending.insert_plan(&s, crate::pending::PendingPlan {
+            sender: tx,
+            proxy_id: SIDEBAR.into(),
+            client_identity: SIDEBAR.as_bytes().to_vec(),
+        });
+        r.engine.observe(&json!({"type": "plan_proposal", "payload": {"session_id": s, "summary": "Build it", "steps": []}}));
+        let w = r.engine.wait(CHANNEL, "m1", &id, Duration::from_secs(1), None).await.unwrap();
+        let plan_id = w.state["approvals"][1]["approval_id"].as_str().unwrap().to_string();
+        assert_eq!(w.state["approvals"][1]["kind"], "plan");
+        // The sweeper got there first: the question's deadline passed.
+        let swept = r.host.pending.expire(std::time::Instant::now() + DELEGATED_HOLD);
+        assert_eq!(swept.len(), 1);
+        assert_eq!(
+            r.engine.approve(Answerer::Agent(CHANNEL.into()), &id, "req-1", Choice::Allow, None).await,
+            Err(ApproveError::ApprovalNotFound)
+        );
+        assert!(!expired.try_recv().unwrap().success, "the refusal is the only answer");
+        // A stop settles the plan before anybody answers it.
+        assert_eq!(r.host.pending.release_session(&s).len(), 1);
+        assert_eq!(
+            r.engine.approve(Answerer::Desktop, &id, &plan_id, Choice::Allow, None).await,
+            Err(ApproveError::ApprovalNotFound)
+        );
+        assert_eq!(plan_rx.try_recv().unwrap(), nevoflux_protocol::PlanResponse::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn an_approval_that_timed_out_fails_the_task_and_stops_its_turn() {
+        let r = rig();
+        let (id, s) = r.start().await;
+        r.engine.observe(&ask(&s, "req-1", Some("permission"), &["Allow", "Deny"]));
+        r.engine.observe(&resolved(&s, "req-1", Some("timeout")));
+        let w = r.engine.wait(CHANNEL, "m1", &id, Duration::from_secs(1), None).await.unwrap();
+        assert_eq!(
+            w.state["error"],
+            json!({"code": "approval_timeout", "message": "nobody answered an approval within 30 minutes; it was denied"})
+        );
+        settle().await;
+        let (_, stop) = r.host.injected().last().cloned().unwrap();
+        assert_eq!(stop["type"], "stop_generation");
     }
 }

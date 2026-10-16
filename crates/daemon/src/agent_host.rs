@@ -1820,6 +1820,23 @@ fn sanitise_path_segment(raw: &str) -> String {
     }
 }
 
+/// How long `execute_browser_action` waits for the browser: 30 s, except the
+/// model's own question in a delegated task, which waits as long as the task
+/// holds its approvals (M3 §3.8) — the paired agent may take minutes.
+fn browser_wait_ms(action: BrowserToolAction, hold: Option<std::time::Duration>) -> u64 {
+    match (action, hold) {
+        (BrowserToolAction::AskUser, Some(hold)) => hold.as_millis() as u64,
+        _ => 30_000,
+    }
+}
+
+/// The `params.timeout_ms` the model's own question carries (contract R32):
+/// the extension closes an unanswered question after it and answers "timed
+/// out", which reads as a deny. Delegated: the task's hold (1 800 000 ms).
+fn ask_shown_ms(hold: Option<std::time::Duration>) -> u64 {
+    hold.map(|d| d.as_millis() as u64).unwrap_or(60_000)
+}
+
 /// Resolve the effective "Agent execution" tier for the permission gate.
 ///
 /// Precedence: a per-session override (`config:session:<id>:agentExecution`,
@@ -5075,6 +5092,11 @@ impl HostFunctions for DaemonHostFunctions {
             question, options
         );
 
+        // Shown to the extension, which may close an unanswered question on
+        // its own; a delegated task's question stays up as long as it is held.
+        let shown_ms = ask_shown_ms(crate::remote::task::hold_for(
+            self.session_id.as_deref().unwrap_or(""),
+        ));
         // Request sidebar to show user prompt and wait for response
         let browser_result = self.execute_browser_action(
             BrowserToolAction::AskUser,
@@ -5082,7 +5104,7 @@ impl HostFunctions for DaemonHostFunctions {
                 "question": question,
                 "options": options,
                 "allow_custom": true,
-                "timeout_ms": 60000  // 60 second timeout for user response
+                "timeout_ms": shown_ms
             }),
             None, // AskUser doesn't need tab_id
         )?;
@@ -8842,13 +8864,14 @@ impl DaemonHostFunctions {
         // Clone params before they are moved into the request (needed for adaptation recording)
         let params_for_adaptation = params.clone();
 
+        let wait_ms = browser_wait_ms(action, crate::remote::task::hold_for(&session_id));
         let request = BrowserRequest {
             request_id: request_id.clone(),
             session_id,
             tab_id,
             action,
             params,
-            timeout_ms: 30000, // 30 second default timeout
+            timeout_ms: wait_ms,
             client_identity: self
                 .services
                 .as_ref()
@@ -8878,7 +8901,7 @@ impl DaemonHostFunctions {
                     .map_err(|_| "Failed to send browser request".to_string())?;
 
                 // Wait for response with timeout
-                tokio::time::timeout(std::time::Duration::from_millis(30000), response_rx)
+                tokio::time::timeout(std::time::Duration::from_millis(wait_ms), response_rx)
                     .await
                     .map_err(|_| "Browser request timed out".to_string())?
                     .map_err(|_| "Response channel closed".to_string())
@@ -13328,5 +13351,24 @@ message = "not here"
         let _ = host.tool_ask_user("Which colour?", &["Blue".to_string(), "Green".to_string()]);
         let (_, params, _) = seen.await.unwrap();
         assert!(params.get("purpose").is_none(), "{params}");
+        assert_eq!(params["timeout_ms"], 60000, "a local question keeps its minute");
+    }
+
+    #[test]
+    fn a_delegated_question_waits_as_long_as_its_task_holds_it() {
+        use nevoflux_protocol::BrowserToolAction;
+        let hold = Some(std::time::Duration::from_secs(1800));
+        assert_eq!(super::browser_wait_ms(BrowserToolAction::AskUser, hold), 1_800_000);
+        assert_eq!(super::browser_wait_ms(BrowserToolAction::AskUser, None), 30_000);
+        assert_eq!(super::browser_wait_ms(BrowserToolAction::Screenshot, hold), 30_000);
+    }
+
+    #[test]
+    fn a_delegated_question_tells_the_extension_to_wait_thirty_minutes() {
+        // Contract v1.1 R32: the extension's own ask timer defaults to 60 s and
+        // its timeout reads as a deny, so a delegated ask must carry 1 800 000.
+        let hold = Some(std::time::Duration::from_secs(1800));
+        assert_eq!(super::ask_shown_ms(hold), 1_800_000);
+        assert_eq!(super::ask_shown_ms(None), 60_000);
     }
 }

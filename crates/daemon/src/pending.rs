@@ -140,6 +140,27 @@ impl Pending {
             .map(|plan| settle_plan(session_id, plan, REASON_TIMEOUT))
     }
 
+    /// The chat turn's wait for `session_id`'s plan: its answer (`None` when
+    /// the answering side went away) and, when `hold` passed first, the plan
+    /// cancelled here and the announcement for the connection showing it. A
+    /// delegated plan is held thirty minutes; a local one (`hold: None`)
+    /// waits however long it takes.
+    pub async fn await_plan(
+        &self,
+        session_id: &str,
+        rx: oneshot::Receiver<PlanResponse>,
+        hold: Option<Duration>,
+    ) -> (Option<PlanResponse>, Option<Announcement>) {
+        match wait_plan(rx, hold).await {
+            PlanWait::Answered(response) => (Some(response), None),
+            PlanWait::TimedOut => (
+                Some(PlanResponse::Cancelled),
+                self.time_out_plan(session_id),
+            ),
+            PlanWait::Dropped => (None, None),
+        }
+    }
+
     /// Settle everything `session_id` is waiting on, because its turn was
     /// stopped (M3 §5.1): each question refused, its plan cancelled, and the
     /// connection showing each dialog told it is gone. A stopped turn parked
@@ -179,7 +200,7 @@ pub enum PlanWait {
 }
 
 /// Wait for a plan answer. `None` waits as long as it takes — a local plan
-/// keeps its behaviour; a delegated one is held thirty minutes (Task 12). A
+/// keeps its behaviour; a delegated one is held thirty minutes (`Pending::await_plan`). A
 /// stop always ends the wait, through [`Pending::release_session`].
 pub async fn wait_plan(rx: oneshot::Receiver<PlanResponse>, hold: Option<Duration>) -> PlanWait {
     match hold {
@@ -259,10 +280,10 @@ pub fn plan_resolved(session_id: &str, response: &PlanResponse, reason: Option<&
     json!({ "type": "plan_resolved", "payload": payload })
 }
 
-/// How long a question from `session_id` is held. Ten minutes; Task 12
-/// gives a session running a delegated task thirty.
-pub fn hold_for(_session_id: &str) -> Duration {
-    LOCAL_HOLD
+/// How long a question from `session_id` is held: thirty minutes while a
+/// delegated task runs in that session (M3 §3.8), ten otherwise.
+pub fn hold_for(session_id: &str) -> Duration {
+    crate::remote::task::hold_for(session_id).unwrap_or(LOCAL_HOLD)
 }
 
 /// The daemon's one set of registries. The message loop, the sweeper and the
@@ -490,5 +511,51 @@ mod tests {
         let (tx, rx) = oneshot::channel::<PlanResponse>();
         drop(tx);
         assert_eq!(wait_plan(rx, None).await, PlanWait::Dropped);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_delegated_plan_nobody_answers_is_cancelled_and_announced_at_its_hold() {
+        let p = Arc::new(Pending::new());
+        let (pl, rx) = plan("s1");
+        p.insert_plan("s1", pl);
+        let waiter = p.clone();
+        let waiting = tokio::spawn(async move {
+            waiter
+                .await_plan("s1", rx, Some(Duration::from_secs(1800)))
+                .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1799)).await;
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let (answer, announced) = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the hold ended the wait")
+            .unwrap();
+        assert_eq!(answer, Some(PlanResponse::Cancelled));
+        assert_eq!(
+            announced,
+            Some(Announcement {
+                client_identity: b"sidebar-1".to_vec(),
+                proxy_id: "sidebar-1".into(),
+                frame: json!({"type": "plan_resolved",
+                              "payload": {"session_id": "s1", "response": "cancelled", "reason": "timeout"}}),
+            })
+        );
+        assert!(p.take_plan("s1").is_none(), "nothing is left to answer");
+    }
+
+    #[tokio::test]
+    async fn an_answered_plan_announces_nothing_from_the_wait() {
+        let p = Pending::new();
+        let (pl, rx) = plan("s1");
+        p.insert_plan("s1", pl);
+        let taken = p.take_plan("s1").unwrap();
+        taken.sender.send(PlanResponse::Confirmed).unwrap();
+        assert_eq!(
+            p.await_plan("s1", rx, Some(Duration::from_secs(1800))).await,
+            (Some(PlanResponse::Confirmed), None)
+        );
     }
 }
