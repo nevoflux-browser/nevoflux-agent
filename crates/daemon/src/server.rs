@@ -2487,7 +2487,7 @@ pub async fn start_server(
     let cleanup_browser_registry = browser_registry.clone();
     let cleanup_response_tx = response_tx.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        let mut interval = tokio::time::interval(crate::pending::SWEEP_INTERVAL);
         loop {
             interval.tick().await;
             let settled = cleanup_browser_registry.expire(std::time::Instant::now());
@@ -2873,11 +2873,17 @@ pub async fn start_server(
                                 result: response.result,
                                 error: response.error,
                             };
-                            if entry.sender.send(browser_response).is_err() {
+                            let announced = crate::pending::answer_browser(
+                                &request_id,
+                                entry,
+                                browser_response,
+                            );
+                            if announced.is_err() {
                                 warn!("Failed to send browser response - receiver dropped");
                             } else {
                                 info!("Browser response forwarded to agent");
                             }
+                            let (Ok(a) | Err(a)) = announced;
 
                             // Announce that this request is settled.
                             //
@@ -2889,14 +2895,11 @@ pub async fn start_server(
                             // answered it: a phone or a paired agent answering
                             // must still take the desktop's dialog down. The M2
                             // tap copies it to every remote gateway as well.
-                            let resolved = crate::pending::browser_resolved(
-                                &request_id,
-                                &entry.session_id,
-                                None,
-                            );
-                            let env = DaemonEnvelope::new(&entry.proxy_id, Channel::Chat, resolved);
+                            // A turn that already stopped waiting got nothing:
+                            // the frame then says `timeout`.
+                            let env = DaemonEnvelope::new(&a.proxy_id, Channel::Chat, a.frame);
                             if let Err(e) = process_response_tx
-                                .send((entry.client_identity.clone(), env))
+                                .send((a.client_identity, env))
                                 .await
                             {
                                 warn!("Failed to announce browser_tool_resolved: {}", e);
@@ -2929,7 +2932,10 @@ pub async fn start_server(
                     if let Some(response) = response {
                         info!("Plan response: {:?} for session: {}", response, session_id);
                         if let Some(plan) = process_plan_registry.take_plan(&session_id) {
-                            let _ = plan.sender.send(response.clone());
+                            // A turn whose plan hold passed went on as
+                            // cancelled; the frame then says so (`timeout`).
+                            let (Ok(a) | Err(a)) =
+                                crate::pending::answer_plan(&session_id, plan, response);
 
                             // Announce the plan is settled, for the same reason
                             // `browser_tool_resolved` is announced: the panel is
@@ -2938,11 +2944,9 @@ pub async fn start_server(
                             // that decide nothing. Only on the branch that took
                             // the oneshot — a second answer settles nothing and
                             // must not take anyone's panel down.
-                            let resolved =
-                                crate::pending::plan_resolved(&session_id, &response, None);
-                            let env = DaemonEnvelope::new(&plan.proxy_id, Channel::Chat, resolved);
+                            let env = DaemonEnvelope::new(&a.proxy_id, Channel::Chat, a.frame);
                             if let Err(e) = process_response_tx
-                                .send((plan.client_identity.clone(), env))
+                                .send((a.client_identity, env))
                                 .await
                             {
                                 warn!("Failed to announce plan_resolved: {}", e);

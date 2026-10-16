@@ -1822,10 +1822,14 @@ fn sanitise_path_segment(raw: &str) -> String {
 
 /// How long `execute_browser_action` waits for the browser: 30 s, except the
 /// model's own question in a delegated task, which waits as long as the task
-/// holds its approvals (M3 §3.8) — the paired agent may take minutes.
-fn browser_wait_ms(action: BrowserToolAction, hold: Option<std::time::Duration>) -> u64 {
+/// holds its approvals (M3 §3.8) — the paired agent may take minutes — and two
+/// sweeps more, so the registry settles it first: as a `timeout` the task
+/// engine sees, not as a turn that silently stopped waiting.
+pub(crate) fn browser_wait_ms(action: BrowserToolAction, hold: Option<std::time::Duration>) -> u64 {
     match (action, hold) {
-        (BrowserToolAction::AskUser, Some(hold)) => hold.as_millis() as u64,
+        (BrowserToolAction::AskUser, Some(hold)) => {
+            (hold + 2 * crate::pending::SWEEP_INTERVAL).as_millis() as u64
+        }
         _ => 30_000,
     }
 }
@@ -13358,7 +13362,10 @@ message = "not here"
     fn a_delegated_question_waits_as_long_as_its_task_holds_it() {
         use nevoflux_protocol::BrowserToolAction;
         let hold = Some(std::time::Duration::from_secs(1800));
-        assert_eq!(super::browser_wait_ms(BrowserToolAction::AskUser, hold), 1_800_000);
+        // Two sweeps past the hold: the registry settles the question (as a
+        // timeout the task engine sees) before the turn's own timer gives up.
+        assert_eq!(crate::pending::SWEEP_INTERVAL, std::time::Duration::from_secs(30));
+        assert_eq!(super::browser_wait_ms(BrowserToolAction::AskUser, hold), 1_860_000);
         assert_eq!(super::browser_wait_ms(BrowserToolAction::AskUser, None), 30_000);
         assert_eq!(super::browser_wait_ms(BrowserToolAction::Screenshot, hold), 30_000);
     }

@@ -738,35 +738,36 @@ impl TaskEngine {
                 .ok_or(ApproveError::ApprovalNotFound)?;
             (approval, task.session.clone(), task.pairing.clone())
         };
+        if matches!(by, Answerer::Agent(_)) && choice == Choice::AllowAlways {
+            // Decision C8: "always" leaves a permanent rule; only the person
+            // may. `Choice::parse_agent` never yields it — this holds anyway.
+            return Err(ApproveError::Invalid(super::answer::NOT_OFFERED));
+        }
         let answer = answer_for(&approval, choice, text).map_err(ApproveError::Invalid)?;
         let pending = self.host.pending();
-        match answer {
+        let delivered = match answer {
             Answer::Plan(response) => {
                 let plan = pending
                     .take_plan(&session)
                     .ok_or(ApproveError::ApprovalNotFound)?;
-                let _ = plan.sender.send(response.clone());
-                self.host
-                    .send(
-                        &plan.proxy_id,
-                        crate::pending::plan_resolved(&session, &response, None),
-                    )
-                    .await;
+                crate::pending::answer_plan(&session, plan, response)
             }
             other => {
                 let entry = pending
                     .take_browser(&approval.approval_id)
                     .ok_or(ApproveError::ApprovalNotFound)?;
-                let _ = entry
-                    .sender
-                    .send(response_for(&approval.approval_id, other));
-                self.host
-                    .send(
-                        &entry.proxy_id,
-                        crate::pending::browser_resolved(&approval.approval_id, &session, None),
-                    )
-                    .await;
+                let response = response_for(&approval.approval_id, other);
+                crate::pending::answer_browser(&approval.approval_id, entry, response)
             }
+        };
+        // When the turn's own timer ran out first nothing was answered, and
+        // the dialog is told it timed out.
+        let (Ok(announcement) | Err(announcement)) = &delivered;
+        self.host
+            .send(&announcement.proxy_id, announcement.frame.clone())
+            .await;
+        if delivered.is_err() {
+            return Err(ApproveError::ApprovalNotFound);
         }
         let state = {
             let mut inner = self.lock();
@@ -2155,5 +2156,93 @@ mod tests {
         settle().await;
         let (_, stop) = r.host.injected().last().cloned().unwrap();
         assert_eq!(stop["type"], "stop_generation");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_delegated_question_nobody_answers_times_out_in_the_registry_and_fails_the_task() {
+        let r = rig();
+        let (id, s) = r.start().await;
+        let filed = std::time::Instant::now();
+        let rx = waiting_request(&r, "req-q", &s);
+        // The turn's own timer, as `execute_browser_action` sets it.
+        let wait = Duration::from_millis(crate::agent_host::browser_wait_ms(
+            nevoflux_protocol::BrowserToolAction::AskUser,
+            r.engine.hold_for(&s),
+        ));
+        let turn = tokio::spawn(tokio::time::timeout(wait, rx));
+        tokio::task::yield_now().await;
+        r.engine.observe(&ask(&s, "req-q", None, &[]));
+        // The sweeper reaches the question at most one interval past its deadline.
+        let swept_at = DELEGATED_HOLD + crate::pending::SWEEP_INTERVAL;
+        tokio::time::advance(swept_at).await;
+        tokio::task::yield_now().await;
+        assert!(!turn.is_finished(), "the turn still waits when the sweeper gets there");
+        let swept = r.host.pending.expire(filed + swept_at);
+        assert_eq!(swept.len(), 1);
+        assert_eq!(swept[0].frame, resolved(&s, "req-q", Some("timeout")));
+        let refused = tokio::time::timeout(Duration::from_secs(1), turn)
+            .await
+            .expect("the refusal ends the wait")
+            .unwrap()
+            .expect("answered by the registry, not by the turn's own timer")
+            .unwrap();
+        assert!(!refused.success);
+        r.engine.observe(&swept[0].frame); // the chat tap
+        let w = r.engine.wait(CHANNEL, "m1", &id, Duration::from_secs(1), None).await.unwrap();
+        assert_eq!(w.state["state"], "failed");
+        assert_eq!(w.state["error"]["code"], "approval_timeout");
+    }
+
+    #[tokio::test]
+    async fn an_answer_the_turn_no_longer_waits_for_finds_nothing_to_answer() {
+        let r = rig();
+        let (id, s) = r.start().await;
+        let rx = waiting_request(&r, "req-1", &s);
+        r.engine.observe(&ask(&s, "req-1", Some("permission"), &["Allow", "Deny"]));
+        drop(rx); // the turn's own timer ran out
+        assert_eq!(
+            r.engine.approve(Answerer::Agent(CHANNEL.into()), &id, "req-1", Choice::Allow, None).await,
+            Err(ApproveError::ApprovalNotFound)
+        );
+        assert!(r.host.sent().contains(&(SIDEBAR.to_string(), resolved(&s, "req-1", Some("timeout")))),
+            "the dialog is not told it was answered");
+    }
+
+    #[tokio::test]
+    async fn a_plan_the_turn_stopped_waiting_for_finds_nothing_to_answer() {
+        let r = rig();
+        let (id, s) = r.start().await;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        r.host.pending.insert_plan(&s, crate::pending::PendingPlan {
+            sender: tx,
+            proxy_id: SIDEBAR.into(),
+            client_identity: SIDEBAR.as_bytes().to_vec(),
+        });
+        r.engine.observe(&json!({"type": "plan_proposal", "payload": {"session_id": s, "summary": "Build it", "steps": []}}));
+        let w = r.engine.wait(CHANNEL, "m1", &id, Duration::from_secs(1), None).await.unwrap();
+        let plan_id = w.state["approvals"][0]["approval_id"].as_str().unwrap().to_string();
+        drop(rx); // its hold passed and the turn went on as cancelled
+        assert_eq!(
+            r.engine.approve(Answerer::Desktop, &id, &plan_id, Choice::Allow, None).await,
+            Err(ApproveError::ApprovalNotFound)
+        );
+        assert!(r.host.sent().contains(&(
+            SIDEBAR.to_string(),
+            crate::pending::plan_resolved(&s, &nevoflux_protocol::PlanResponse::Cancelled, Some("timeout"))
+        )));
+    }
+
+    #[tokio::test]
+    async fn a_paired_agent_can_never_answer_always_allow() {
+        let r = rig();
+        let (id, s) = r.start().await;
+        let mut rx = waiting_request(&r, "req-1", &s);
+        r.engine.observe(&ask(&s, "req-1", Some("permission"), &["Allow", "Always allow this type of action", "Deny"]));
+        assert_eq!(
+            r.engine.approve(Answerer::Agent(CHANNEL.into()), &id, "req-1", Choice::AllowAlways, None).await,
+            Err(ApproveError::Invalid(super::super::answer::NOT_OFFERED))
+        );
+        assert!(rx.try_recv().is_err(), "the question is still waiting");
+        assert!(r.host.pending.take_browser("req-1").is_some());
     }
 }

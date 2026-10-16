@@ -39,6 +39,10 @@ pub const REASON_TIMEOUT: &str = "timeout";
 /// stopped waiting.
 pub const REASON_STOPPED: &str = "stopped";
 
+/// How often the sweeper (`server.rs`) settles entries past their deadline.
+/// A deadline is noticed at most one interval late.
+pub const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+
 /// A browser request still waiting for its answer.
 pub struct PendingBrowserRequest {
     /// The session that asked.
@@ -213,6 +217,57 @@ pub async fn wait_plan(rx: oneshot::Receiver<PlanResponse>, hold: Option<Duratio
             Ok(Err(_)) => PlanWait::Dropped,
             Err(_) => PlanWait::TimedOut,
         },
+    }
+}
+
+/// Hand `response` to the turn waiting on a request taken out of the registry
+/// and build the announcement for the connection showing its dialog. `Err`
+/// when the turn no longer waits — its own timer ran out first — so nothing
+/// was answered: the dialog is told it timed out, never that it was answered.
+pub fn answer_browser(
+    request_id: &str,
+    entry: PendingBrowserRequest,
+    response: BrowserResponse,
+) -> Result<Announcement, Announcement> {
+    let delivered = entry.sender.send(response).is_ok();
+    let announcement = Announcement {
+        client_identity: entry.client_identity,
+        proxy_id: entry.proxy_id,
+        frame: browser_resolved(
+            request_id,
+            &entry.session_id,
+            (!delivered).then_some(REASON_TIMEOUT),
+        ),
+    };
+    if delivered {
+        Ok(announcement)
+    } else {
+        Err(announcement)
+    }
+}
+
+/// The plan counterpart of [`answer_browser`]. A plan whose turn stopped
+/// waiting went on as cancelled at its hold, and is announced so.
+pub fn answer_plan(
+    session_id: &str,
+    plan: PendingPlan,
+    response: PlanResponse,
+) -> Result<Announcement, Announcement> {
+    let delivered = plan.sender.send(response.clone()).is_ok();
+    let frame = if delivered {
+        plan_resolved(session_id, &response, None)
+    } else {
+        plan_resolved(session_id, &PlanResponse::Cancelled, Some(REASON_TIMEOUT))
+    };
+    let announcement = Announcement {
+        client_identity: plan.client_identity,
+        proxy_id: plan.proxy_id,
+        frame,
+    };
+    if delivered {
+        Ok(announcement)
+    } else {
+        Err(announcement)
     }
 }
 
@@ -556,6 +611,35 @@ mod tests {
         assert_eq!(
             p.await_plan("s1", rx, Some(Duration::from_secs(1800))).await,
             (Some(PlanResponse::Confirmed), None)
+        );
+    }
+
+    #[test]
+    fn an_answer_reaches_the_waiting_turn_and_is_announced_as_answered() {
+        let (e, mut rx) = entry("s1", Instant::now() + LOCAL_HOLD);
+        let a = answer_browser("r1", e, withdrawn("r1", "no")).expect("delivered");
+        assert_eq!(a.frame, browser_resolved("r1", "s1", None));
+        assert_eq!(a.proxy_id, "sidebar-1");
+        assert!(rx.try_recv().is_ok());
+        let (pl, mut prx) = plan("s1");
+        let a = answer_plan("s1", pl, PlanResponse::Confirmed).expect("delivered");
+        assert_eq!(a.frame, plan_resolved("s1", &PlanResponse::Confirmed, None));
+        assert_eq!(prx.try_recv().unwrap(), PlanResponse::Confirmed);
+    }
+
+    #[test]
+    fn an_answer_the_turn_no_longer_waits_for_is_announced_as_a_timeout() {
+        let (e, rx) = entry("s1", Instant::now() + LOCAL_HOLD);
+        drop(rx);
+        let a = answer_browser("r1", e, withdrawn("r1", "no")).unwrap_err();
+        assert_eq!(a.frame, browser_resolved("r1", "s1", Some(REASON_TIMEOUT)));
+        let (pl, prx) = plan("s1");
+        drop(prx);
+        let a = answer_plan("s1", pl, PlanResponse::Confirmed).unwrap_err();
+        assert_eq!(
+            a.frame,
+            plan_resolved("s1", &PlanResponse::Cancelled, Some(REASON_TIMEOUT)),
+            "the turn went on as cancelled"
         );
     }
 }
