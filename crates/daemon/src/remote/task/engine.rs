@@ -102,7 +102,8 @@ pub enum TurnStart {
 }
 
 /// Held for the length of a turn; dropping it tells the engine the turn
-/// ended, however it ended.
+/// ended, however it ended. It names the task the turn is, not the session:
+/// a later task can be running in the same session by the time it drops.
 pub struct TurnGuard {
     watched: Option<(Arc<TaskEngine>, String)>,
 }
@@ -116,8 +117,8 @@ impl TurnGuard {
 
 impl Drop for TurnGuard {
     fn drop(&mut self) {
-        if let Some((engine, session)) = self.watched.take() {
-            engine.turn_ended(&session, std::thread::panicking());
+        if let Some((engine, task_id)) = self.watched.take() {
+            engine.turn_ended(&task_id, std::thread::panicking());
         }
     }
 }
@@ -133,8 +134,13 @@ struct Inner {
     /// (MCP session, task) pairs that were sent the image.
     shown: HashSet<(String, String)>,
     /// Tasks whose turn ended and whose end marker is on its way through the
-    /// chat tap: fired when it arrives.
-    ending: HashMap<String, oneshot::Sender<()>>,
+    /// chat tap: `task -> (session, fired when it arrives)`. Until it arrives,
+    /// the session's frames are still that turn's.
+    ending: HashMap<String, (String, oneshot::Sender<()>)>,
+    /// Tasks whose chat message was injected and whose turn has not ended
+    /// (or been skipped). At most one per session: `start` refuses to
+    /// continue a session while its previous task's turn is pending.
+    turn_pending: HashSet<String>,
 }
 
 /// How long a turn's end waits for its marker to come back through the chat
@@ -197,9 +203,23 @@ impl TaskEngine {
                     inner.by_session.remove(&task.session);
                 }
             }
+            inner.turn_pending.remove(&id);
             inner.cursors.retain(|(_, task), _| *task != id);
             inner.shown.retain(|(_, task)| *task != id);
         }
+    }
+
+    /// The task a frame of `session` belongs to: the one whose turn ended
+    /// there and whose end marker has not come back yet, else the session's
+    /// current task. Frames are tapped in the order they were queued, so a
+    /// turn's late frames arrive before its marker.
+    fn task_of(inner: &Inner, session: &str) -> Option<String> {
+        inner
+            .ending
+            .iter()
+            .find(|(_, (s, _))| s == session)
+            .map(|(id, _)| id.clone())
+            .or_else(|| inner.by_session.get(session).cloned())
     }
 
     fn owned<'a>(inner: &'a Inner, pairing: &str, task_id: &str) -> Option<&'a TaskRecord> {
@@ -279,12 +299,22 @@ impl TaskEngine {
             // past the first check must not both run. (The loser may leave an
             // empty session behind; `session.list` hides empty sessions.)
             Self::check_admission(&mut inner, pairing, now)?;
+            // The previous task's turn has not ended (or been skipped) yet:
+            // a turn started now would be taken for this task's.
+            if let Some(previous) = inner.by_session.get(&session_id) {
+                if inner.turn_pending.contains(previous) {
+                    return Err(AgentError::TaskBusy {
+                        task_id: previous.clone(),
+                    });
+                }
+            }
             inner
                 .starts
                 .entry(pairing.to_string())
                 .or_default()
                 .push_back(now);
             inner.by_session.insert(session_id.clone(), task_id.clone());
+            inner.turn_pending.insert(task_id.clone());
             inner.tasks.insert(
                 task_id.clone(),
                 TaskRecord::new(&task_id, pairing, &session_id, prompt, &proxy, now),
@@ -323,17 +353,20 @@ impl TaskEngine {
             // The marker `turn_ended` sent: every frame its turn queued before
             // it ended has been observed by now.
             let mut inner = self.lock();
-            if let Some(id) = inner.by_session.get(session).cloned() {
-                if let Some(arrived) = inner.ending.remove(&id) {
-                    let _ = arrived.send(());
-                }
+            let ended = inner
+                .ending
+                .iter()
+                .find(|(_, (s, _))| s == session)
+                .map(|(id, _)| id.clone());
+            if let Some((_, arrived)) = ended.and_then(|id| inner.ending.remove(&id)) {
+                let _ = arrived.send(());
             }
             return;
         }
         let now = self.now();
         let (task_id, pairing, seen, stop) = {
             let mut inner = self.lock();
-            let Some(task_id) = inner.by_session.get(session).cloned() else {
+            let Some(task_id) = Self::task_of(&inner, session) else {
                 return;
             };
             let Some(task) = inner.tasks.get_mut(&task_id) else {
@@ -374,7 +407,7 @@ impl TaskEngine {
             .and_then(Value::as_bool)
             == Some(true);
         let mut inner = self.lock();
-        let Some(id) = inner.by_session.get(session).cloned() else {
+        let Some(id) = Self::task_of(&inner, session) else {
             return;
         };
         if let Some(task) = inner.tasks.get_mut(&id) {
@@ -382,55 +415,77 @@ impl TaskEngine {
         }
     }
 
-    /// A turn of `session` is starting. Only a task's first turn is watched.
+    /// A turn of `session` is starting. It is the turn of the session's task
+    /// whose turn is pending (there is at most one); any other turn there is
+    /// not watched.
     pub fn begin_turn(self: &Arc<Self>, session: &str) -> TurnStart {
         let mut inner = self.lock();
-        let Some(id) = inner.by_session.get(session).cloned() else {
+        let Some(id) = inner
+            .by_session
+            .get(session)
+            .filter(|id| inner.turn_pending.contains(*id))
+            .cloned()
+        else {
             return TurnStart::Run(TurnGuard::untracked());
         };
         let Some(task) = inner.tasks.get_mut(&id) else {
+            inner.turn_pending.remove(&id);
             return TurnStart::Run(TurnGuard::untracked());
         };
         if task.turn_started {
             return TurnStart::Run(TurnGuard::untracked());
         }
         task.turn_started = true;
-        if task.state == TaskState::Cancelled {
+        let state = task.state;
+        if state == TaskState::Cancelled {
+            inner.turn_pending.remove(&id);
             return TurnStart::Skip;
         }
-        if task.state.is_terminal() {
+        if state.is_terminal() {
+            inner.turn_pending.remove(&id);
             return TurnStart::Run(TurnGuard::untracked());
         }
         TurnStart::Run(TurnGuard {
-            watched: Some((self.clone(), session.to_string())),
+            watched: Some((self.clone(), id)),
         })
     }
 
-    /// The turn of `session` ended. Its last frames may still be queued for
+    /// The turn of `task_id` ended. Its last frames may still be queued for
     /// the chat tap (the turn hands them to the writer and moves on), and the
     /// record stops reading frames once it concludes, so the conclusion waits
     /// for a marker sent behind them — or `TURN_END_GRACE`, should it never
     /// come back. A turn that unwound, or whose sidebar is gone, has nothing
     /// more coming and concludes now.
-    fn turn_ended(self: &Arc<Self>, session: &str, panicking: bool) {
-        let (task_id, proxy, pairing) = {
-            let inner = self.lock();
-            let Some(id) = inner.by_session.get(session).cloned() else {
-                return;
-            };
-            let Some(task) = inner.tasks.get(&id) else {
-                return;
-            };
-            (id, task.proxy_id.clone(), task.pairing.clone())
+    fn turn_ended(self: &Arc<Self>, task_id: &str, panicking: bool) {
+        let Some((session, proxy, pairing)) = self.lock().tasks.get(task_id).map(|task| {
+            (
+                task.session.clone(),
+                task.proxy_id.clone(),
+                task.pairing.clone(),
+            )
+        }) else {
+            self.lock().turn_pending.remove(task_id);
+            return;
         };
+        let task_id = task_id.to_string();
         let rt = match tokio::runtime::Handle::try_current() {
             Ok(rt) if !panicking && self.host.is_connected(&proxy) => rt,
-            _ => return self.conclude_turn(&task_id, panicking),
+            _ => {
+                self.lock().turn_pending.remove(&task_id);
+                return self.conclude_turn(&task_id, panicking);
+            }
         };
         let (arrived, marker) = oneshot::channel();
-        self.lock().ending.insert(task_id.clone(), arrived);
+        {
+            // One step: the session's frames stay this turn's from the moment
+            // another task may start there.
+            let mut inner = self.lock();
+            inner.turn_pending.remove(&task_id);
+            inner
+                .ending
+                .insert(task_id.clone(), (session.clone(), arrived));
+        }
         let engine = self.clone();
-        let session = session.to_string();
         rt.spawn(async move {
             engine
                 .host
@@ -848,6 +903,8 @@ pub(crate) mod testing {
         pub(crate) log: Mutex<Vec<(&'static str, String, Value)>>,
         pub(crate) shots: Mutex<Vec<BrowserRequest>>,
         pub(crate) shot_answer: Mutex<Option<BrowserResponse>>,
+        /// The sidebar disconnects while the screenshot is asked for.
+        pub(crate) gone_on_shot: Mutex<bool>,
         pub(crate) pending: Arc<Pending>,
         /// Where `send` hands every frame, as the daemon's chat tap does:
         /// the engine itself, unless a test cuts it.
@@ -917,6 +974,9 @@ pub(crate) mod testing {
         }
         async fn browser(&self, request: BrowserRequest) -> Option<BrowserResponse> {
             self.shots.lock().unwrap().push(request);
+            if *self.gone_on_shot.lock().unwrap() {
+                *self.connected.lock().unwrap() = false;
+            }
             self.shot_answer.lock().unwrap().clone()
         }
     }
@@ -937,6 +997,7 @@ pub(crate) mod testing {
             log: Mutex::new(Vec::new()),
             shots: Mutex::new(Vec::new()),
             shot_answer: Mutex::new(None),
+            gone_on_shot: Mutex::new(false),
             pending: Arc::new(Pending::new()),
             tap: Mutex::new(None),
         });
@@ -1152,12 +1213,134 @@ mod tests {
         }
         let (id, session) = r.start().await;
         r.engine.cancel(Some(CHANNEL), &id).await.unwrap();
+        assert!(matches!(r.engine.begin_turn(&session), TurnStart::Skip));
         let again = r
             .engine
             .start(CHANNEL, "make it blue", Some(&session))
             .await
             .unwrap();
         assert_eq!(again["session"], session.as_str());
+    }
+
+    #[tokio::test]
+    async fn a_session_is_continued_only_once_its_previous_turn_was_skipped() {
+        let r = rig();
+        let (first, s) = r.start().await;
+        r.engine.cancel(Some(CHANNEL), &first).await.unwrap();
+        assert_eq!(
+            r.engine
+                .start(CHANNEL, "go on", Some(&s))
+                .await
+                .unwrap_err(),
+            AgentError::TaskBusy {
+                task_id: first.clone()
+            },
+            "the cancelled task's chat message has not reached its turn yet"
+        );
+        assert!(
+            matches!(r.engine.begin_turn(&s), TurnStart::Skip),
+            "the first task's prompt is skipped, not taken for a later task's turn"
+        );
+        let second = r.engine.start(CHANNEL, "go on", Some(&s)).await.unwrap();
+        let second = second["task_id"].as_str().unwrap().to_string();
+        let turn = guard(&r, &s);
+        r.engine.observe(&text(&s, "Continued."));
+        drop(turn);
+        let w = r
+            .engine
+            .wait(CHANNEL, "m1", &second, Duration::from_secs(5), None)
+            .await
+            .unwrap();
+        assert_eq!(w.state["state"], "done");
+        assert_eq!(w.state["reply"], "Continued.");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_turn_that_ends_never_concludes_the_task_that_continued_its_session() {
+        let r = rig();
+        // Markers come back only when the test replays them.
+        *r.host.tap.lock().unwrap() = None;
+        let (first, s) = r.start().await;
+        let turn1 = guard(&r, &s);
+        r.engine.cancel(Some(CHANNEL), &first).await.unwrap();
+        assert_eq!(
+            r.engine
+                .start(CHANNEL, "go on", Some(&s))
+                .await
+                .unwrap_err(),
+            AgentError::TaskBusy {
+                task_id: first.clone()
+            },
+            "the first turn is still running"
+        );
+        drop(turn1);
+        let second = r.engine.start(CHANNEL, "go on", Some(&s)).await.unwrap();
+        let second = second["task_id"].as_str().unwrap().to_string();
+        // The first turn's last frame, then its marker, reach the tap after
+        // the second task started.
+        r.engine
+            .observe(&tool_start(&s, "toolu_late", "browser_click"));
+        r.engine.observe(&text(&s, "Late from the first turn."));
+        r.engine.observe(&session_origin_frame(&s, CHANNEL));
+        settle().await;
+        let turn2 = guard(&r, &s);
+        r.engine.observe(&text(&s, "From the second turn."));
+        // A stale marker for the first turn while the second runs.
+        r.engine.observe(&session_origin_frame(&s, CHANNEL));
+        settle().await;
+        let w = r
+            .engine
+            .wait(CHANNEL, "m1", &second, Duration::from_millis(1), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            w.state["state"], "running",
+            "the first turn did not conclude the second task"
+        );
+        assert_eq!(
+            w.state["steps"],
+            json!([]),
+            "the first turn's late frames are not the second task's"
+        );
+        drop(turn2);
+        r.engine.observe(&session_origin_frame(&s, CHANNEL));
+        let w = r
+            .engine
+            .wait(CHANNEL, "m1", &second, Duration::from_secs(5), None)
+            .await
+            .unwrap();
+        assert_eq!(w.state["state"], "done");
+        assert_eq!(w.state["reply"], "From the second turn.");
+        let w = r
+            .engine
+            .wait(CHANNEL, "m1", &first, Duration::from_millis(1), None)
+            .await
+            .unwrap();
+        assert_eq!(w.state["state"], "cancelled");
+    }
+
+    #[tokio::test]
+    async fn a_sidebar_that_left_during_the_screenshot_is_browser_unavailable() {
+        let r = rig();
+        let (id, s) = r.start().await;
+        *r.host.gone_on_shot.lock().unwrap() = true;
+        let turn = guard(&r, &s);
+        r.engine.observe(
+            &json!({"type": "artifact_start", "payload": {"session_id": s, "id": "calc-1",
+                                 "title": "Calculator", "content_type": "text/html"}}),
+        );
+        drop(turn);
+        let w = r
+            .engine
+            .wait(CHANNEL, "m1", &id, Duration::from_secs(5), None)
+            .await
+            .unwrap();
+        assert_eq!(w.state["state"], "done");
+        assert_eq!(
+            w.state["screenshot_error"], "browser_unavailable",
+            "not timeout"
+        );
+        assert_eq!(r.host.shots.lock().unwrap().len(), 1, "it was asked");
     }
 
     #[tokio::test]
