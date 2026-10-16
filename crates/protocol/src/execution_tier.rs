@@ -164,10 +164,6 @@ const R_TOOLS: &[&str] = &[
     "list_agents",
     "subagent_list",
     "subagent_status",
-    // Runs a tool found with tool_search. Judged by the tool it names: the
-    // delegated stage unwraps it, and the ACP bridge gates the inner call on
-    // its own, so the wrapper adds no reach of its own.
-    "tool_call_dynamic",
 ];
 
 /// B1 bucket — browser interactions that change page/site state.
@@ -526,7 +522,7 @@ mod tests {
             "browser_network_requests", "recall", "brain_search", "goal_status",
             "schedule_list", "schedule_runs", "loop_list", "loop_scratchpad_get",
             "pack_list_active", "list_flows", "list_agents", "subagent_list",
-            "subagent_status", "tool_call_dynamic",
+            "subagent_status",
         ] {
             assert_eq!(classify_tool(t), RiskBucket::R, "{t}");
             assert!(tier_auto_approves(t, ExecutionTier::ReadOnly), "{t}");
@@ -546,8 +542,21 @@ mod tests {
             "loop_scratchpad_set", "pack_activate", "pack_deactivate", "switch_model",
             "screencast_start", "goal_set", "goal_clear", "system_prompt_replace",
             "system_prompt_restore", "run_flow", "tts_synthesize_api", "write_file",
+            "tool_call_dynamic",
         ] {
             assert_eq!(classify_tool(t), RiskBucket::X, "{t}");
         }
+    }
+
+    /// `tool_call_dynamic` runs whatever tool it names. The ACP bridge's tier
+    /// gate sees only this outer name, so the wrapper must not be read-only:
+    /// otherwise an ordinary read-only session would run `computer_click` or
+    /// an external MCP tool through it unasked.
+    #[test]
+    fn the_dynamic_call_wrapper_is_not_read_only() {
+        assert_eq!(classify_tool("tool_call_dynamic"), RiskBucket::X);
+        assert!(!tier_auto_approves("tool_call_dynamic", ExecutionTier::ReadOnly));
+        assert!(!tier_auto_approves("mcp__nevoflux__tool_call_dynamic", ExecutionTier::BrowserAutoLocalRead));
+        assert_eq!(minimum_tier("tool_call_dynamic"), ExecutionTier::FullAuto);
     }
 }
