@@ -113,6 +113,9 @@ mod tests {
     #[test]
     fn a_panel_cannot_let_an_agent_approve_sensitive_actions() {
         assert!(is_forbidden_command("remote.agent_set_guarded_approval"));
+        // Nor answer or stop a delegated task as the desktop (contract §8).
+        assert!(is_forbidden_command("remote.task_answer"));
+        assert!(is_forbidden_command("remote.task_cancel"));
     }
 
     #[test]

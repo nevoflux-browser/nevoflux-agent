@@ -2656,12 +2656,11 @@ mod tests {
             wrap: impl FnOnce(McpGateway) -> McpGateway,
         ) -> Self {
             let sink = Arc::new(Collect::default());
-            let gw = wrap(McpGateway::new(
-                KEY,
-                sink.clone(),
-                Arc::new(backend),
-                CHANNEL,
-            ));
+            // No task engine, whatever the process installed: these tests
+            // count the browser tools.
+            let gw = wrap(
+                McpGateway::new(KEY, sink.clone(), Arc::new(backend), CHANNEL).with_tasks(None),
+            );
             gw.on_wire_in(&Wire::Text(r#"{"k":"peers","n":1}"#.into()))
                 .await;
             let ch = sink.frames()[0]["ch"].as_str().unwrap().to_string();
