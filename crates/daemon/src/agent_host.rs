@@ -1991,6 +1991,10 @@ fn expand_tilde(path: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(path)
 }
 
+/// Why a delegated session's `browser_network_capture(true)` is refused.
+pub(crate) const DELEGATED_NO_CAPTURE: &str =
+    "Network capture is never started in a task delegated by a paired agent.";
+
 /// 网络捕获此刻是否开着。
 ///
 /// 真正的状态在扩展那边(缓冲和计时都在那儿),这里存一份镜像,只为了让
@@ -6310,6 +6314,25 @@ impl HostFunctions for DaemonHostFunctions {
         tab_id: Option<i64>,
     ) -> HostResult<BrowserToolResult> {
         debug!("browser_network_capture on={on}");
+        // Contract-adjacent (final review I1): a delegated turn's "user
+        // prompt" is the paired agent's, so naming the tool must not arm an
+        // all-tab capture. Checked here, host side, so the guest cannot skip
+        // it; stopping stays allowed.
+        if on {
+            if let Some(services) = self.services.as_ref() {
+                if crate::remote::task::origin::delegated_pairing(
+                    &services.database,
+                    services.gate_session_id(),
+                )
+                .is_some()
+                {
+                    return Err(HostError {
+                        code: 403,
+                        message: DELEGATED_NO_CAPTURE.into(),
+                    });
+                }
+            }
+        }
         NETWORK_CAPTURE_ARMED.store(on, std::sync::atomic::Ordering::Relaxed);
         let action = if on {
             BrowserToolAction::NetworkCaptureStart
@@ -13591,6 +13614,51 @@ message = "not here"
         .with_is_subagent(true)
         .with_services(services);
         let gate = host.tool_pre(&a_tool_call("schedule_create"), &a_tool_context("subagent-1"));
+        assert!(matches!(gate, nevoflux_builtin_wasm::ToolGate::Allow), "{gate:?}");
+    }
+
+    #[test]
+    fn a_delegated_session_never_arms_network_capture() {
+        use super::HostFunctions;
+        let (host, _rt, brx) = delegated_host("s-del");
+        let asked = watch_for_asks(brx);
+        // Refused before the tier is consulted (below full-auto the ceiling
+        // would refuse it too, but full-auto must not arm it either).
+        let err = host.browser_network_capture(true, None).unwrap_err();
+        assert_eq!(err.message, super::DELEGATED_NO_CAPTURE);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !asked.load(std::sync::atomic::Ordering::SeqCst),
+            "no capture request reached the browser"
+        );
+    }
+
+    #[test]
+    fn a_delegated_turn_needs_browser_auto_to_read_network_requests() {
+        use super::HostFunctions;
+        // Read-only pairing (no store in a unit test).
+        let (host, _rt, brx) = delegated_host("s-del");
+        let asked = watch_for_asks(brx);
+        match host.tool_pre(&a_tool_call("browser_network_requests"), &a_tool_context("s-del")) {
+            nevoflux_builtin_wasm::ToolGate::Deny(d) => {
+                assert_eq!(d.code, "DELEGATED_ABOVE_TIER");
+                assert_eq!(
+                    d.message,
+                    "browser_network_requests needs the browser-auto tier, which this paired agent does not have. The person can raise the agent's tier in NevoFlux."
+                );
+            }
+            other => panic!("not refused: {other:?}"),
+        }
+        assert!(!asked.load(std::sync::atomic::Ordering::SeqCst), "nobody was asked");
+        // A local session is not judged by a pairing.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        let local = super::DaemonHostFunctions::new(
+            std::sync::Arc::new(crate::config::AgentConfig::default()),
+            rt.handle().clone(),
+        )
+        .with_services(crate::wasm::services::HostServices::new(db).with_session_id("s-own".to_string()));
+        let gate = local.tool_pre(&a_tool_call("browser_network_requests"), &a_tool_context("s-own"));
         assert!(matches!(gate, nevoflux_builtin_wasm::ToolGate::Allow), "{gate:?}");
     }
 }

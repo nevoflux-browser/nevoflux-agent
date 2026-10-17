@@ -12,6 +12,7 @@
 use std::sync::Arc;
 
 use nevoflux_llm::providers::acp::mcp_bridge::Tightener;
+use nevoflux_protocol::ExecutionTier;
 use nevoflux_storage::Database;
 
 use crate::remote::pairing::PairingStore;
@@ -27,11 +28,32 @@ pub fn ceiling_with(
 ) -> Option<Ceiling> {
     let pairing = super::origin::delegated_pairing(&db, session_id)?;
     Some(Arc::new(move |tool: &str| {
-        nevoflux_protocol::tier_auto_approves(
-            tool,
-            super::origin::pairing_tier(store.clone(), &pairing),
-        )
+        let tier = super::origin::pairing_tier(store.clone(), &pairing);
+        if raised_to_browser_auto(tool) {
+            return tier != ExecutionTier::ReadOnly;
+        }
+        nevoflux_protocol::tier_auto_approves(tool, tier)
     }))
+}
+
+/// Tools a delegated turn needs at least browser-auto for although they are
+/// read-only locally (final review I1): the captured-network buffer holds
+/// every tab's requests, not only what the paired agent opened.
+const DELEGATED_BROWSER_AUTO: &[&str] = &["browser_network_requests"];
+
+/// Whether `tool` (bare or ACP-prefixed) is in [`DELEGATED_BROWSER_AUTO`].
+fn raised_to_browser_auto(tool: &str) -> bool {
+    let bare = tool.rsplit("__").next().unwrap_or(tool);
+    DELEGATED_BROWSER_AUTO.contains(&bare)
+}
+
+/// The least tier a delegated turn runs `tool` at.
+fn delegated_minimum(tool: &str) -> ExecutionTier {
+    if raised_to_browser_auto(tool) {
+        ExecutionTier::BrowserAuto
+    } else {
+        nevoflux_protocol::minimum_tier(tool)
+    }
 }
 
 /// [`ceiling_with`] against the daemon's own pairing store.
@@ -44,7 +66,7 @@ pub fn refusal(tool: &str) -> String {
     format!(
         "{} needs the {} tier, which this paired agent does not have. The person can raise the agent's tier in NevoFlux.",
         tool,
-        nevoflux_protocol::minimum_tier(tool).as_setting()
+        delegated_minimum(tool).as_setting()
     )
 }
 
@@ -70,7 +92,6 @@ pub fn tighten(inner: Option<Tightener>, ceiling: Ceiling) -> Tightener {
 mod tests {
     use super::*;
     use crate::remote::agent_status::testing::agent;
-    use nevoflux_protocol::ExecutionTier;
 
     #[test]
     fn the_ceiling_follows_the_pairing_live() {
@@ -89,6 +110,25 @@ mod tests {
         );
         store.set_tier("chan-1", ExecutionTier::ReadOnly).unwrap();
         assert!(!within("run_command"), "and lowered again");
+    }
+
+    #[test]
+    fn a_delegated_turn_reads_network_requests_only_from_browser_auto() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        super::super::origin::create_delegated(&db, "s1", "chan-1").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PairingStore::new(dir.path().join("agent-pairings.json")));
+        store.add(agent("chan-1", 1)).unwrap();
+        let within = ceiling_with(db, "s1", Some(store.clone())).expect("a delegated session");
+        assert!(!within("browser_network_requests"));
+        assert!(!within("mcp__nevoflux__browser_network_requests"), "the ACP name too");
+        assert!(within("browser_console_messages"), "only network capture is raised");
+        store.set_tier("chan-1", ExecutionTier::BrowserAuto).unwrap();
+        assert!(within("browser_network_requests"));
+        assert_eq!(
+            refusal("browser_network_requests"),
+            "browser_network_requests needs the browser-auto tier, which this paired agent does not have. The person can raise the agent's tier in NevoFlux."
+        );
     }
 
     #[test]

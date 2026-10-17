@@ -4498,6 +4498,23 @@ message = "ask.example wants a person to confirm"
         assert_eq!(session, "s-del", "asked in the task's session, where R39 applies");
         assert_eq!(params["must_approve"], true);
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_mcp_gate_needs_browser_auto_for_network_requests_in_a_delegated_turn() {
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        crate::remote::task::origin::create_delegated(&db, "s-del", "chan-1").unwrap();
+        let services = HostServices::new(db).with_session_id("s-del".to_string());
+        let bridge = make_test_bridge();
+        let err = refused_within_a_deadline(
+            "browser_network_requests",
+            serde_json::json!({}),
+            &services,
+            &bridge,
+        )
+        .await;
+        assert!(err.starts_with("[DELEGATED_ABOVE_TIER]"), "{err}");
+        assert!(err.contains("needs the browser-auto tier"), "{err}");
+    }
 }
 
 #[cfg(test)]
