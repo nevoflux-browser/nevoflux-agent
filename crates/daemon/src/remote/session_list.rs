@@ -12,6 +12,16 @@
 
 use super::runtime_state::{RuntimeState, Snapshot};
 
+/// What `session.list` shows as `runtime` (M3 contract §3): `running`,
+/// `awaiting_approval`, or `null` for a session doing nothing.
+pub fn runtime_label(state: Option<&RuntimeState>) -> serde_json::Value {
+    match state {
+        Some(RuntimeState::Running) => serde_json::json!("running"),
+        Some(RuntimeState::Blocked { .. }) => serde_json::json!("awaiting_approval"),
+        None => serde_json::Value::Null,
+    }
+}
+
 /// One row of the list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRow {
@@ -240,5 +250,19 @@ mod tests {
         let mut names = active_sessions(&s);
         names.sort();
         assert_eq!(names, ["s1", "s2"]);
+    }
+}
+
+#[cfg(test)]
+mod runtime_label_tests {
+    use super::*;
+    use crate::remote::translate::BlockKind;
+
+    #[test]
+    fn the_runtime_label_is_running_awaiting_or_null() {
+        assert_eq!(runtime_label(Some(&RuntimeState::Running)), serde_json::json!("running"));
+        let blocked = RuntimeState::Blocked { kind: BlockKind::Gate, id: "r".into(), prompt: "p".into() };
+        assert_eq!(runtime_label(Some(&blocked)), serde_json::json!("awaiting_approval"));
+        assert_eq!(runtime_label(None), serde_json::Value::Null);
     }
 }

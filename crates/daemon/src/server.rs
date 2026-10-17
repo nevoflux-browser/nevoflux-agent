@@ -10247,6 +10247,8 @@ async fn handle_session_list(
                 sessions.len(),
                 exclude_empty
             );
+            // What each session is doing right now (M3 contract §3).
+            let runtime = crate::remote::start::control_deps().map(|deps| deps.tracker.snapshot());
             // Get message counts for each session
             let mut session_summaries = Vec::new();
             for session in &sessions {
@@ -10260,7 +10262,13 @@ async fn handle_session_list(
                     "title": session.title,
                     "updated_at": session.updated_at,
                     "message_count": message_count,
-                    "pinned": session.pinned
+                    "pinned": session.pinned,
+                    // Who started it (a paired agent's delegated task), and
+                    // whether it is running or waiting on someone.
+                    "origin": crate::remote::task::origin::origin_value(session.metadata.as_ref()),
+                    "runtime": crate::remote::session_list::runtime_label(
+                        runtime.as_ref().and_then(|r| r.get(&session.id))
+                    )
                 }));
             }
 
@@ -16548,5 +16556,24 @@ mod tests {
             types.push(env.payload["type"].as_str().unwrap().to_string());
         }
         assert_eq!(types, ["artifact_start", "artifact_delta", "artifact_complete"]);
+    }
+
+    #[tokio::test]
+    async fn the_session_list_says_who_started_a_session() {
+        let sm = Arc::new(SessionManager::in_memory().unwrap());
+        sm.create_session(Some("s-muse".into()), None).await.unwrap();
+        let mut meta = HashMap::new();
+        meta.insert("origin".to_string(), serde_json::json!({"kind": "muse", "pairing": "chan-1"}));
+        sm.update_session_metadata("s-muse", meta).await.unwrap();
+        sm.add_message("s-muse", MessageRole::User, "Generate a calculator Canvas").await.unwrap();
+        sm.create_session(Some("s-own".into()), None).await.unwrap();
+        sm.add_message("s-own", MessageRole::User, "hello").await.unwrap();
+        let v = handle_session_list(&sm, &serde_json::json!({"request_id": "r1"})).await;
+        let sessions = v["payload"]["data"]["sessions"].as_array().unwrap().clone();
+        let find = |id: &str| sessions.iter().find(|s| s["id"] == id).cloned().unwrap();
+        assert_eq!(find("s-muse")["origin"], serde_json::json!({"kind": "muse", "pairing": "chan-1"}));
+        assert_eq!(find("s-own")["origin"], serde_json::Value::Null);
+        // No runtime map in a unit test: idle reads as null, never absent.
+        assert!(find("s-own").get("runtime").is_some_and(|r| r.is_null()));
     }
 }
