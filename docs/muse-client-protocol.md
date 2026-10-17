@@ -107,7 +107,9 @@ Tools: `tools/list` shows the head's whitelist with their schemas:
 `browser_click_by_id`, `browser_fill_by_id`, `browser_type_by_id`,
 `browser_click`, `browser_fill`, `browser_type`, `browser_key_press`,
 `browser_scroll`, `browser_wait_for`, `browser_upload_file`. Calls run in the
-person's desktop NevoFlux browser.
+person's desktop NevoFlux browser. A head that offers delegation (§8) also lists
+`nevoflux_task_start`, `nevoflux_task_wait`, `nevoflux_task_approve` and
+`nevoflux_task_cancel`.
 
 Example requests: `fixtures/muse/mcp_messages.json`.
 
@@ -180,6 +182,7 @@ in `fixtures/muse/tool_errors.json` exactly as the head sends it.
 JSON-RPC errors still mean a malformed request. A head before M2 answered
 off-whitelist calls with JSON-RPC errors carrying `data.code` `not_allowed` or
 `unavailable`; an M2 head sends neither.
+The task tools of §8 answer the same way, with the codes in §8.5 as well.
 
 ### 5.4 Approvals
 
@@ -251,3 +254,151 @@ browser. Environment:
 
 It answers `browser_snapshot` and `browser_navigate` with fixed results and
 lists only whitelisted tools; a whitelisted tool it does not stub answers `unknown_tool` (section 5.3).
+
+## 8. Delegation
+
+A head that lists `nevoflux_task_start` in `tools/list` lets you hand the
+person's desktop NevoFlux a whole task: one full agent turn, run in a
+background session of its sidebar, in Agent mode, with skills, Canvas and
+every tool **this pairing's tier** allows. The tier (§5.1) is the boundary,
+not the browser whitelist of §5: above it a tool is refused at once and
+nobody is asked, and the person lowering the tier stops the next tool call.
+Within the tier, ten sensitive tools always need an approval, whatever was
+allowed before: by default only the person at the desktop can give it, and
+the person can let you answer them too; see §8.3. The four task tools
+themselves work at every tier. The protocol number stays `1`; detect
+delegation by the tool.
+
+Schemas: `fixtures/muse/task_tools.json`. Results: `fixtures/muse/task_results.json`.
+
+### 8.1 Calls
+
+| tool | arguments | result (`structuredContent`) |
+|---|---|---|
+| `nevoflux_task_start` | `prompt` (1–8000 characters after trimming); `session` (optional) | `{"task_id", "session", "state": "running"}` |
+| `nevoflux_task_wait` | `task_id`; `timeout_secs` (integer 1–60, default 30) | the task (§8.2) |
+| `nevoflux_task_approve` | `task_id`, `approval_id`, `choice` (`allow` or `deny`); `answer` (≤ 4000 characters, for a question) | `{"ok": true, "state"}` |
+| `nevoflux_task_cancel` | `task_id` | `{"task_id", "state"}`: `cancelled`, or the final state of a task that already ended |
+
+- One task per pairing at a time; at most 20 starts in any hour.
+- `session` continues one of your earlier tasks (for example "now make the
+  buttons blue"): pass the `session` an earlier start returned. Any other
+  session is `session_not_found`.
+- Malformed arguments answer `tool_failed` with `detail` one of:
+  `prompt is required`, `prompt must be 1 to 8000 characters`,
+  `timeout_secs must be an integer from 1 to 60`, `choice must be allow or deny`
+  (also for `allow_always`, which only the person can choose),
+  `answer is required for a question`, `answer must be a string`,
+  `answer must be at most 4000 characters`, `answer is only allowed with allow`,
+  `<field> is required`.
+- Task ids, session ids and approval ids are UUIDs (36 characters, lowercase,
+  hyphenated); match them case-insensitively. Your own
+  elicitation ids from §5.4 are 8 hex characters, so the two never collide.
+
+### 8.2 The task
+
+```json
+{"task_id": "…", "session": "…", "state": "running | awaiting_approval | done | failed | cancelled",
+ "steps": [{"id": "toolu_01", "at": "2026-10-14T13:05:56Z", "tool": "skill_load", "status": "started | ok | failed"}],
+ "steps_truncated": true,
+ "approvals": [ … §8.3 … ],
+ "reply": "…", "reply_truncated": true,
+ "screenshot_error": "no_tab",
+ "error": {"code": "approval_timeout | llm_error | browser_unavailable | interrupted", "message": "…"}}
+```
+
+- `steps` are events: a tool call gives a `started` event and later one `ok`
+  or `failed` event with the same `id`. Each wait returns the events since
+  your previous wait **in this MCP session**; after a reconnect the first
+  wait replays from the oldest kept event. At most 500 events are kept;
+  `steps_truncated: true` says some you had not seen were dropped. `at` is UTC.
+- `approvals` only while `awaiting_approval`, oldest first. `reply` only on
+  `done`: the assistant's text after its last tool call, at most 32 000
+  characters (`reply_truncated: true` when cut). `error` only on `failed`.
+  `steps_truncated`, `reply_truncated` and `screenshot_error` appear only
+  when they apply. Accept keys you do not know.
+- The **first** `done` result in an MCP session carries one picture of what
+  the task produced (the Canvas it generated, else the tab it opened, else
+  the tab it last acted on) as `content[1]`:
+  `{"type": "image", "data": "<base64>", "mimeType": "image/jpeg"}` — at most
+  1280 px wide, 2400 px tall, 300 KB. Later waits in that session omit it.
+  With no picture, `done` carries `screenshot_error`: `no_tab` (nothing was
+  opened or touched), `tab_discarded`, `tab_closed`, `too_large`, `timeout`,
+  `capture_failed`, `browser_unavailable`.
+- A wait returns at once while an approval is open or when the task has
+  ended; otherwise when one of those happens, or at `timeout_secs`. Steps do
+  not end a wait early.
+- `failed` messages: `approval_timeout` — `nobody answered an approval within
+  30 minutes; it was denied`; `llm_error` — `the model call failed: <detail>`;
+  `browser_unavailable` — `the NevoFlux desktop browser disconnected`;
+  `interrupted` — `the task was interrupted`. Cancelling, pausing or
+  unpairing ends a task as `cancelled`, without `error`.
+- A finished task can be waited on for an hour. After that, or after the
+  desktop's NevoFlux restarts, it is `task_not_found` (its session remains).
+- Your MCP connection dropping does not stop a task; wait again after you
+  reconnect.
+
+### 8.3 Approvals
+
+```json
+{"approval_id": "…", "kind": "tool | question | plan", "summary": "Create a Canvas artifact: \"Calculator\"",
+ "tool": "create_artifact", "target": null, "question": "…", "options": ["…"], "plan_steps": ["…"],
+ "choices": ["allow", "deny"], "at": "2026-10-14T13:06:10Z", "expires_in": 1740}
+```
+
+- `tool`: a permission prompt (a site or pack rule, a risk flag, an ACP
+  agent's own permission request, one of the ten sensitive tools below).
+  `question`: the agent asks you something; `question` and `options`
+  (possibly empty) are present, answer with `choice: "allow"` and the text
+  in `answer`, or `deny` to cancel the question. `plan`: a plan to confirm;
+  `plan_steps` is present; `allow` runs it, `deny` cancels it.
+- `tool` is the running tool, or `null`. `target` is always `null` in this
+  version. `expires_in` is whole seconds left of 30 minutes; unanswered by
+  then, the approval is denied and the task ends `failed`
+  (`approval_timeout`).
+- The person at the desktop can answer the same approval. The first answer
+  wins; the other side's is `approval_not_found` — wait again to see the
+  task's state.
+- Ten sensitive tools always ask, even at full-auto and whatever was allowed
+  before: when the task wants to schedule work, run or resume a schedule,
+  start a loop, switch a pack or the model, set a goal, replace the system
+  prompt or share the screen. Such a `tool` approval's `summary` is
+  `A task delegated by a paired agent wants to run <tool>. This action always needs approval.`
+  By default only the person at the desktop may answer it: it carries
+  `"desktop_only": true` with `"choices": []`, and answering it is
+  `approval_desktop_only`; ask the person to approve it at the desktop, or to
+  turn on "Let Muse approve sensitive actions" for this agent there, and
+  wait. With that setting on, the same approvals arrive as ordinary ones
+  (`choices: ["allow", "deny"]`, no `desktop_only`; first answer wins as
+  above). The setting can change while an approval waits: read
+  `desktop_only` from each wait result, never from an earlier one.
+  Unanswered after 30 minutes it is denied like any other approval.
+
+### 8.4 Progress
+
+Put `_meta: {"progressToken": <token>}` on a `nevoflux_task_wait` call and,
+while that wait is open, the head sends `notifications/progress`
+`{progressToken, progress, message}` (no `total`), one per step event and one
+per new approval; `progress` counts 1, 2, … within the wait. Messages:
+`Running <tool>`, `<tool> finished`, `<tool> failed`,
+`Waiting for approval: <summary>`.
+
+Progress is optional: without a `progressToken` nothing is sent, and the same
+events arrive as `steps` in the wait result (nevoflux-muse 0.4.0 sends none).
+
+### 8.5 Errors
+
+| `code` | when | extra fields |
+|---|---|---|
+| `task_busy` | a task of yours has not ended; or the desktop's ACP model provider is busy with another conversation | `task_id`, or `provider` |
+| `rate_limited` | 20 starts in the last hour | `retry_after` (seconds, ≥ 1) |
+| `session_not_found` | `session` is not one of your task sessions | `session` |
+| `task_not_found` | unknown, someone else's, ended over an hour ago, or the head restarted | `task_id` |
+| `approval_not_found` | not waiting for an answer (answered on the desktop, expired, unknown) | `approval_id` |
+| `approval_desktop_only` | only the person at the desktop may answer this approval (`desktop_only`; "Let Muse approve sensitive actions" is off) | `approval_id` |
+| `paused` | the person paused you | |
+| `browser_unavailable` | the desktop sidebar is not connected | |
+| `tool_failed` | malformed arguments (§8.1) | `detail` |
+
+Every case: `fixtures/muse/tool_errors.json` (the `provider` form of
+`task_busy` is its `task_busy_provider` entry).

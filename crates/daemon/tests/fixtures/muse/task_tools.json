@@ -1,0 +1,45 @@
+{
+  "note": "The four M3 delegation tools exactly as tools/list shows them (name, description, inputSchema). A head offers delegation when nevoflux_task_start is listed; protocol stays 1. Clients must accept extra keys on a tool.",
+  "tools": [
+    {"name": "nevoflux_task_start",
+     "description": "Hand NevoFlux a whole task to run on the desktop: a full agent turn that may use skills, Canvas and every tool this pairing's tier allows. Returns at once with a task_id; follow it with nevoflux_task_wait. Pass session to continue a task session this agent started before.",
+     "inputSchema": {"type": "object", "properties": {
+        "prompt": {"type": "string", "description": "What to do, in plain words (1 to 8000 characters)"},
+        "session": {"type": "string", "description": "A session from an earlier nevoflux_task_start of yours, to continue that conversation"}},
+      "required": ["prompt"]}},
+    {"name": "nevoflux_task_wait",
+     "description": "Wait for a delegated task. Returns its state, the tool steps since your last wait, the approvals it is waiting on, and once it is done its reply and one screenshot of what it produced. Returns early when an approval appears or the task ends.",
+     "inputSchema": {"type": "object", "properties": {
+        "task_id": {"type": "string", "description": "From nevoflux_task_start"},
+        "timeout_secs": {"type": "integer", "minimum": 1, "maximum": 60, "default": 30, "description": "The longest to wait, in seconds"}},
+      "required": ["task_id"]}},
+    {"name": "nevoflux_task_approve",
+     "description": "Answer an approval a delegated task is waiting on: allow or deny. For a question, choose allow and put the text in answer. The person at the desktop may answer first; then this answers approval_not_found.",
+     "inputSchema": {"type": "object", "properties": {
+        "task_id": {"type": "string", "description": "The task"},
+        "approval_id": {"type": "string", "description": "From the approvals of nevoflux_task_wait"},
+        "choice": {"type": "string", "enum": ["allow", "deny"]},
+        "answer": {"type": "string", "description": "The answer to a question (at most 4000 characters)"}},
+      "required": ["task_id", "approval_id", "choice"]}},
+    {"name": "nevoflux_task_cancel",
+     "description": "Stop a delegated task. Safe to repeat: a task that already ended keeps its final state.",
+     "inputSchema": {"type": "object", "properties": {
+        "task_id": {"type": "string", "description": "The task"}},
+      "required": ["task_id"]}}
+  ],
+  "requests_note": "One tools/call request example per tool (contract v1.1 C1). progressToken is optional; nevoflux-muse 0.4.0 sends none.",
+  "requests": [
+    {"jsonrpc": "2.0", "id": 11, "method": "tools/call", "params": {"name": "nevoflux_task_start",
+      "arguments": {"prompt": "Generate a calculator Canvas"}}},
+    {"jsonrpc": "2.0", "id": 12, "method": "tools/call", "params": {"name": "nevoflux_task_start",
+      "arguments": {"prompt": "Now make the buttons blue", "session": "9c4e1a2b-5f6d-4c3e-b8a7-1d2e3f4a5b6c"}}},
+    {"jsonrpc": "2.0", "id": 13, "method": "tools/call", "params": {"name": "nevoflux_task_wait",
+      "arguments": {"task_id": "3f2b8c1e-7d4a-4e9b-8a61-2c5d9e0f1a37", "timeout_secs": 30}}},
+    {"jsonrpc": "2.0", "id": 14, "method": "tools/call", "params": {"name": "nevoflux_task_approve",
+      "arguments": {"task_id": "3f2b8c1e-7d4a-4e9b-8a61-2c5d9e0f1a37", "approval_id": "5d0c8e2a-3b1f-4a7e-9c6d-8e2f1a0b3c4d", "choice": "allow"}}},
+    {"jsonrpc": "2.0", "id": 15, "method": "tools/call", "params": {"name": "nevoflux_task_approve",
+      "arguments": {"task_id": "6b7c8d9e-0f1a-4b2c-8d3e-4f5a6b7c8d9e", "approval_id": "8f7e6d5c-4b3a-4c2d-9e1f-0a9b8c7d6e5f", "choice": "allow", "answer": "Blue"}}},
+    {"jsonrpc": "2.0", "id": 16, "method": "tools/call", "params": {"name": "nevoflux_task_cancel",
+      "arguments": {"task_id": "3f2b8c1e-7d4a-4e9b-8a61-2c5d9e0f1a37"}}}
+  ]
+}

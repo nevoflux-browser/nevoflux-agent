@@ -2883,10 +2883,25 @@ mod tests {
                     .to_result("browser_click"),
             ),
         ];
+        // The M3 task codes come from the task engine, not this backend;
+        // tests/muse_fixtures.rs builds those entries.
+        let task_codes = [
+            "task_busy",
+            "rate_limited",
+            "session_not_found",
+            "task_not_found",
+            "approval_not_found",
+            "paused",
+            "approval_desktop_only",
+        ];
+        let browser_codes = errors
+            .keys()
+            .filter(|k| !task_codes.contains(&k.as_str()))
+            .count();
         assert_eq!(
             built.len(),
-            errors.len(),
-            "every fixture entry is built, none is missing"
+            browser_codes,
+            "every browser fixture entry is built, none is missing"
         );
         for (name, result) in built {
             let got = serde_json::to_value(&result).unwrap();

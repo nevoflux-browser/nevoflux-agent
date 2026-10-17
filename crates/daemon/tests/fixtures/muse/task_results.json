@@ -1,0 +1,66 @@
+{
+  "note": "M3 delegation results as the head sends them. start/approve/cancel are structuredContent. Each wait_* entry is one tools/call result: content[0] is a text block holding structuredContent as JSON; image, when not null, is content[1] exactly. The daemon test rebuilds every entry from the real record and result code with fixed ids and the clock T0 = 1792000000 (2026-10-14T17:46:40Z). progress_messages are the exact notifications/progress messages; progress_notification is one example frame (progress is a JSON number, counting 1, 2, ... within one wait). Clients must accept keys they do not know.",
+  "start": {"task_id": "3f2b8c1e-7d4a-4e9b-8a61-2c5d9e0f1a37", "session": "9c4e1a2b-5f6d-4c3e-b8a7-1d2e3f4a5b6c", "state": "running"},
+  "approve": {"ok": true, "state": "running"},
+  "cancel": {"task_id": "3f2b8c1e-7d4a-4e9b-8a61-2c5d9e0f1a37", "state": "cancelled"},
+  "wait_running": {"isError": false, "image": null, "structuredContent": {
+    "task_id": "3f2b8c1e-7d4a-4e9b-8a61-2c5d9e0f1a37", "session": "9c4e1a2b-5f6d-4c3e-b8a7-1d2e3f4a5b6c", "state": "running",
+    "steps": [
+      {"id": "toolu_01", "at": "2026-10-14T17:46:45Z", "tool": "skill_load", "status": "started"},
+      {"id": "toolu_01", "at": "2026-10-14T17:46:49Z", "tool": "skill_load", "status": "ok"},
+      {"id": "toolu_02", "at": "2026-10-14T17:46:52Z", "tool": "create_artifact", "status": "started"}]}},
+  "wait_awaiting_approval": {"isError": false, "image": null, "structuredContent": {
+    "task_id": "3f2b8c1e-7d4a-4e9b-8a61-2c5d9e0f1a37", "session": "9c4e1a2b-5f6d-4c3e-b8a7-1d2e3f4a5b6c", "state": "awaiting_approval",
+    "steps": [],
+    "approvals": [
+      {"approval_id": "5d0c8e2a-3b1f-4a7e-9c6d-8e2f1a0b3c4d", "kind": "tool", "summary": "Create a Canvas artifact: \"Calculator\"",
+       "tool": "create_artifact", "target": null, "choices": ["allow", "deny"], "at": "2026-10-14T17:47:00Z", "expires_in": 1740}]}},
+  "wait_question_and_plan": {"isError": false, "image": null, "structuredContent": {
+    "task_id": "6b7c8d9e-0f1a-4b2c-8d3e-4f5a6b7c8d9e", "session": "2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d", "state": "awaiting_approval",
+    "steps": [],
+    "approvals": [
+      {"approval_id": "8f7e6d5c-4b3a-4c2d-9e1f-0a9b8c7d6e5f", "kind": "question", "summary": "Which colour should the buttons be?",
+       "tool": null, "target": null, "question": "Which colour should the buttons be?", "options": ["Blue", "Green"],
+       "choices": ["allow", "deny"], "at": "2026-10-14T17:47:10Z", "expires_in": 1770},
+      {"approval_id": "0e9d8c7b-6a5f-4e3d-8c2b-1a0f9e8d7c6b", "kind": "plan", "summary": "Build the calculator",
+       "tool": null, "target": null, "plan_steps": ["Write the HTML", "Render the Canvas"],
+       "choices": ["allow", "deny"], "at": "2026-10-14T17:47:20Z", "expires_in": 1780}]}},
+  "wait_desktop_only": {"isError": false, "image": null, "structuredContent": {
+    "task_id": "3f2b8c1e-7d4a-4e9b-8a61-2c5d9e0f1a37", "session": "9c4e1a2b-5f6d-4c3e-b8a7-1d2e3f4a5b6c", "state": "awaiting_approval",
+    "steps": [],
+    "approvals": [
+      {"approval_id": "7a6b5c4d-3e2f-4a1b-8c9d-0e1f2a3b4c5d", "kind": "tool",
+       "summary": "A task delegated by a paired agent wants to run schedule_create. This action always needs approval.",
+       "tool": null, "target": null, "choices": [], "desktop_only": true, "at": "2026-10-14T17:47:30Z", "expires_in": 1790}]}},
+  "wait_guarded_approval": {"isError": false, "image": null, "structuredContent": {
+    "task_id": "3f2b8c1e-7d4a-4e9b-8a61-2c5d9e0f1a37", "session": "9c4e1a2b-5f6d-4c3e-b8a7-1d2e3f4a5b6c", "state": "awaiting_approval",
+    "steps": [],
+    "approvals": [
+      {"approval_id": "7a6b5c4d-3e2f-4a1b-8c9d-0e1f2a3b4c5d", "kind": "tool",
+       "summary": "A task delegated by a paired agent wants to run schedule_create. This action always needs approval.",
+       "tool": null, "target": null, "choices": ["allow", "deny"], "at": "2026-10-14T17:47:30Z", "expires_in": 1790}]}},
+  "wait_done_with_image": {"isError": false,
+    "image": {"type": "image", "data": "/9j/4AAQSkZJRgABAQ==", "mimeType": "image/jpeg"},
+    "structuredContent": {
+    "task_id": "3f2b8c1e-7d4a-4e9b-8a61-2c5d9e0f1a37", "session": "9c4e1a2b-5f6d-4c3e-b8a7-1d2e3f4a5b6c", "state": "done",
+    "steps": [{"id": "toolu_02", "at": "2026-10-14T17:48:10Z", "tool": "create_artifact", "status": "ok"}],
+    "reply": "Here is your calculator."}},
+  "wait_done_again": {"isError": false, "image": null, "structuredContent": {
+    "task_id": "3f2b8c1e-7d4a-4e9b-8a61-2c5d9e0f1a37", "session": "9c4e1a2b-5f6d-4c3e-b8a7-1d2e3f4a5b6c", "state": "done",
+    "steps": [], "reply": "Here is your calculator."}},
+  "wait_done_screenshot_error": {"isError": false, "image": null, "structuredContent": {
+    "task_id": "3f2b8c1e-7d4a-4e9b-8a61-2c5d9e0f1a37", "session": "9c4e1a2b-5f6d-4c3e-b8a7-1d2e3f4a5b6c", "state": "done",
+    "steps": [], "reply": "Done.", "screenshot_error": "no_tab"}},
+  "wait_failed": {"isError": false, "image": null, "structuredContent": {
+    "task_id": "3f2b8c1e-7d4a-4e9b-8a61-2c5d9e0f1a37", "session": "9c4e1a2b-5f6d-4c3e-b8a7-1d2e3f4a5b6c", "state": "failed",
+    "steps": [], "error": {"code": "llm_error", "message": "the model call failed: Agent error: rate limited"}}},
+  "wait_cancelled": {"isError": false, "image": null, "structuredContent": {
+    "task_id": "3f2b8c1e-7d4a-4e9b-8a61-2c5d9e0f1a37", "session": "9c4e1a2b-5f6d-4c3e-b8a7-1d2e3f4a5b6c", "state": "cancelled",
+    "steps": []}},
+  "progress_messages": {
+    "steps": ["Running skill_load", "skill_load finished", "Running create_artifact", "create_artifact finished"],
+    "approval": "Waiting for approval: Create a Canvas artifact: \"Calculator\"",
+    "failed_step_example": "browser_click failed"},
+  "progress_notification": {"jsonrpc": "2.0", "method": "notifications/progress",
+    "params": {"progressToken": "wait-1", "progress": 1.0, "message": "Running skill_load"}}
+}
