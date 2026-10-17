@@ -287,6 +287,7 @@ Schemas: `fixtures/muse/task_tools.json`. Results: `fixtures/muse/task_results.j
   session is `session_not_found`.
 - Malformed arguments answer `tool_failed` with `detail` one of:
   `prompt is required`, `prompt must be 1 to 8000 characters`,
+  `session must be a non-empty string`,
   `timeout_secs must be an integer from 1 to 60`, `choice must be allow or deny`
   (also for `allow_always`, which only the person can choose),
   `answer is required for a question`, `answer must be a string`,

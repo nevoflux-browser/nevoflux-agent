@@ -133,10 +133,15 @@ async fn start(engine: &TaskEngine, pairing: &str, args: &Value) -> Result<Value
     if length == 0 || length > PROMPT_MAX_CHARS {
         return Err(failed("prompt must be 1 to 8000 characters"));
     }
-    let session = args
-        .get("session")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty());
+    // Present means continue that session: never quietly a new one.
+    let session = match args.get("session") {
+        None => None,
+        Some(v) => Some(
+            v.as_str()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| failed("session must be a non-empty string"))?,
+        ),
+    };
     engine.start(pairing, prompt, session).await
 }
 
@@ -292,6 +297,16 @@ mod tests {
                 TASK_START,
                 json!({"prompt": long}),
                 "prompt must be 1 to 8000 characters",
+            ),
+            (
+                TASK_START,
+                json!({"prompt": "go", "session": ""}),
+                "session must be a non-empty string",
+            ),
+            (
+                TASK_START,
+                json!({"prompt": "go", "session": 42}),
+                "session must be a non-empty string",
             ),
             (TASK_WAIT, json!({}), "task_id is required"),
             (
