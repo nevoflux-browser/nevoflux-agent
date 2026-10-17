@@ -263,6 +263,8 @@ pub enum AgentError {
     ToolFailed { detail: String },
     /// A task of this pairing has not ended (decision C6, contract §1.1).
     TaskBusy { task_id: String },
+    /// The active ACP provider is in use by another turn (R38).
+    ProviderBusy { provider: String },
     /// Twenty starts in the trailing hour.
     RateLimited { retry_after: u64 },
     /// `session` is not a task session this pairing started.
@@ -293,6 +295,7 @@ impl AgentError {
             AgentError::TabClosed { .. } => "tab_closed",
             AgentError::ToolFailed { .. } => "tool_failed",
             AgentError::TaskBusy { .. } => "task_busy",
+            AgentError::ProviderBusy { .. } => "task_busy",
             AgentError::RateLimited { .. } => "rate_limited",
             AgentError::SessionNotFound { .. } => "session_not_found",
             AgentError::TaskNotFound { .. } => "task_not_found",
@@ -345,6 +348,10 @@ impl AgentError {
             AgentError::TaskBusy { task_id } => (
                 "another task is already running for this agent".to_string(),
                 vec![("task_id", json!(task_id))],
+            ),
+            AgentError::ProviderBusy { provider } => (
+                format!("NevoFlux's model provider {provider} is busy with another conversation; try again when it finishes"),
+                vec![("provider", json!(provider))],
             ),
             AgentError::RateLimited { retry_after } => (
                 format!(
@@ -617,6 +624,7 @@ mod tests {
             (AgentError::TabClosed { tab_id: 7 }, "tab_closed"),
             (AgentError::ToolFailed { detail: "-1: Element not found".into() }, "tool_failed"),
             (AgentError::TaskBusy { task_id: "t1".into() }, "task_busy"),
+            (AgentError::ProviderBusy { provider: "ClaudeCode".into() }, "task_busy"),
             (AgentError::RateLimited { retry_after: 1234 }, "rate_limited"),
             (AgentError::SessionNotFound { session: "s1".into() }, "session_not_found"),
             (AgentError::TaskNotFound { task_id: "t1".into() }, "task_not_found"),
@@ -630,6 +638,9 @@ mod tests {
     fn the_task_errors_carry_the_contracts_messages_and_extras() {
         let busy = AgentError::TaskBusy { task_id: "t1".into() }.body("nevoflux_task_start");
         assert_eq!(busy["error"], json!({"code": "task_busy", "message": "another task is already running for this agent", "task_id": "t1"}));
+        let provider = AgentError::ProviderBusy { provider: "ClaudeCode".into() }.body("nevoflux_task_start");
+        assert_eq!(provider["error"], json!({"code": "task_busy", "provider": "ClaudeCode",
+            "message": "NevoFlux's model provider ClaudeCode is busy with another conversation; try again when it finishes"}));
         let rate = AgentError::RateLimited { retry_after: 1234 }.body("nevoflux_task_start");
         assert_eq!(rate["error"], json!({"code": "rate_limited", "message": "this agent has started 20 tasks in the last hour", "retry_after": 1234}));
         let session = AgentError::SessionNotFound { session: "s1".into() }.body("nevoflux_task_start");

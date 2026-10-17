@@ -4132,6 +4132,21 @@ async fn stream_acp_completion(
     // Get or create ACP provider (lazy init, auto-reconnect on crash).
     let provider_key = format!("{:?}", provider);
 
+    // M3 R38: a delegated turn and a local turn never share this provider's
+    // bridge (it is re-pointed per turn). Held until this call returns.
+    let (lease_session, lease_delegated) = host_services
+        .as_ref()
+        .map(|s| {
+            let delegated =
+                crate::remote::task::origin::delegated_pairing(&s.database, &s.session_id)
+                    .is_some();
+            (s.session_id.clone(), delegated)
+        })
+        .unwrap_or_default();
+    let _acp_lease =
+        crate::wasm::acp_lease::acquire(&provider_key, &lease_session, lease_delegated)
+            .map_err(DaemonError::InternalError)?;
+
     {
         let mut providers = acp_providers().lock().await;
 

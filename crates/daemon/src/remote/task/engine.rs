@@ -49,6 +49,10 @@ pub trait TaskHost: Send + Sync {
     fn pairing(&self, channel: &str) -> Option<Pairing>;
     /// Where turns wait for answers (`crate::pending::shared()`).
     fn pending(&self) -> Arc<Pending>;
+    /// The active ACP provider's key when some turn holds it now (R38), else `None`.
+    fn acp_busy(&self) -> Option<String> {
+        None
+    }
     /// Send a chat frame to the connection `proxy_id`. It must leave through
     /// the chat writer, past the chat tap (`super::observe`), behind every
     /// frame already queued: the engine marks the end of a turn this way and
@@ -276,6 +280,10 @@ impl TaskEngine {
             let mut inner = self.lock();
             Self::purge(&mut inner, now);
             Self::check_admission(&mut inner, pairing, now)?;
+        }
+        // R38: the delegated turn could not use a provider another turn holds.
+        if let Some(provider) = self.host.acp_busy() {
+            return Err(AgentError::ProviderBusy { provider });
         }
         let db = self.host.database();
         if let Some(s) = session {
@@ -1060,6 +1068,7 @@ pub(crate) mod testing {
         pub(crate) tap: Mutex<Option<std::sync::Weak<TaskEngine>>>,
         /// The message loop is gone: `inject` reports it was not delivered.
         pub(crate) inject_fails: Mutex<bool>,
+        pub(crate) acp_busy: Mutex<Option<String>>,
     }
 
     impl FakeHost {
@@ -1101,6 +1110,9 @@ pub(crate) mod testing {
         }
         fn pending(&self) -> Arc<Pending> {
             self.pending.clone()
+        }
+        fn acp_busy(&self) -> Option<String> {
+            self.acp_busy.lock().unwrap().clone()
         }
         async fn send(&self, proxy_id: &str, payload: Value) {
             self.log
@@ -1156,6 +1168,7 @@ pub(crate) mod testing {
             pending: Arc::new(Pending::new()),
             tap: Mutex::new(None),
             inject_fails: Mutex::new(false),
+            acp_busy: Mutex::new(None),
         });
         let (status, seen, _status_clock) = status_testing::watched(T0);
         status.set_pairings(&[status_testing::agent(CHANNEL, 1)]);
@@ -1289,6 +1302,15 @@ mod tests {
         for _ in 0..20 {
             tokio::task::yield_now().await;
         }
+    }
+
+    #[tokio::test]
+    async fn a_task_is_refused_while_its_acp_provider_is_in_use() {
+        let r = rig();
+        *r.host.acp_busy.lock().unwrap() = Some("ClaudeCode".into());
+        let err = r.engine.start(CHANNEL, "Generate a calculator Canvas", None).await.unwrap_err();
+        assert_eq!(err, AgentError::ProviderBusy { provider: "ClaudeCode".into() });
+        assert!(r.host.log.lock().unwrap().is_empty(), "no session, no turn");
     }
 
     #[tokio::test]

@@ -3,6 +3,7 @@
 //! This module provides the infrastructure for loading and executing
 //! WebAssembly modules within the NevoFlux daemon.
 
+pub mod acp_lease;
 pub mod antigravity_session;
 pub mod instance;
 pub mod json_normalizing_client;

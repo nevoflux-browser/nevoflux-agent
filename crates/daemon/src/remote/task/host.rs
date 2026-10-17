@@ -23,7 +23,6 @@ pub struct DaemonTaskHost {
     browser_tx: Option<BrowserSender>,
     /// The daemon's live config (`server.rs` `agent_config`, the same
     /// `SharedAgentConfig` a local turn reads), for R38's provider check.
-    #[allow(dead_code)] // read by R38's provider check (Task 14b)
     shared_config: crate::server::SharedAgentConfig,
 }
 
@@ -94,6 +93,19 @@ impl TaskHost for DaemonTaskHost {
 
     fn pending(&self) -> Arc<Pending> {
         crate::pending::shared()
+    }
+
+    fn acp_busy(&self) -> Option<String> {
+        // The provider the injected turn will use: the active one, read now,
+        // parsed exactly as the turn parses it (`ProviderType: FromStr`).
+        // Read now, never cached: config.llm.set swaps the inner Arc.
+        let config = self.shared_config.read().ok()?.clone();
+        let id = config.llm.active_provider()?;
+        if !crate::config::is_acp_provider(id) {
+            return None;
+        }
+        let key = format!("{:?}", id.parse::<nevoflux_llm::ProviderType>().ok()?);
+        (crate::wasm::acp_lease::holder_count(&key) > 0).then_some(key)
     }
 
     async fn send(&self, proxy_id: &str, payload: Value) {
