@@ -51,18 +51,20 @@ pub fn delegated_refused(provider: &str) -> String {
 }
 
 /// Take `provider` for `session_id`. Refused (with the R38 copy) when another
-/// session holds it and either side is a delegated turn.
+/// session holds it and either side is a delegated turn. The copy is the
+/// newcomer's: a delegated newcomer is told the provider is busy, a local one
+/// that a delegated task holds it (contract §14).
 pub fn acquire(provider: &str, session_id: &str, delegated: bool) -> Result<Lease, String> {
     let mut map = leases().lock().unwrap_or_else(|e| e.into_inner());
     let holders = map.entry(provider.to_string()).or_default();
-    if let Some(other) = holders
+    if holders
         .iter()
-        .find(|h| h.session_id != session_id && (h.delegated || delegated))
+        .any(|h| h.session_id != session_id && (h.delegated || delegated))
     {
-        return Err(if other.delegated {
-            local_refused(provider)
-        } else {
+        return Err(if delegated {
             delegated_refused(provider)
+        } else {
+            local_refused(provider)
         });
     }
     holders.push(Holder {
@@ -122,6 +124,15 @@ mod tests {
         assert_eq!(
             acquire("T3", "s-del", true).unwrap_err(),
             "T3 is busy with another conversation, so the delegated task cannot use it. Try again when it finishes."
+        );
+    }
+
+    #[test]
+    fn a_delegated_newcomer_gets_the_delegated_copy_even_against_a_delegated_holder() {
+        let _d = acquire("T8", "s-del-a", true).unwrap();
+        assert_eq!(
+            acquire("T8", "s-del-b", true).unwrap_err(),
+            "T8 is busy with another conversation, so the delegated task cannot use it. Try again when it finishes."
         );
     }
 
