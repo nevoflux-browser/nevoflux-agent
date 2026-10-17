@@ -47,16 +47,50 @@ pub fn origin_value(metadata: Option<&HashMap<String, Value>>) -> Value {
     }
 }
 
-/// The pairing that started `session_id`, if a paired agent did.
-pub fn delegated_pairing(db: &Database, session_id: &str) -> Option<String> {
+/// Who started a session, as far as the store can tell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Delegation {
+    /// Not a paired agent's session (or no such session yet).
+    Local,
+    /// Started by this pairing.
+    Delegated(String),
+    /// The session could not be read.
+    Unknown,
+}
+
+/// Who started `session_id`.
+pub fn delegation(db: &Database, session_id: &str) -> Delegation {
     if session_id.is_empty() {
-        return None;
+        return Delegation::Local;
     }
-    let session = SessionRepository::new(db).get(session_id).ok().flatten()?;
-    origin_value(session.metadata.as_ref())
+    let session = match SessionRepository::new(db).get(session_id) {
+        Ok(Some(session)) => session,
+        Ok(None) => return Delegation::Local,
+        Err(e) => {
+            tracing::warn!(target: "remote", "session origin unreadable, treating it as delegated: {e}");
+            return Delegation::Unknown;
+        }
+    };
+    match origin_value(session.metadata.as_ref())
         .get("pairing")
         .and_then(Value::as_str)
-        .map(str::to_string)
+    {
+        Some(pairing) => Delegation::Delegated(pairing.to_string()),
+        None => Delegation::Local,
+    }
+}
+
+/// The pairing that started `session_id`, if a paired agent did.
+///
+/// Fails closed: a session the store cannot read is treated as delegated, to
+/// the empty pairing id — which no pairing has, so it runs read-only
+/// ([`pairing_tier`]) and is never any pairing's own session.
+pub fn delegated_pairing(db: &Database, session_id: &str) -> Option<String> {
+    match delegation(db, session_id) {
+        Delegation::Delegated(pairing) => Some(pairing),
+        Delegation::Unknown => Some(String::new()),
+        Delegation::Local => None,
+    }
 }
 
 /// Create the session a new delegated task runs in: Agent mode, marked as
@@ -133,6 +167,27 @@ mod tests {
         assert_eq!(delegated_pairing(&db, "s2"), None);
         assert_eq!(delegated_pairing(&db, "no-such-session"), None);
         assert_eq!(delegated_pairing(&db, ""), None);
+    }
+
+    #[test]
+    fn an_unreadable_session_fails_closed_as_delegated_to_no_pairing() {
+        let db = db();
+        create_delegated(&db, "s1", "chan-1").unwrap();
+        db.with_connection(|c| {
+            c.execute_batch("PRAGMA foreign_keys=OFF; DROP TABLE sessions;")
+                .map_err(Into::into)
+        })
+        .unwrap();
+        assert_eq!(delegation(&db, "s1"), Delegation::Unknown);
+        let pairing = delegated_pairing(&db, "s1").expect("treated as delegated");
+        let (store, _dir) = store_with(&[agent("chan-1", 1)]);
+        store.set_tier("chan-1", ExecutionTier::FullAuto).unwrap();
+        assert_eq!(
+            pairing_tier(Some(store), &pairing),
+            ExecutionTier::ReadOnly,
+            "no pairing's tier: read-only"
+        );
+        assert_eq!(delegation(&db, ""), Delegation::Local);
     }
 
     #[test]
