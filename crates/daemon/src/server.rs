@@ -5581,6 +5581,28 @@ fn current_container(tab_id: Option<i64>, tab_ids: &[nevoflux_builtin_wasm::TabI
         .unwrap_or_else(|| nevoflux_protocol::chat::DEFAULT_COOKIE_STORE_ID.to_string())
 }
 
+/// The metadata map a change is merged into: the session's own, or an empty
+/// one for a session not stored yet. `None` when the session could not be
+/// read — `update_session_metadata` replaces the whole map, so writing then
+/// would drop `origin` (and every other key); the caller skips the write.
+fn metadata_for_merge(
+    fetched: &crate::error::Result<Option<nevoflux_storage::models::Session>>,
+    session_id: &str,
+) -> Option<HashMap<String, serde_json::Value>> {
+    match fetched {
+        Ok(session) => Some(
+            session
+                .as_ref()
+                .and_then(|s| s.metadata.clone())
+                .unwrap_or_default(),
+        ),
+        Err(e) => {
+            warn!("Session {session_id} unreadable; leaving its metadata as it is: {e}");
+            None
+        }
+    }
+}
+
 /// Resolve which soul answers this turn and persist any change to the pin.
 ///
 /// Returns `None` when nothing is bound, which is the pre-souls behaviour: the
@@ -5607,9 +5629,11 @@ async fn resolve_active_soul(
         return None;
     };
 
-    let session = session_manager.get_session(session_id).await.ok().flatten();
-    let stored = session
+    let fetched = session_manager.get_session(session_id).await;
+    let stored = fetched
         .as_ref()
+        .ok()
+        .and_then(Option::as_ref)
         .and_then(|s| soul_resolver::override_from_metadata(s.metadata.as_ref()));
 
     let resolution = {
@@ -5624,8 +5648,11 @@ async fn resolve_active_soul(
     };
 
     // Persist the pin change, if any. A failure here costs stickiness, not the turn.
-    if resolution.action != OverrideAction::Keep {
-        let mut metadata = session.and_then(|s| s.metadata).unwrap_or_default();
+    // Unreadable: skip rather than replace the map without `origin`.
+    let base = (resolution.action != OverrideAction::Keep)
+        .then(|| metadata_for_merge(&fetched, session_id))
+        .flatten();
+    if let Some(mut metadata) = base {
         if soul_resolver::apply_override_action(&mut metadata, &resolution.action) {
             if let Err(e) = session_manager
                 .update_session_metadata(session_id, metadata)
@@ -7585,19 +7612,15 @@ async fn handle_chat_message_streaming(
             // the existing metadata and merges; building a fresh map would
             // silently drop every other key on the session.
             if local_mode_active {
-                let stored = session_manager
-                    .get_session(&session_id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .and_then(|s| s.metadata);
+                let fetched = session_manager.get_session(&session_id).await;
                 let current = serde_json::json!(output.loaded_tools);
+                // `None`: unreadable, so the write is skipped (it would drop `origin`).
+                let stored = metadata_for_merge(&fetched, &session_id);
                 let unchanged = stored
                     .as_ref()
                     .and_then(|m| m.get(LOCAL_LOADED_TOOLS_KEY))
                     .is_some_and(|prev| prev == &current);
-                if !unchanged {
-                    let mut merged = stored.unwrap_or_default();
+                if let Some(mut merged) = stored.filter(|_| !unchanged) {
                     merged.insert(LOCAL_LOADED_TOOLS_KEY.to_string(), current);
                     if let Err(e) = session_manager
                         .update_session_metadata(&session_id, merged)
@@ -14894,6 +14917,20 @@ mod usage_frame_tests {
 mod tests {
     use super::*;
     use nevoflux_protocol::PlanStep;
+
+    #[test]
+    fn a_session_that_could_not_be_read_gets_no_metadata_write() {
+        let failed: crate::error::Result<Option<nevoflux_storage::models::Session>> =
+            Err(crate::error::DaemonError::InternalError("db locked".into()));
+        assert!(super::metadata_for_merge(&failed, "s1").is_none(), "skip, keep origin");
+        let none: crate::error::Result<Option<nevoflux_storage::models::Session>> = Ok(None);
+        assert_eq!(super::metadata_for_merge(&none, "s1"), Some(HashMap::new()));
+        let db = nevoflux_storage::Database::open_in_memory().unwrap();
+        crate::remote::task::origin::create_delegated(&db, "s-del", "chan-1").unwrap();
+        let session = nevoflux_storage::SessionRepository::new(&db).get("s-del").unwrap();
+        let base = super::metadata_for_merge(&Ok(session), "s-del").unwrap();
+        assert!(base.contains_key("origin"), "merged into, not replaced");
+    }
 
     #[test]
     fn a_command_kind_policy_check_is_judged_by_the_command_gate() {
