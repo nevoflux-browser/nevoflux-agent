@@ -1546,6 +1546,16 @@ Do you want to allow it?",
         }
     }
 
+    /// A delegated turn cannot write NevoFlux's own settings or pairings
+    /// (final review I3), whatever its tier; checked before anyone is asked.
+    fn guard_settings_write(&self, path: &std::path::Path) -> HostResult<()> {
+        let Some(s) = self.services.as_ref() else {
+            return Ok(());
+        };
+        crate::remote::task::settings_guard::check_write(&s.database, s.gate_session_id(), path)
+            .map_err(|message| HostError { code: 403, message })
+    }
+
     /// The pairing's ceiling for a call made in `ctx_session`, against `store`.
     pub(crate) fn delegated_ceiling(
         &self,
@@ -4575,16 +4585,16 @@ impl HostFunctions for DaemonHostFunctions {
     }
 
     fn tool_write(&self, path: &str, content: &str) -> HostResult<()> {
+        // Resolve path using skill base if available (no absolute fallback for writes)
+        let resolved_path = self
+            .resolve_skill_path(path, false)
+            .unwrap_or_else(|| std::path::PathBuf::from(path));
+        self.guard_settings_write(&resolved_path)?;
         self.check_tool_permission("write_file", path)?;
         use std::fs;
 
         let start = std::time::Instant::now();
         self.validate_sandbox_path(path)?;
-
-        // Resolve path using skill base if available (no absolute fallback for writes)
-        let resolved_path = self
-            .resolve_skill_path(path, false)
-            .unwrap_or_else(|| std::path::PathBuf::from(path));
 
         let result = fs::write(resolved_path.as_path(), content).map_err(|e| HostError {
             code: 1,
@@ -4624,6 +4634,7 @@ impl HostFunctions for DaemonHostFunctions {
         new_string: &str,
         replace_all: bool,
     ) -> HostResult<()> {
+        self.guard_settings_write(std::path::Path::new(path))?;
         self.check_tool_permission("edit_file", path)?;
         use std::fs;
 
@@ -13660,5 +13671,41 @@ message = "not here"
         .with_services(crate::wasm::services::HostServices::new(db).with_session_id("s-own".to_string()));
         let gate = local.tool_pre(&a_tool_call("browser_network_requests"), &a_tool_context("s-own"));
         assert!(matches!(gate, nevoflux_builtin_wasm::ToolGate::Allow), "{gate:?}");
+    }
+
+    #[test]
+    fn a_delegated_write_to_the_pairings_file_is_refused_on_the_native_path() {
+        use super::HostFunctions;
+        let (host, _rt, brx) = delegated_host("s-del");
+        let asked = watch_for_asks(brx);
+        let pairings = crate::remote::pairing::PairingStore::default_agent_path();
+        let path = pairings.to_string_lossy().to_string();
+        let err = host.tool_write(&path, "{}").unwrap_err();
+        assert_eq!(err.message, crate::remote::task::settings_guard::REFUSAL);
+        let err = host.tool_edit(&path, "a", "b", false).unwrap_err();
+        assert_eq!(err.message, crate::remote::task::settings_guard::REFUSAL);
+        assert!(!asked.load(std::sync::atomic::Ordering::SeqCst), "nobody was asked");
+    }
+
+    #[test]
+    fn a_local_write_is_unaffected_on_the_native_path() {
+        use super::HostFunctions;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        nevoflux_storage::ConfigRepository::new(&db)
+            .set(
+                "config:settings",
+                serde_json::json!({"general": {"agentExecution": "full-auto"}}),
+            )
+            .unwrap();
+        let host = super::DaemonHostFunctions::new(
+            std::sync::Arc::new(crate::config::AgentConfig::default()),
+            rt.handle().clone(),
+        )
+        .with_services(crate::wasm::services::HostServices::new(db).with_session_id("s-own".to_string()));
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("notes.txt");
+        host.tool_write(&file.to_string_lossy(), "hello").unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello");
     }
 }

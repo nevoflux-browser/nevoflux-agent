@@ -4515,6 +4515,37 @@ message = "ask.example wants a person to confirm"
         assert!(err.starts_with("[DELEGATED_ABOVE_TIER]"), "{err}");
         assert!(err.contains("needs the browser-auto tier"), "{err}");
     }
+
+    /// The MCP entry point has no path-writing arm: `write_file` is not one of
+    /// its tools (ACP providers write with their own), so a delegated turn
+    /// cannot reach NevoFlux's files through it either.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_mcp_entry_point_writes_no_file() {
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        nevoflux_storage::ConfigRepository::new(&db)
+            .set(
+                "config:settings",
+                serde_json::json!({"general": {"agentExecution": "full-auto"}}),
+            )
+            .unwrap();
+        let services = HostServices::new(db).with_session_id("s-own".to_string());
+        let bridge = make_test_bridge();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("agent-pairings.json");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            execute_mcp_tool(
+                "write_file",
+                &serde_json::json!({"path": file.to_string_lossy(), "content": "{}"}),
+                &services,
+                &bridge,
+            ),
+        )
+        .await
+        .expect("write_file: still waiting");
+        assert!(result.is_err(), "{result:?}");
+        assert!(!file.exists());
+    }
 }
 
 #[cfg(test)]

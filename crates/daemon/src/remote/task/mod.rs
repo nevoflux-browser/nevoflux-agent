@@ -15,6 +15,7 @@ pub mod limits;
 pub mod origin;
 pub mod record;
 pub mod screenshot;
+pub mod settings_guard;
 pub mod tools;
 
 /// `params.purpose` on an `ask_user` request that asks permission for an
