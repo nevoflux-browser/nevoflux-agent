@@ -446,7 +446,7 @@ pub(crate) fn ask_user_allow_blocking_as(
     question: &str,
     must_approve: bool,
 ) -> bool {
-    let Some(browser_ctx) = services.browser_context() else {
+    let Some(browser_ctx) = services.permission_context() else {
         return false;
     };
     // No "always allow": a site rule asks about *this* action here, and a
@@ -495,7 +495,7 @@ pub(crate) fn gate_pipeline(
 /// §4.2) — on this entry point as on the native loop's — bounded by the
 /// pairing's tier read now.
 fn delegated_ceiling(services: &HostServices) -> Option<crate::remote::task::ceiling::Ceiling> {
-    crate::remote::task::ceiling::ceiling_for(services.database.clone(), &services.session_id)
+    crate::remote::task::ceiling::ceiling_for(services.database.clone(), services.gate_session_id())
 }
 
 /// Run the gate for `call` with the ceiling [`execute_mcp_tool`] read: the
@@ -2782,6 +2782,7 @@ async fn execute_subagent_tool(
                     // spawned from an ACP provider's tool call therefore do
                     // not show up in that reply's token stats.
                     None,
+                    services.nested_gate_session(),
                 )
                 .map_err(|e| format!("subagent spawn failed: {e}"))?;
 
@@ -4444,6 +4445,58 @@ message = "ask.example wants a person to confirm"
             params["question"],
             crate::tool_pipeline::delegated::prompt_for("goal_set")
         );
+    }
+
+    /// A subagent's services as the executor builds them for a turn of
+    /// delegated session `s-del`: no session id of their own, gated by it.
+    fn delegated_subagent_services(
+        btx: Option<crate::wasm::services::BrowserSender>,
+    ) -> HostServices {
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        crate::remote::task::origin::create_delegated(&db, "s-del", "chan-1").unwrap();
+        let parent = HostServices::new(db.clone()).with_session_id("s-del".to_string());
+        let mut base = HostServices::new(db);
+        if let Some(btx) = btx {
+            base = base.with_browser_sender(btx);
+        }
+        crate::wasm::subagent::gated(base, parent.nested_gate_session())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_mcp_gate_holds_a_delegated_turns_subagent_to_the_pairings_tier() {
+        let (btx, mut brx) = tokio::sync::mpsc::channel(4);
+        let services = delegated_subagent_services(Some(btx));
+        let bridge = make_test_bridge();
+        for name in ["write_file", "goal_set"] {
+            let err = refused_within_a_deadline(name, serde_json::json!({}), &services, &bridge).await;
+            assert!(err.starts_with("[DELEGATED_ABOVE_TIER]"), "{name}: {err}");
+        }
+        assert!(brx.try_recv().is_err(), "nobody was asked");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delegated_subagents_mcp_question_is_asked_in_its_task() {
+        let (btx, mut brx) = tokio::sync::mpsc::channel(4);
+        let services = delegated_subagent_services(Some(btx));
+        let seen = tokio::spawn(async move {
+            let (req, reply) = tokio::time::timeout(std::time::Duration::from_secs(10), brx.recv())
+                .await
+                .expect("nobody was asked")
+                .unwrap();
+            let seen = (req.session_id.clone(), req.params.clone());
+            let _ = reply.send(crate::wasm::services::BrowserResponse {
+                request_id: req.request_id,
+                success: true,
+                result: Some(serde_json::json!({"answer": "Deny"})),
+                error: None,
+            });
+            seen
+        });
+        let prompt = crate::tool_pipeline::delegated::prompt_for("goal_set");
+        assert!(!ask_user_allow_blocking_as(&services, &prompt, true));
+        let (session, params) = seen.await.unwrap();
+        assert_eq!(session, "s-del", "asked in the task's session, where R39 applies");
+        assert_eq!(params["must_approve"], true);
     }
 }
 

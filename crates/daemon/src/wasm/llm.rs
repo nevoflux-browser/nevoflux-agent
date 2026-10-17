@@ -4166,8 +4166,10 @@ async fn stream_acp_completion(
     let (lease_session, lease_delegated) = host_services
         .as_ref()
         .map(|s| {
+            // Delegated if its gate session is: a delegated turn's subagent
+            // is never a local newcomer (C1).
             let delegated =
-                crate::remote::task::origin::delegated_pairing(&s.database, &s.session_id)
+                crate::remote::task::origin::delegated_pairing(&s.database, s.gate_session_id())
                     .is_some();
             (s.session_id.clone(), delegated)
         })
@@ -4324,7 +4326,7 @@ async fn stream_acp_completion(
             // the bridge's shared always-allow cache can lift.
             let ceiling = crate::remote::task::ceiling::ceiling_for(
                 services.database.clone(),
-                &services.session_id,
+                services.gate_session_id(),
             );
             // Jev can require a confirmation the tier or cache would skip
             // (spec §5.7, J14). Nobody to ask: the iteration handler or the
@@ -4341,7 +4343,7 @@ async fn stream_acp_completion(
                 Some(within) => Some(crate::remote::task::ceiling::tighten(jev, within.clone())),
                 None => jev,
             });
-            if let Some(browser_ctx) = services.browser_context() {
+            if let Some(browser_ctx) = services.permission_context() {
                 tokio::spawn(crate::wasm::mcp_tool_executor::run_permission_handler(
                     perm_rx,
                     browser_ctx,

@@ -321,6 +321,8 @@ impl SubagentExecutor {
     /// * `mode` - Execution mode (chat, browser, agent)
     /// * `custom_prompt` - Optional custom system prompt
     /// * `tab_id` - Optional tab ID for browser content access (read-only)
+    /// * `gate` - The delegated session the spawning turn belongs to
+    ///   ([`HostServices::nested_gate_session`]); the subagent is gated by it
     ///
     /// # Returns
     ///
@@ -335,6 +337,7 @@ impl SubagentExecutor {
         provider_override: Option<String>,
         model_override: Option<String>,
         turn_stats: Option<std::sync::Arc<crate::turn_stats::TurnStats>>,
+        gate: Option<String>,
     ) -> Result<SubagentHandle, String> {
         // Prune completed handles when the map grows too large to prevent
         // unbounded memory growth. We keep a generous threshold so callers
@@ -403,6 +406,7 @@ impl SubagentExecutor {
                 executor_handle.clone(),
                 sidebar_tx,
                 turn_stats,
+                gate,
             )
             .await;
 
@@ -448,6 +452,7 @@ impl SubagentExecutor {
             tokio::sync::mpsc::UnboundedSender<crate::agent_host::SidebarStreamChunk>,
         >,
         turn_stats: Option<std::sync::Arc<crate::turn_stats::TurnStats>>,
+        gate: Option<String>,
     ) -> Result<AgentOutput, String> {
         let execution = Self::run_subagent_inner(
             id,
@@ -463,6 +468,7 @@ impl SubagentExecutor {
             handle.clone(),
             sidebar_stream_tx,
             turn_stats,
+            gate,
         );
 
         match timeout(timeout_duration, execution).await {
@@ -493,6 +499,7 @@ impl SubagentExecutor {
             tokio::sync::mpsc::UnboundedSender<crate::agent_host::SidebarStreamChunk>,
         >,
         turn_stats: Option<std::sync::Arc<crate::turn_stats::TurnStats>>,
+        gate: Option<String>,
     ) -> Result<AgentOutput, String> {
         use crate::agent_host::DaemonHostFunctions;
         use nevoflux_builtin_wasm::{Agent, AgentConfig as WasmAgentConfig};
@@ -505,8 +512,9 @@ impl SubagentExecutor {
         let mut host = DaemonHostFunctions::new(Arc::new(config), runtime);
         host = host.with_is_subagent(true);
         if let Some(services) = base_services {
-            // Create a new services instance with its own interrupt flag
-            let subagent_services = services.clone();
+            // Create a new services instance with its own interrupt flag,
+            // gated by the delegated turn that spawned it, if any (C1).
+            let subagent_services = gated(services.clone(), gate);
             // The interrupt flag is checked via the handle's kill_flag
             host = host.with_services(subagent_services);
         }
@@ -661,6 +669,16 @@ impl std::fmt::Debug for SubagentExecutor {
             .field("active_count", &self.handles.read().unwrap().len())
             .finish()
     }
+}
+
+/// A subagent's services, gated by `gate` — the delegated session the
+/// subagent was spawned from ([`HostServices::nested_gate_session`]), if any.
+/// A paired agent's ceiling, must-approve stage and question routing reach
+/// every nested run of its turn (contract v1.3 R25/R30/R39); nothing else
+/// about the subagent's own session changes.
+pub(crate) fn gated(mut services: HostServices, gate: Option<String>) -> HostServices {
+    services.delegated_parent = gate;
+    services
 }
 
 #[cfg(test)]

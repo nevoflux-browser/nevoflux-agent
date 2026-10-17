@@ -208,6 +208,12 @@ pub struct HostServices {
     pub proxy_id: String,
     /// Current session ID for artifact creation and other session-scoped operations.
     pub session_id: String,
+    /// The delegated session a nested run (a subagent) was started from, if
+    /// any (M3 §4.1/§4.2). Gating only: the tier ceiling, the must-approve
+    /// stage and where permission questions are routed follow that session's
+    /// delegation, while `session_id` keeps the nested run's own identity.
+    /// See [`Self::gate_session_id`].
+    pub delegated_parent: Option<String>,
     /// Who the tool calls dispatched through these services come from, in the
     /// `ToolContext.origin` vocabulary (`model`, `mcp:<client>`, ...).
     ///
@@ -411,6 +417,7 @@ impl HostServices {
             client_identity: Vec::new(),
             proxy_id: String::new(),
             session_id: String::new(),
+            delegated_parent: None,
             // The common case: an agent run, relaying what the model asked for.
             tool_origin: "model".to_string(),
             always_allowed_tools: Arc::new(
@@ -465,6 +472,7 @@ impl HostServices {
             client_identity: Vec::new(),
             proxy_id: String::new(),
             session_id: String::new(),
+            delegated_parent: None,
             // The common case: an agent run, relaying what the model asked for.
             tool_origin: "model".to_string(),
             always_allowed_tools: Arc::new(
@@ -856,6 +864,31 @@ impl HostServices {
     pub fn with_session_id(mut self, session_id: String) -> Self {
         self.session_id = session_id;
         self
+    }
+
+    /// The session every delegation decision for these services is made
+    /// against: the delegated parent of a nested run, else `session_id`.
+    pub fn gate_session_id(&self) -> &str {
+        self.delegated_parent.as_deref().unwrap_or(&self.session_id)
+    }
+
+    /// What a nested run started from these services is gated by: the gate
+    /// session when a paired agent started it, else `None` (an ordinary
+    /// session's subagent is left exactly as before).
+    pub fn nested_gate_session(&self) -> Option<String> {
+        let session = self.gate_session_id();
+        crate::remote::task::origin::delegated_pairing(&self.database, session)
+            .map(|_| session.to_string())
+    }
+
+    /// [`Self::browser_context`] for putting a permission question: scoped to
+    /// the gate session, so a delegated subagent's question reaches the task
+    /// it belongs to (and its R39 rules) instead of an unscoped dialog.
+    pub fn permission_context(&self) -> Option<BrowserContext> {
+        self.browser_context().map(|mut ctx| {
+            ctx.session_id = self.gate_session_id().to_string();
+            ctx
+        })
     }
 
     /// Give this copy its own activation state instead of the daemon-wide

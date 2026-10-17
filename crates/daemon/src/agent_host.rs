@@ -816,10 +816,11 @@ Do you want to allow it?",
     ) -> Result<String, String> {
         let sender = browser_ctx.sender.clone();
         let runtime = self.runtime.clone();
+        // A delegated subagent asks in its task's session (contract R39).
         let permission_session_id = self
             .services
             .as_ref()
-            .map(|s| s.session_id.clone())
+            .map(|s| s.gate_session_id().to_string())
             .unwrap_or_default();
         tokio::task::block_in_place(|| {
             runtime.block_on(async {
@@ -899,8 +900,11 @@ Do you want to allow it?",
         // (M2a A1). Checked before the always-allow cache, which a person's
         // own chat may have filled for every session.
         if !tier_auto
-            && crate::remote::task::origin::delegated_pairing(&services.database, &services.session_id)
-                .is_some()
+            && crate::remote::task::origin::delegated_pairing(
+                &services.database,
+                services.gate_session_id(),
+            )
+            .is_some()
         {
             return Err(HostError {
                 code: 403,
@@ -1542,6 +1546,18 @@ Do you want to allow it?",
         }
     }
 
+    /// The pairing's ceiling for a call made in `ctx_session`, against `store`.
+    pub(crate) fn delegated_ceiling(
+        &self,
+        ctx_session: &str,
+        store: Option<std::sync::Arc<crate::remote::pairing::PairingStore>>,
+    ) -> Option<crate::remote::task::ceiling::Ceiling> {
+        let s = self.services.as_ref()?;
+        // A subagent of a delegated turn is judged as that turn (C1).
+        let session = s.delegated_parent.as_deref().unwrap_or(ctx_session);
+        crate::remote::task::ceiling::ceiling_with(s.database.clone(), session, store)
+    }
+
     /// `tool_pre` with the delegated ceiling already read: the ceiling and
     /// whether the call's question is must-approve come from one read.
     fn run_gate(
@@ -1606,7 +1622,8 @@ Do you want to allow it?",
 
         let sender = browser_ctx.sender.clone();
         let runtime = self.runtime.clone();
-        let session_id = services.session_id.clone();
+        // A delegated subagent asks in its task's session (contract R39).
+        let session_id = services.gate_session_id().to_string();
         let question = question.to_string();
         let client_identity = browser_ctx.client_identity.clone();
         let proxy_id = browser_ctx.proxy_id.clone();
@@ -1901,7 +1918,7 @@ fn ask_shown_ms(hold: Option<std::time::Duration>) -> u64 {
 /// the next tool call. Any missing/legacy/invalid value falls back to the
 /// safest tier (read-only) via `ExecutionTier::from_setting`.
 pub(crate) fn resolve_execution_tier(services: &HostServices) -> nevoflux_protocol::ExecutionTier {
-    resolve_execution_tier_for(&services.database, &services.session_id)
+    resolve_execution_tier_for(&services.database, services.gate_session_id())
 }
 
 /// The same resolution, addressed by database and session rather than by a
@@ -2850,9 +2867,8 @@ impl HostFunctions for DaemonHostFunctions {
     ) -> nevoflux_builtin_wasm::ToolGate {
         // A session a paired agent started gets the must-approve stage first,
         // bounded by the pairing's tier read now.
-        let delegated = self.services.as_ref().and_then(|s| {
-            crate::remote::task::ceiling::ceiling_for(s.database.clone(), &ctx.session_id)
-        });
+        let delegated =
+            self.delegated_ceiling(&ctx.session_id, crate::remote::task::origin::production_store());
         self.run_gate(call, ctx, delegated)
     }
 
@@ -6668,6 +6684,7 @@ impl HostFunctions for DaemonHostFunctions {
                         None,
                         None,
                         self.turn_stats(),
+                        services.nested_gate_session(),
                     )
                     .map_err(|e| HostError {
                         code: 500,
@@ -9167,6 +9184,7 @@ impl DaemonHostFunctions {
                         final_provider.clone(),
                         final_model.clone(),
                         self.turn_stats(),
+                        services.nested_gate_session(),
                     )
                     .map_err(|e| HostError {
                         code: 500,
@@ -9274,7 +9292,10 @@ impl DaemonHostFunctions {
                     host = host.with_turn_stats(stats);
                 }
                 if let Some(svc) = services {
-                    host = host.with_services(svc);
+                    // Its own session is the parent's here already; the gate
+                    // also covers `tool_pre`, which sees "subagent-N" (C1).
+                    let gate = svc.nested_gate_session();
+                    host = host.with_services(crate::wasm::subagent::gated(svc, gate));
                 }
 
                 // Pipe subagent stream to parent's sidebar
@@ -13469,5 +13490,107 @@ message = "not here"
         let hold = Some(std::time::Duration::from_secs(1800));
         assert_eq!(super::ask_shown_ms(hold), 1_800_000);
         assert_eq!(super::ask_shown_ms(None), 60_000);
+    }
+
+    /// A subagent's host as the executor builds it for a turn of delegated
+    /// session `parent` (pairing `chan-1`): the executor's own services (no
+    /// session id), gated by what the parent's services carry over.
+    fn subagent_host_of(
+        parent: &str,
+    ) -> (
+        super::DaemonHostFunctions,
+        tokio::runtime::Runtime,
+        tokio::sync::mpsc::Receiver<(
+            crate::wasm::services::BrowserRequest,
+            tokio::sync::oneshot::Sender<crate::wasm::services::BrowserResponse>,
+        )>,
+    ) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let db = delegated_db(parent, "chan-1");
+        let parent_services =
+            crate::wasm::services::HostServices::new(db.clone()).with_session_id(parent.to_string());
+        let (btx, brx) = tokio::sync::mpsc::channel(4);
+        let base = crate::wasm::services::HostServices::new(db).with_browser_sender(btx);
+        let services = crate::wasm::subagent::gated(base, parent_services.nested_gate_session());
+        let host = super::DaemonHostFunctions::new(
+            std::sync::Arc::new(crate::config::AgentConfig::default()),
+            rt.handle().clone(),
+        )
+        .with_is_subagent(true)
+        .with_services(services);
+        (host, rt, brx)
+    }
+
+    #[test]
+    fn a_delegated_turns_subagent_is_held_to_the_pairings_tier_on_the_native_path() {
+        use super::HostFunctions;
+        // Read-only pairing (no store in a unit test).
+        let (host, _rt, brx) = subagent_host_of("s-del");
+        let asked = watch_for_asks(brx);
+        match host.tool_pre(&a_tool_call("write_file"), &a_tool_context("subagent-1")) {
+            nevoflux_builtin_wasm::ToolGate::Deny(d) => assert_eq!(d.code, "DELEGATED_ABOVE_TIER"),
+            other => panic!("write_file was not refused: {other:?}"),
+        }
+        let err = host.check_tool_permission("write_file", "C:/notes.txt").unwrap_err();
+        assert_eq!(err.message, crate::remote::task::ceiling::refusal("write_file"));
+        assert!(!asked.load(std::sync::atomic::Ordering::SeqCst), "nobody was asked");
+    }
+
+    #[test]
+    fn a_full_auto_delegated_turns_subagent_is_asked_for_goal_set_in_its_task() {
+        let (host, rt, mut brx) = subagent_host_of("s-del");
+        let mut chan = crate::remote::agent_status::testing::agent("chan-1", 1);
+        chan.tier = Some("full-auto".to_string());
+        let (store, _dir) = agent_store(&[chan]);
+        let ceiling = host.delegated_ceiling("subagent-1", Some(store));
+        assert!(ceiling.is_some(), "the subagent is gated by its parent's delegation");
+        let seen = rt.spawn(async move {
+            let (req, reply) =
+                tokio::time::timeout(std::time::Duration::from_secs(10), brx.recv())
+                    .await
+                    .expect("nobody was asked")
+                    .unwrap();
+            let seen = (req.session_id.clone(), req.params.clone());
+            let _ = reply.send(crate::wasm::services::BrowserResponse {
+                request_id: req.request_id,
+                success: true,
+                result: Some(serde_json::json!({"answer": "Deny"})),
+                error: None,
+            });
+            seen
+        });
+        let gate = host.run_gate(&a_tool_call("goal_set"), &a_tool_context("subagent-1"), ceiling);
+        assert!(matches!(gate, nevoflux_builtin_wasm::ToolGate::Deny(_)), "{gate:?}");
+        let (session, params) = rt.block_on(seen).unwrap();
+        assert_eq!(session, "s-del", "asked in the task's session, where R39 applies");
+        assert_eq!(params["must_approve"], true);
+        assert_eq!(params["options"], serde_json::json!(["Allow", "Deny"]));
+        assert_eq!(params["question"], crate::tool_pipeline::delegated::prompt_for("goal_set"));
+    }
+
+    #[test]
+    fn an_ordinary_sessions_subagent_is_not_judged_by_a_pairing() {
+        use super::HostFunctions;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        nevoflux_storage::SessionRepository::new(&db)
+            .create(nevoflux_storage::models::CreateSessionParams::new().with_id("s-own"))
+            .unwrap();
+        let parent =
+            crate::wasm::services::HostServices::new(db.clone()).with_session_id("s-own".to_string());
+        assert_eq!(parent.nested_gate_session(), None);
+        let services = crate::wasm::subagent::gated(
+            crate::wasm::services::HostServices::new(db),
+            parent.nested_gate_session(),
+        );
+        assert_eq!(services.gate_session_id(), "");
+        let host = super::DaemonHostFunctions::new(
+            std::sync::Arc::new(crate::config::AgentConfig::default()),
+            rt.handle().clone(),
+        )
+        .with_is_subagent(true)
+        .with_services(services);
+        let gate = host.tool_pre(&a_tool_call("schedule_create"), &a_tool_context("subagent-1"));
+        assert!(matches!(gate, nevoflux_builtin_wasm::ToolGate::Allow), "{gate:?}");
     }
 }
