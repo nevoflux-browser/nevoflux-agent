@@ -78,6 +78,10 @@ pub struct Approval {
     /// The buttons or choices offered (kept for every kind: R15 maps onto them).
     pub options: Vec<String>,
     pub plan_steps: Vec<String>,
+    /// Raised by the must-approve stage (contract v1.2 §2.1). Whether the
+    /// agent may answer it is not stored here: it is the pairing's toggle,
+    /// read at each wait and each answer (R39).
+    pub must_approve: bool,
     /// Unix seconds.
     pub at: i64,
 }
@@ -274,6 +278,7 @@ impl TaskRecord {
                     question: None,
                     options: Vec::new(),
                     plan_steps: steps,
+                    must_approve: false,
                     at: now,
                 });
                 out.changed = true;
@@ -353,8 +358,15 @@ impl TaskRecord {
         removed
     }
 
-    /// The `nevoflux_task_wait` result for a reader at `cursor` (contract §2).
+    /// [`Self::wait_json_for`] with the pairing's toggle off (contract v1.2
+    /// R39's default): what tests and fixtures without a pairing see.
     pub fn wait_json(&self, cursor: u64, now: i64) -> Value {
+        self.wait_json_for(cursor, now, false)
+    }
+
+    /// The `nevoflux_task_wait` result for a reader at `cursor` (contract §2),
+    /// with the pairing's R39 toggle as read for this wait.
+    pub fn wait_json_for(&self, cursor: u64, now: i64, muse_may_approve_guarded: bool) -> Value {
         let (events, truncated) = self.events_since(cursor);
         let steps: Vec<Value> = events
             .iter()
@@ -374,7 +386,7 @@ impl TaskRecord {
                 let items: Vec<Value> = self
                     .approvals
                     .iter()
-                    .map(|a| self.approval_item(a, now))
+                    .map(|a| self.approval_item(a, now, muse_may_approve_guarded))
                     .collect();
                 v["approvals"] = json!(items);
             }
@@ -399,7 +411,7 @@ impl TaskRecord {
         v
     }
 
-    fn approval_item(&self, a: &Approval, now: i64) -> Value {
+    fn approval_item(&self, a: &Approval, now: i64, muse_may_approve_guarded: bool) -> Value {
         let mut v = json!({
             "approval_id": a.approval_id,
             "kind": a.kind.as_str(),
@@ -420,6 +432,12 @@ impl TaskRecord {
             }
             ApprovalKind::Tool => {}
         }
+        // Contract v1.2 §2.1 / R39: only the desktop may answer, unless the
+        // person turned the pairing's toggle on.
+        if a.must_approve && !muse_may_approve_guarded {
+            v["desktop_only"] = json!(true);
+            v["choices"] = json!([]);
+        }
         v
     }
 
@@ -427,14 +445,19 @@ impl TaskRecord {
     /// (contract §4). Only asked of a task that has not ended.
     pub fn status_json(&self) -> Value {
         let approval = self.approvals.first().map(|a| {
-            json!({
+            let mut o = json!({
                 "approval_id": a.approval_id,
                 "kind": a.kind.as_str(),
                 "summary": a.summary,
                 "choices": desktop_choices(a),
                 "started_at": a.at,
                 "expires_at": a.at + DELEGATED_HOLD.as_secs() as i64,
-            })
+            });
+            // Contract v1.2 §4: where the sidebar's "Muse may also answer" hint goes.
+            if a.must_approve {
+                o["must_approve"] = json!(true);
+            }
+            o
         });
         json!({
             "id": self.task_id,
@@ -600,6 +623,11 @@ fn ask_user_approval(p: &Value, now: i64) -> Option<Approval> {
     } else {
         ApprovalKind::Question
     };
+    let must_approve = kind == ApprovalKind::Tool
+        && params
+            .and_then(|q| q.get(super::MUST_APPROVE_KEY))
+            .and_then(Value::as_bool)
+            == Some(true);
     let question = text("question");
     let summary = text("description")
         .or_else(|| question.clone())
@@ -625,6 +653,7 @@ fn ask_user_approval(p: &Value, now: i64) -> Option<Approval> {
         },
         options,
         plan_steps: Vec::new(),
+        must_approve,
         at: now,
     })
 }
@@ -662,6 +691,8 @@ pub fn summary_line(prompt: &str) -> String {
 /// The buttons the desktop status bar offers for an approval (contract §4).
 pub fn desktop_choices(a: &Approval) -> Vec<&'static str> {
     match a.kind {
+        // Never "always" for a must-approve tool, whatever the toggle (v1.1/v1.2).
+        _ if a.must_approve => vec!["allow", "deny"],
         ApprovalKind::Tool if a.options.iter().any(|o| o.starts_with("Always allow")) => {
             vec!["allow", "allow_always", "deny"]
         }
@@ -713,6 +744,33 @@ mod tests {
         }
         json!({"type": "browser_tool_request", "payload": {"request_id": id, "session_id": "s1",
                "tab_id": null, "action": "ask_user", "params": params, "timeout_ms": 86400000}})
+    }
+
+    #[test]
+    fn a_must_approve_question_is_desktop_only_unless_the_pairing_lets_muse_answer() {
+        let mut r = record();
+        let mut frame = ask("req-9", Some("permission"), &["Allow", "Deny"]);
+        frame["payload"]["params"]["must_approve"] = json!(true);
+        r.observe(&frame, T0 + 20);
+        assert!(r.approvals[0].must_approve);
+        // Off (the default, and what `wait_json` means): the agent is offered nothing.
+        let item = &r.wait_json(0, T0 + 30)["approvals"][0];
+        assert_eq!(item["kind"], "tool");
+        assert_eq!(item["desktop_only"], true);
+        assert_eq!(item["choices"], json!([]));
+        assert_eq!(r.wait_json_for(0, T0 + 30, false)["approvals"][0], *item);
+        // On: an ordinary approval for the agent, still never `allow_always`.
+        let on = &r.wait_json_for(0, T0 + 30, true)["approvals"][0];
+        assert!(on.get("desktop_only").is_none(), "{on}");
+        assert_eq!(on["choices"], json!(["allow", "deny"]));
+        // The desktop's buttons do not depend on the toggle.
+        assert_eq!(desktop_choices(&r.approvals[0]), ["allow", "deny"]);
+        assert_eq!(r.status_json()["approval"]["must_approve"], true);
+        assert_eq!(r.status_json()["approval"]["choices"], json!(["allow", "deny"]));
+        // An ordinary permission prompt carries neither key, whatever the toggle.
+        r.observe(&ask("req-10", Some("permission"), &["Allow", "Deny"]), T0 + 21);
+        assert!(r.wait_json_for(0, T0 + 30, false)["approvals"][1].get("desktop_only").is_none());
+        assert!(!r.approvals[1].must_approve);
     }
 
     #[test]

@@ -21,6 +21,12 @@ pub mod tools;
 /// it; the task engine reads it to tell approval kinds apart.
 pub const PERMISSION_PURPOSE: &str = "permission";
 
+/// `params.must_approve: true` on the permission prompt Task 5's stage raises
+/// for a must-approve tool in a delegated turn (contract v1.2 §2.1). It says
+/// what the question is, fixed when it is asked; who may answer it is read
+/// from the pairing at each answer (R39). The extension ignores it.
+pub const MUST_APPROVE_KEY: &str = "must_approve";
+
 use std::sync::{Arc, OnceLock};
 
 static ENGINE: OnceLock<Arc<engine::TaskEngine>> = OnceLock::new();

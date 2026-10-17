@@ -93,6 +93,12 @@ pub struct Pairing {
     /// paused; written only when true. Never set on a device.
     #[serde(default, skip_serializing_if = "is_false")]
     pub paused: bool,
+    /// The person let this agent answer its delegated tasks' must-approve
+    /// approvals itself (M3 contract v1.2 R39). Absent in older files, which
+    /// reads as no; written only when true. Never set on a device. Read from
+    /// the store at every answer, never cached.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub muse_may_approve_guarded: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -273,6 +279,25 @@ impl PairingStore {
         Ok(true)
     }
 
+    /// Let an agent answer its must-approve approvals, or stop it (R39).
+    /// Reports whether there was such an agent; a device row has no toggle.
+    pub fn set_muse_may_approve_guarded(
+        &self,
+        control_channel_id: &str,
+        on: bool,
+    ) -> Result<bool, PairingError> {
+        let mut all = self.load()?;
+        let Some(entry) = all
+            .iter_mut()
+            .find(|p| p.control_channel_id == control_channel_id && p.is_agent())
+        else {
+            return Ok(false);
+        };
+        entry.muse_may_approve_guarded = on;
+        self.write(&all)?;
+        Ok(true)
+    }
+
     /// Forget one by its control channel. Reports whether there was one.
     pub fn remove(&self, control_channel_id: &str) -> Result<bool, PairingError> {
         let mut all = self.load()?;
@@ -348,6 +373,7 @@ pub fn mint(code: &str) -> Option<Pairing> {
         kind: PairingKind::Device,
         tier: None,
         paused: false,
+        muse_may_approve_guarded: false,
     })
 }
 
@@ -382,6 +408,7 @@ pub fn mint_agent(code: &str) -> Option<Pairing> {
                 .to_string(),
         ),
         paused: false,
+        muse_may_approve_guarded: false,
     })
 }
 
@@ -437,6 +464,7 @@ mod tests {
             kind: PairingKind::Device,
             tier: None,
             paused: false,
+            muse_may_approve_guarded: false,
         }
     }
 
@@ -723,5 +751,31 @@ mod tests {
         assert!(!store.set_paused("nobody", true).unwrap());
         let text = std::fs::read_to_string(dir.path().join("pairings.json")).unwrap();
         assert!(!text.contains("paused"), "{text}");
+    }
+
+    #[test]
+    fn an_agent_written_before_the_toggle_existed_does_not_let_muse_approve() {
+        let (store, dir) = store();
+        let old = r#"[{"control_channel_id":"a","control_key":"aa","created_at":1,"kind":"agent","tier":"full-auto"}]"#;
+        std::fs::write(dir.path().join("pairings.json"), old).unwrap();
+        assert!(!store.load().unwrap()[0].muse_may_approve_guarded);
+    }
+
+    #[test]
+    fn the_toggle_is_written_only_when_on_and_only_for_an_agent() {
+        let text = serde_json::to_string(&agent_row("a", None)).unwrap();
+        assert!(!text.contains("muse_may_approve_guarded"), "{text}");
+        let (store, dir) = store();
+        store.add(agent_row("a1", None)).unwrap();
+        store.add(pairing("d1")).unwrap();
+        assert!(store.set_muse_may_approve_guarded("a1", true).unwrap());
+        let text = std::fs::read_to_string(dir.path().join("pairings.json")).unwrap();
+        assert!(text.contains("\"muse_may_approve_guarded\": true"), "{text}"); // pretty-printed
+        assert!(store.load().unwrap()[0].muse_may_approve_guarded);
+        assert!(store.set_muse_may_approve_guarded("a1", false).unwrap());
+        assert!(!store.load().unwrap()[0].muse_may_approve_guarded);
+        assert!(!store.set_muse_may_approve_guarded("d1", true).unwrap(), "a device has no toggle");
+        assert!(!store.set_muse_may_approve_guarded("nobody", true).unwrap());
+        assert!(!store.load().unwrap()[1].muse_may_approve_guarded);
     }
 }

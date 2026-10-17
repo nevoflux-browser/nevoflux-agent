@@ -1542,6 +1542,44 @@ Do you want to allow it?",
         }
     }
 
+    /// `tool_pre` with the delegated ceiling already read: the ceiling and
+    /// whether the call's question is must-approve come from one read.
+    fn run_gate(
+        &self,
+        call: &nevoflux_builtin_wasm::ToolCall,
+        ctx: &nevoflux_builtin_wasm::ToolContext,
+        delegated: Option<crate::remote::task::ceiling::Ceiling>,
+    ) -> nevoflux_builtin_wasm::ToolGate {
+        // The stage order lives in `tool_pipeline::default_pipeline`, shared
+        // with the MCP dispatcher so both entry points judge a call the same
+        // way (invariant I2).
+        //
+        // The permission gate is not here on purpose — it keeps its own dialog
+        // inside the host functions, where it knows the honest name of the
+        // action and the resolved arguments. See `tool_pipeline`'s module docs.
+        let packs_dir = crate::paths::resolve_from_daemon().packs_dir();
+        let active: Vec<String> = self
+            .services
+            .as_ref()
+            .and_then(|s| {
+                s.active_packs
+                    .read()
+                    .ok()
+                    .map(|g| g.iter().cloned().collect())
+            })
+            .unwrap_or_default();
+        let policy_on = crate::jev::permission::policy_on(&self.config);
+        // Contract v1.2 §2.1: a must-approve tool's question says so; who may
+        // answer it is decided at each answer (R39).
+        let must_approve =
+            crate::tool_pipeline::delegated::must_approve_call(delegated.is_some(), call);
+        crate::tool_pipeline::default_pipeline_for(&packs_dir, &active, policy_on, delegated).run(
+            call,
+            ctx,
+            &|prompt: &str| self.ask_user_allow_as(prompt, must_approve),
+        )
+    }
+
     /// Put a yes/no question to the user and wait for the answer.
     ///
     /// Shares the request shape `check_tool_permission` uses, but deliberately
@@ -1551,6 +1589,14 @@ Do you want to allow it?",
     /// Returns false when there is nobody to ask or the dialog fails. A guard
     /// that cannot get an answer must not assume yes (invariant I6).
     fn ask_user_allow(&self, question: &str) -> bool {
+        self.ask_user_allow_as(question, false)
+    }
+
+    /// [`Self::ask_user_allow`], marked must-approve when `must_approve`
+    /// (contract v1.2 §2.1): the question a delegated turn's must-approve
+    /// stage raises. The mark says what the question is; who may answer it
+    /// is read from the pairing at each answer (R39).
+    pub(crate) fn ask_user_allow_as(&self, question: &str, must_approve: bool) -> bool {
         let Some(services) = self.services.as_ref() else {
             return false;
         };
@@ -1569,19 +1615,23 @@ Do you want to allow it?",
             runtime.block_on(async {
                 use tokio::sync::oneshot;
                 let (response_tx, response_rx) = oneshot::channel();
+                let mut params = serde_json::json!({
+                    "question": question,
+                    "description": question,
+                    "options": ["Allow", "Deny"],
+                    "allow_custom": false,
+                    "timeout_ms": 86400000,
+                    "purpose": crate::remote::task::PERMISSION_PURPOSE
+                });
+                if must_approve {
+                    params[crate::remote::task::MUST_APPROVE_KEY] = serde_json::json!(true);
+                }
                 let request = crate::wasm::services::BrowserRequest {
                     request_id: uuid::Uuid::new_v4().to_string(),
                     session_id,
                     tab_id: None,
                     action: nevoflux_protocol::BrowserToolAction::AskUser,
-                    params: serde_json::json!({
-                        "question": question,
-                        "description": question,
-                        "options": ["Allow", "Deny"],
-                        "allow_custom": false,
-                        "timeout_ms": 86400000,
-                        "purpose": crate::remote::task::PERMISSION_PURPOSE
-                    }),
+                    params,
                     timeout_ms: 86_400_000,
                     client_identity,
                     proxy_id,
@@ -2798,35 +2848,12 @@ impl HostFunctions for DaemonHostFunctions {
         call: &nevoflux_builtin_wasm::ToolCall,
         ctx: &nevoflux_builtin_wasm::ToolContext,
     ) -> nevoflux_builtin_wasm::ToolGate {
-        // The stage order lives in `tool_pipeline::default_pipeline`, shared
-        // with the MCP dispatcher so both entry points judge a call the same
-        // way (invariant I2).
-        //
-        // The permission gate is not here on purpose — it keeps its own dialog
-        // inside the host functions, where it knows the honest name of the
-        // action and the resolved arguments. See `tool_pipeline`'s module docs.
-        let packs_dir = crate::paths::resolve_from_daemon().packs_dir();
-        let active: Vec<String> = self
-            .services
-            .as_ref()
-            .and_then(|s| {
-                s.active_packs
-                    .read()
-                    .ok()
-                    .map(|g| g.iter().cloned().collect())
-            })
-            .unwrap_or_default();
-        let policy_on = crate::jev::permission::policy_on(&self.config);
         // A session a paired agent started gets the must-approve stage first,
         // bounded by the pairing's tier read now.
         let delegated = self.services.as_ref().and_then(|s| {
             crate::remote::task::ceiling::ceiling_for(s.database.clone(), &ctx.session_id)
         });
-        crate::tool_pipeline::default_pipeline_for(&packs_dir, &active, policy_on, delegated).run(
-            call,
-            ctx,
-            &|prompt: &str| self.ask_user_allow(prompt),
-        )
+        self.run_gate(call, ctx, delegated)
     }
 
     fn record_turn_boundary(&self, turn: u32, start: bool) {
@@ -13345,6 +13372,45 @@ message = "not here"
         assert!(host.ask_user_allow("A rule wants a person to confirm this."));
         let (_, params, _) = seen.await.unwrap();
         assert_eq!(params["purpose"], "permission");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_must_approve_question_is_stamped_and_offers_allow_or_deny() {
+        let (host, brx) = host_with_browser();
+        let seen = answer_one_browser_request(brx, serde_json::json!({"answer": "Allow"}));
+        assert!(host.ask_user_allow_as("A task delegated by a paired agent wants to run goal_set. This action always needs approval.", true));
+        let (_, params, _) = seen.await.unwrap();
+        assert_eq!(params["purpose"], "permission");
+        assert_eq!(params["must_approve"], true);
+        assert!(params.get("desktop_only").is_none(), "who may answer is decided per answer: {params}");
+        assert_eq!(params["options"], serde_json::json!(["Allow", "Deny"]));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_ordinary_rule_question_is_not_must_approve() {
+        let (host, brx) = host_with_browser();
+        let seen = answer_one_browser_request(brx, serde_json::json!({"answer": "Allow"}));
+        assert!(host.ask_user_allow("A rule wants a person to confirm this."));
+        let (_, params, _) = seen.await.unwrap();
+        assert!(params.get("must_approve").is_none(), "{params}");
+    }
+
+    /// The native entry point stamps the question its must-approve stage
+    /// raises in a delegated turn (the ceiling is passed in: a unit test has
+    /// no pairing store, so `tool_pre`'s own read would refuse every listed tool).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_native_gate_stamps_a_delegated_must_approve_question() {
+        let (host, brx) = host_with_browser();
+        let seen = answer_one_browser_request(brx, serde_json::json!({"answer": "Deny"}));
+        let within: crate::remote::task::ceiling::Ceiling = std::sync::Arc::new(|_: &str| true);
+        let gate = host.run_gate(&a_tool_call("goal_set"), &a_tool_context("s1"), Some(within));
+        assert!(matches!(gate, nevoflux_builtin_wasm::ToolGate::Deny(_)), "{gate:?}");
+        let (_, params, _) = seen.await.unwrap();
+        assert_eq!(params["must_approve"], true);
+        assert_eq!(
+            params["question"],
+            crate::tool_pipeline::delegated::prompt_for("goal_set")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

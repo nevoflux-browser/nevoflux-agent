@@ -93,6 +93,9 @@ pub enum ApproveError {
     TaskNotFound,
     ApprovalNotFound,
     Invalid(&'static str),
+    /// A must-approve approval, and the pairing does not let its agent
+    /// answer those (contract v1.2 R39).
+    DesktopOnly,
 }
 
 /// Whether a turn that is starting should run.
@@ -650,6 +653,8 @@ impl TaskEngine {
             }
         }
         let now = self.now();
+        // Read before the lock: the store is a file.
+        let guarded = self.muse_may_approve_guarded(pairing);
         let mut inner = self.lock();
         let cursor = inner.cursors.get(&key).copied().unwrap_or(0);
         let (state, next, image) = {
@@ -659,7 +664,7 @@ impl TaskEngine {
             } else {
                 None
             };
-            (task.wait_json(cursor, now), task.next_seq(), image)
+            (task.wait_json_for(cursor, now, guarded), task.next_seq(), image)
         };
         inner.cursors.insert(key.clone(), next);
         let image = match image {
@@ -738,6 +743,13 @@ impl TaskEngine {
                 .ok_or(ApproveError::ApprovalNotFound)?;
             (approval, task.session.clone(), task.pairing.clone())
         };
+        // Contract v1.2 R39: read at the answer, outside the lock.
+        if approval.must_approve
+            && matches!(by, Answerer::Agent(_))
+            && !self.muse_may_approve_guarded(&pairing)
+        {
+            return Err(ApproveError::DesktopOnly);
+        }
         if matches!(by, Answerer::Agent(_)) && choice == Choice::AllowAlways {
             // Decision C8: "always" leaves a permanent rule; only the person
             // may. `Choice::parse_agent` never yields it — this holds anyway.
@@ -785,11 +797,21 @@ impl TaskEngine {
             kind = approval.kind.as_str(),
             choice = choice.as_str(),
             by = if matches!(by, Answerer::Desktop) { "desktop" } else { "agent" },
+            must_approve = approval.must_approve,
             "delegated task approval answered"
         );
         self.publish_status(&pairing);
         self.bump();
         Ok(state)
+    }
+
+    /// Contract v1.2 R39: whether `pairing` lets its agent answer
+    /// must-approve approvals. Read from the store now, never cached; a
+    /// pairing that cannot be read or is gone reads as no.
+    fn muse_may_approve_guarded(&self, pairing: &str) -> bool {
+        self.host
+            .pairing(pairing)
+            .is_some_and(|p| p.muse_may_approve_guarded)
     }
 
     /// Cancel every running task of `pairing` (it was paused or unpaired).
@@ -2244,5 +2266,87 @@ mod tests {
         );
         assert!(rx.try_recv().is_err(), "the question is still waiting");
         assert!(r.host.pending.take_browser("req-1").is_some());
+    }
+
+    fn must_approve_ask(session: &str, request_id: &str) -> Value {
+        let mut frame = ask(session, request_id, Some("permission"), &["Allow", "Deny"]);
+        frame["payload"]["params"]["must_approve"] = json!(true);
+        frame
+    }
+
+    fn let_muse_approve(r: &Rig, on: bool) {
+        r.host.pairings.lock().unwrap()[0].muse_may_approve_guarded = on;
+    }
+
+    #[tokio::test]
+    async fn the_agent_cannot_answer_a_desktop_only_approval_but_the_desktop_can() {
+        let r = rig();
+        let (id, s) = r.start().await;
+        let waiting = waiting_request(&r, "req-d", &s);
+        r.engine.observe(&must_approve_ask(&s, "req-d"));
+        assert_eq!(
+            r.engine.approve(Answerer::Agent(CHANNEL.into()), &id, "req-d", Choice::Allow, None).await,
+            Err(ApproveError::DesktopOnly)
+        );
+        assert!(r.engine.approve(Answerer::Desktop, &id, "req-d", Choice::Allow, None).await.is_ok());
+        assert_eq!(waiting.await.unwrap().result.unwrap()["answer"], "Allow");
+    }
+
+    #[tokio::test]
+    async fn with_the_toggle_on_the_agent_answers_first_and_the_desktop_finds_nothing() {
+        let r = rig();
+        let_muse_approve(&r, true);
+        let (id, s) = r.start().await;
+        let waiting = waiting_request(&r, "req-g", &s);
+        r.engine.observe(&must_approve_ask(&s, "req-g"));
+        let item = r.engine.wait(CHANNEL, "m1", &id, Duration::from_secs(1), None).await.unwrap().state;
+        assert_eq!(item["approvals"][0]["choices"], json!(["allow", "deny"]));
+        assert!(item["approvals"][0].get("desktop_only").is_none());
+        assert!(matches!(
+            r.engine.approve(Answerer::Desktop, &id, "req-g", Choice::AllowAlways, None).await,
+            Err(ApproveError::Invalid(_))
+        ), "no Always allow for a must-approve tool, from either side");
+        assert!(r.engine.approve(Answerer::Agent(CHANNEL.into()), &id, "req-g", Choice::Allow, None).await.is_ok());
+        assert_eq!(waiting.await.unwrap().result.unwrap()["answer"], "Allow");
+        assert_eq!(
+            r.engine.approve(Answerer::Desktop, &id, "req-g", Choice::Deny, None).await,
+            Err(ApproveError::ApprovalNotFound)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_toggle_is_read_when_the_agent_answers_not_when_the_question_was_asked() {
+        let r = rig();
+        let_muse_approve(&r, true);
+        let (id, s) = r.start().await;
+        let waiting = waiting_request(&r, "req-t", &s);
+        r.engine.observe(&must_approve_ask(&s, "req-t"));
+        // Turned off while pending: the agent is refused and the wait says so.
+        let_muse_approve(&r, false);
+        assert_eq!(
+            r.engine.approve(Answerer::Agent(CHANNEL.into()), &id, "req-t", Choice::Deny, None).await,
+            Err(ApproveError::DesktopOnly)
+        );
+        let off = r.engine.wait(CHANNEL, "m1", &id, Duration::from_secs(1), None).await.unwrap().state;
+        assert_eq!(off["approvals"][0]["desktop_only"], true);
+        assert_eq!(off["approvals"][0]["choices"], json!([]));
+        // Turned on again: the agent's answer goes through.
+        let_muse_approve(&r, true);
+        assert!(r.engine.approve(Answerer::Agent(CHANNEL.into()), &id, "req-t", Choice::Deny, None).await.is_ok());
+        assert_eq!(waiting.await.unwrap().result.unwrap()["answer"], "Deny");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_pairing_never_lets_the_agent_answer() {
+        // The store unreadable or the row gone reads as off, never on.
+        let r = rig();
+        let (id, s) = r.start().await;
+        let _waiting = waiting_request(&r, "req-u", &s);
+        r.engine.observe(&must_approve_ask(&s, "req-u"));
+        r.host.pairings.lock().unwrap().clear();
+        assert_eq!(
+            r.engine.approve(Answerer::Agent(CHANNEL.into()), &id, "req-u", Choice::Allow, None).await,
+            Err(ApproveError::DesktopOnly)
+        );
     }
 }

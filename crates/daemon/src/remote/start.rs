@@ -1637,6 +1637,7 @@ mod tests {
             kind: crate::remote::pairing::PairingKind::Device,
             tier: None,
             paused: false,
+            muse_may_approve_guarded: false,
         }
     }
 
@@ -1652,6 +1653,7 @@ mod tests {
             kind: crate::remote::pairing::PairingKind::Agent,
             tier: None,
             paused: false,
+            muse_may_approve_guarded: false,
         }
     }
 

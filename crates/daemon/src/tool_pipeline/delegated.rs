@@ -45,6 +45,26 @@ pub fn must_approve(tool: &str) -> bool {
     MUST_APPROVE.contains(&tool)
 }
 
+/// The tool a call runs: the wrapped one for `tool_call_dynamic`.
+pub fn called_name(call: &ToolCall) -> &str {
+    if call.name == "tool_call_dynamic" {
+        call.arguments
+            .get("tool_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+    } else {
+        call.name.as_str()
+    }
+}
+
+/// Whether the question a call raises is marked must-approve (contract v1.2
+/// §2.1): a must-approve tool in a delegated turn. One answer for both tool
+/// entry points, from the ceiling each already read for the call (`delegated`
+/// = it has one); the stage itself never reads the R39 toggle and always asks.
+pub fn must_approve_call(delegated: bool, call: &ToolCall) -> bool {
+    delegated && must_approve(called_name(call))
+}
+
 /// The question put to the desktop (offered `Allow` / `Deny` only).
 pub fn prompt_for(tool: &str) -> String {
     format!("A task delegated by a paired agent wants to run {tool}. This action always needs approval.")
@@ -70,14 +90,7 @@ impl Stage for DelegatedTaskStage {
         // `tool_call_dynamic` names the tool it will run; judge that one.
         // On the ACP path the inner call is gated again on its own, but the
         // native loop's `tool_call_dynamic` is not.
-        let name = if call.name == "tool_call_dynamic" {
-            call.arguments
-                .get("tool_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-        } else {
-            call.name.as_str()
-        };
+        let name = called_name(call);
         if !(self.ceiling)(name) {
             return Verdict::Deny(ToolDenial {
                 code: ABOVE_TIER_CODE.into(),
@@ -256,6 +269,24 @@ mod tests {
             arguments,
             signature: None,
         }
+    }
+
+    #[test]
+    fn the_called_name_sees_through_tool_call_dynamic() {
+        assert_eq!(called_name(&call("goal_set", serde_json::json!({}))), "goal_set");
+        assert_eq!(
+            called_name(&call("tool_call_dynamic", serde_json::json!({"tool_name": "switch_model"}))),
+            "switch_model"
+        );
+    }
+
+    #[test]
+    fn only_a_delegated_turns_must_approve_call_is_stamped() {
+        let wrapped = call("tool_call_dynamic", serde_json::json!({"tool_name": "goal_set"}));
+        assert!(must_approve_call(true, &call("goal_set", serde_json::json!({}))));
+        assert!(must_approve_call(true, &wrapped));
+        assert!(!must_approve_call(false, &wrapped), "an ordinary session has no must-approve");
+        assert!(!must_approve_call(true, &call("browser_click", serde_json::json!({}))));
     }
 
     fn ctx() -> ToolContext {

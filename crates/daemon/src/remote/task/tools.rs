@@ -204,6 +204,9 @@ async fn approve(engine: &TaskEngine, pairing: &str, args: &Value) -> Result<Val
             approval_id: approval_id.to_string(),
         }),
         Err(ApproveError::Invalid(why)) => Err(failed(why)),
+        Err(ApproveError::DesktopOnly) => Err(AgentError::ApprovalDesktopOnly {
+            approval_id: approval_id.to_string(),
+        }),
     }
 }
 
@@ -476,6 +479,43 @@ mod tests {
         assert_eq!(v["content"].as_array().unwrap().len(), 1, "no image");
         assert_eq!(v["structuredContent"]["screenshot_error"], "too_large");
         assert!(serde_json::to_vec(&r).unwrap().len() <= MCP_RESULT_BUDGET);
+    }
+
+    fn must_approve_ask(session: &str, request_id: &str) -> Value {
+        let mut frame = ask(session, request_id, Some("permission"), &["Allow", "Deny"]);
+        frame["payload"]["params"]["must_approve"] = json!(true);
+        frame
+    }
+
+    #[tokio::test]
+    async fn a_desktop_only_approval_answers_approval_desktop_only() {
+        let r = rig();
+        let (id, s) = r.start().await;
+        let _waiting = waiting_request(&r, "req-d", &s);
+        r.engine.observe(&must_approve_ask(&s, "req-d"));
+        let out = call(&r.engine, CHANNEL, "m1", TASK_APPROVE,
+                       json!({"task_id": id, "approval_id": "req-d", "choice": "deny"}), None).await;
+        assert_eq!(
+            structured(&out)["error"],
+            json!({"code": "approval_desktop_only", "approval_id": "req-d",
+                   "message": "approval req-d can only be answered by the person at the desktop"})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_guarded_approval_is_the_agents_to_answer_when_the_pairing_allows_it() {
+        let r = rig();
+        r.host.pairings.lock().unwrap()[0].muse_may_approve_guarded = true;
+        let (id, s) = r.start().await;
+        let _waiting = waiting_request(&r, "req-g", &s);
+        r.engine.observe(&must_approve_ask(&s, "req-g"));
+        let always = call(&r.engine, CHANNEL, "m1", TASK_APPROVE,
+                          json!({"task_id": id, "approval_id": "req-g", "choice": "allow_always"}), None).await;
+        assert_eq!(structured(&always)["error"]["code"], "tool_failed");
+        assert_eq!(structured(&always)["error"]["detail"], "choice must be allow or deny");
+        let out = call(&r.engine, CHANNEL, "m1", TASK_APPROVE,
+                       json!({"task_id": id, "approval_id": "req-g", "choice": "allow"}), None).await;
+        assert_eq!(structured(&out)["ok"], true);
     }
 
     #[test]

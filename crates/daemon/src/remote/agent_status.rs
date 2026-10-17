@@ -127,6 +127,8 @@ pub struct AgentRow {
     pub label: Option<String>,
     pub created_at: i64,
     pub paused: bool,
+    /// The pairing's R39 toggle, as stored (contract v1.2 §4).
+    pub muse_may_approve_guarded: bool,
 }
 
 impl AgentRow {
@@ -140,6 +142,7 @@ impl AgentRow {
                 label: p.label.clone(),
                 created_at: p.created_at,
                 paused: p.paused,
+                muse_may_approve_guarded: p.muse_may_approve_guarded,
             })
             .collect();
         rows.sort_by_key(|r| r.created_at);
@@ -212,6 +215,7 @@ pub fn snapshot(
                 "channel_id": row.channel_id,
                 "label": row.label,
                 "state": state.as_str(),
+                "muse_may_approve_guarded": row.muse_may_approve_guarded,
                 "since": since,
                 "tool": tool,
                 "approval": approval.map(|a| json!({
@@ -602,6 +606,7 @@ pub(crate) mod testing {
             kind: PairingKind::Agent,
             tier: None,
             paused: false,
+            muse_may_approve_guarded: false,
         }
     }
 
@@ -799,6 +804,7 @@ mod tests {
         clock.store(200, Ordering::SeqCst);
         status.set_pairings(&[testing::agent("a", 1)]);
         let fresh = json!({ "channel_id": "a", "label": null, "state": "offline",
+                            "muse_may_approve_guarded": false,
                             "since": 200, "tool": null, "approval": null, "task": null });
         assert_eq!(status.current()["agents"][0], fresh);
         // Watches from before the forget end without bringing anything back.
@@ -879,11 +885,23 @@ mod tests {
             snap,
             json!({ "agents": [
                 { "channel_id": "early", "label": "Claude", "state": "offline",
+                  "muse_may_approve_guarded": false,
                   "since": 100, "tool": null, "approval": null, "task": null },
                 { "channel_id": "late", "label": null, "state": "offline",
+                  "muse_may_approve_guarded": false,
                   "since": 100, "tool": null, "approval": null, "task": null },
             ]})
         );
+    }
+
+    #[test]
+    fn the_snapshot_says_whether_muse_may_approve_sensitive_actions() {
+        let (status, _seen, _clock) = testing::watched(100);
+        let on = Pairing { muse_may_approve_guarded: true, ..testing::agent("a", 1) };
+        status.set_pairings(&[on, testing::agent("b", 2)]);
+        let agents = status.current()["agents"].clone();
+        assert_eq!(agents[0]["muse_may_approve_guarded"], true);
+        assert_eq!(agents[1]["muse_may_approve_guarded"], false);
     }
 
     #[test]

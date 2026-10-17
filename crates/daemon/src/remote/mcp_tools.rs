@@ -273,6 +273,9 @@ pub enum AgentError {
     /// The approval is not waiting for an answer (answered on the desktop,
     /// expired, or never existed).
     ApprovalNotFound { approval_id: String },
+    /// Only the person at the desktop may answer this approval (contract
+    /// v1.1 R25, unless the pairing's v1.2 R39 toggle is on).
+    ApprovalDesktopOnly { approval_id: String },
     /// The person paused this agent.
     Paused,
 }
@@ -294,6 +297,7 @@ impl AgentError {
             AgentError::SessionNotFound { .. } => "session_not_found",
             AgentError::TaskNotFound { .. } => "task_not_found",
             AgentError::ApprovalNotFound { .. } => "approval_not_found",
+            AgentError::ApprovalDesktopOnly { .. } => "approval_desktop_only",
             AgentError::Paused => "paused",
         }
     }
@@ -359,6 +363,10 @@ impl AgentError {
             ),
             AgentError::ApprovalNotFound { approval_id } => (
                 format!("approval {approval_id} is not waiting for an answer"),
+                vec![("approval_id", json!(approval_id))],
+            ),
+            AgentError::ApprovalDesktopOnly { approval_id } => (
+                format!("approval {approval_id} can only be answered by the person at the desktop"),
                 vec![("approval_id", json!(approval_id))],
             ),
             AgentError::Paused => ("this agent is paused in NevoFlux".to_string(), vec![]),
@@ -613,6 +621,7 @@ mod tests {
             (AgentError::SessionNotFound { session: "s1".into() }, "session_not_found"),
             (AgentError::TaskNotFound { task_id: "t1".into() }, "task_not_found"),
             (AgentError::ApprovalNotFound { approval_id: "a1".into() }, "approval_not_found"),
+            (AgentError::ApprovalDesktopOnly { approval_id: "a1".into() }, "approval_desktop_only"),
             (AgentError::Paused, "paused"),
         ]
     }

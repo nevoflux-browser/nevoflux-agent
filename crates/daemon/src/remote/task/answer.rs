@@ -73,6 +73,8 @@ pub fn answer_for(
 ) -> Result<Answer, &'static str> {
     match (approval.kind, choice) {
         (ApprovalKind::Tool, Choice::Allow) => Ok(Answer::Option(allow_option(&approval.options))),
+        // Contract v1.2 R39: never accepted for a must-approve tool, from either side.
+        (ApprovalKind::Tool, Choice::AllowAlways) if approval.must_approve => Err(NOT_OFFERED),
         (ApprovalKind::Tool, Choice::AllowAlways) => approval
             .options
             .iter()
@@ -153,6 +155,7 @@ mod tests {
             question: None,
             options: options.iter().map(|o| o.to_string()).collect(),
             plan_steps: vec![],
+            must_approve: false,
             at: 0,
         }
     }
