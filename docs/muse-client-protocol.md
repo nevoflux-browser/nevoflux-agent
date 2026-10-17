@@ -266,12 +266,14 @@ not the browser whitelist of §5: above it a tool is refused at once and
 nobody is asked, and the person lowering the tier stops the next tool call.
 Within the tier, ten sensitive tools always need an approval, whatever was
 allowed before: by default only the person at the desktop can give it, and
-the person can let you answer them too; see §8.3. Whatever the tier, the
-task's file-writing tools cannot write into NevoFlux's own configuration or
-data directory (its settings, pairings and database): such a write fails with
+the person can let you answer them too; see §8.3. In a delegated task the
+daemon's own file tools (`write_file`, `edit_file`) refuse to write into
+NevoFlux's configuration or data directory (its settings, pairings and
+database) with
 `A task delegated by a paired agent cannot change NevoFlux's own settings or pairings.`
-Shell commands are not restricted — full-auto is full access. The four task
-tools themselves work at every tier. The protocol number stays `1`; detect
+Commands (`bash`) and an ACP model provider's own file tools are not
+restricted, so at full-auto this limit does not hold: full-auto is full
+access. The four task tools themselves work at every tier. The protocol number stays `1`; detect
 delegation by the tool.
 
 Schemas: `fixtures/muse/task_tools.json`. Results: `fixtures/muse/task_results.json`.
