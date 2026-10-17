@@ -182,6 +182,7 @@ in `fixtures/muse/tool_errors.json` exactly as the head sends it.
 JSON-RPC errors still mean a malformed request. A head before M2 answered
 off-whitelist calls with JSON-RPC errors carrying `data.code` `not_allowed` or
 `unavailable`; an M2 head sends neither.
+
 The task tools of §8 answer the same way, with the codes in §8.5 as well.
 
 ### 5.4 Approvals
@@ -317,6 +318,10 @@ Schemas: `fixtures/muse/task_tools.json`. Results: `fixtures/muse/task_results.j
   characters (`reply_truncated: true` when cut). `error` only on `failed`.
   `steps_truncated`, `reply_truncated` and `screenshot_error` appear only
   when they apply. Accept keys you do not know.
+- A whole result is kept within 900 KiB (921 600 bytes, the relay's message
+  budget): over it, the picture is dropped first (`screenshot_error:
+  "too_large"`), then `reply` is halved until it fits, so `reply_truncated:
+  true` can appear on a reply shorter than 32 000 characters.
 - The **first** `done` result in an MCP session carries one picture of what
   the task produced (the Canvas it generated, else the tab it opened, else
   the tab it last acted on) as `content[1]`:
@@ -325,9 +330,14 @@ Schemas: `fixtures/muse/task_tools.json`. Results: `fixtures/muse/task_results.j
   With no picture, `done` carries `screenshot_error`: `no_tab` (nothing was
   opened or touched), `tab_discarded`, `tab_closed`, `too_large`, `timeout`,
   `capture_failed`, `browser_unavailable`.
-- A wait returns at once while an approval is open or when the task has
-  ended; otherwise when one of those happens, or at `timeout_secs`. Steps do
-  not end a wait early.
+- A wait returns at once when an approval is open that no earlier wait in
+  this MCP session returned, when the task's state changes while you wait
+  (an answered approval puts it back to `running`), or when the task has
+  ended; otherwise at `timeout_secs`. An approval a wait already returned
+  does not end the next wait in that MCP session early, so waiting again on
+  an approval only the person can answer blocks until something changes.
+  After a reconnect the first wait returns the open approvals at once. Steps
+  do not end a wait early.
 - `failed` messages: `approval_timeout` — `nobody answered an approval within
   30 minutes; it was denied`; `llm_error` — `the model call failed: <detail>`;
   `browser_unavailable` — `the NevoFlux desktop browser disconnected`;
@@ -362,8 +372,10 @@ Schemas: `fixtures/muse/task_tools.json`. Results: `fixtures/muse/task_results.j
 - Ten sensitive tools always ask, even at full-auto and whatever was allowed
   before: when the task wants to schedule work, run or resume a schedule,
   start a loop, switch a pack or the model, set a goal, replace the system
-  prompt or share the screen. Such a `tool` approval's `summary` is
-  `A task delegated by a paired agent wants to run <tool>. This action always needs approval.`
+  prompt or share the screen. The must-approve question's `summary` is
+  `A task delegated by a paired agent wants to run <tool>. This action always needs approval.`;
+  other questions about the same call (a site, pack or policy rule) can also
+  carry `desktop_only`.
   By default only the person at the desktop may answer it: it carries
   `"desktop_only": true` with `"choices": []`, and answering it is
   `approval_desktop_only`; ask the person to approve it at the desktop, or to

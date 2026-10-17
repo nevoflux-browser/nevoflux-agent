@@ -142,6 +142,9 @@ struct Inner {
     cursors: HashMap<(String, String), u64>,
     /// (MCP session, task) pairs that were sent the image.
     shown: HashSet<(String, String)>,
+    /// Approval ids each (MCP session, task) was last returned: an approval
+    /// already returned is not a reason for the next wait to end early.
+    returned: HashMap<(String, String), HashSet<String>>,
     /// Tasks whose turn ended and whose end marker is on its way through the
     /// chat tap: `task -> (session, fired when it arrives)`. Until it arrives,
     /// the session's frames are still that turn's.
@@ -214,6 +217,7 @@ impl TaskEngine {
             }
             inner.turn_pending.remove(&id);
             inner.cursors.retain(|(_, task), _| *task != id);
+            inner.returned.retain(|(_, task), _| *task != id);
             inner.shown.retain(|(_, task)| *task != id);
         }
     }
@@ -627,10 +631,13 @@ impl TaskEngine {
         self.bump();
     }
 
-    /// `nevoflux_task_wait` (spec §3.3): returns at once while an approval is
-    /// open or the task has ended, otherwise when one of those happens or at
-    /// `timeout`; every step event and new approval meanwhile goes to
-    /// `progress`.
+    /// `nevoflux_task_wait` (spec §3.3, final review I2): returns at once
+    /// when an approval this MCP session was not yet returned is open, when
+    /// the state differs from the one this wait began in (an approval
+    /// resolved → running included), or when the task has ended; otherwise at
+    /// `timeout`. A new MCP session (reconnect) has been returned nothing, so
+    /// it gets the open approvals at once. Every step event and new approval
+    /// meanwhile goes to `progress`.
     pub async fn wait(
         &self,
         pairing: &str,
@@ -645,13 +652,18 @@ impl TaskEngine {
         let key = (mcp_session.to_string(), task_id.to_string());
         let deadline = tokio::time::Instant::now() + timeout;
         let mut changes = self.changed.subscribe();
-        let mut told = {
+        let (mut told, began, returned) = {
             let mut inner = self.lock();
             Self::purge(&mut inner, self.now());
-            if Self::owned(&inner, pairing, task_id).is_none() {
+            let Some(task) = Self::owned(&inner, pairing, task_id) else {
                 return Err(not_found());
-            }
-            inner.cursors.get(&key).copied().unwrap_or(0)
+            };
+            let began = task.state;
+            (
+                inner.cursors.get(&key).copied().unwrap_or(0),
+                began,
+                inner.returned.get(&key).cloned().unwrap_or_default(),
+            )
         };
         let mut told_approvals: HashSet<String> = HashSet::new();
         let mut sent = 0u64;
@@ -669,9 +681,13 @@ impl TaskEngine {
                         messages.push(approval_progress(approval));
                     }
                 }
+                let news = task
+                    .approvals
+                    .iter()
+                    .any(|a| !returned.contains(&a.approval_id));
                 (
                     messages,
-                    task.state.is_terminal() || task.state == TaskState::AwaitingApproval,
+                    task.state.is_terminal() || task.state != began || news,
                 )
             };
             if let Some(sink) = progress {
@@ -697,16 +713,19 @@ impl TaskEngine {
         let guarded = self.muse_may_approve_guarded(pairing);
         let mut inner = self.lock();
         let cursor = inner.cursors.get(&key).copied().unwrap_or(0);
-        let (state, next, image) = {
+        let (state, next, image, ids) = {
             let task = Self::owned(&inner, pairing, task_id).ok_or_else(not_found)?;
             let image = if task.state == TaskState::Done {
                 task.screenshot.clone()
             } else {
                 None
             };
-            (task.wait_json_for(cursor, now, guarded), task.next_seq(), image)
+            let ids: HashSet<String> =
+                task.approvals.iter().map(|a| a.approval_id.clone()).collect();
+            (task.wait_json_for(cursor, now, guarded), task.next_seq(), image, ids)
         };
         inner.cursors.insert(key.clone(), next);
+        inner.returned.insert(key.clone(), ids);
         let image = match image {
             Some(data) if inner.shown.insert(key) => Some(data),
             _ => None,
@@ -1658,6 +1677,101 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    /// A task with one open tool approval that MCP session `m1` has been
+    /// shown once already, and a second `m1` wait (30 s) blocked on it.
+    async fn blocked_on_a_shown_approval(
+        r: &Rig,
+    ) -> (String, tokio::task::JoinHandle<Result<Waited, AgentError>>) {
+        let (id, s) = r.start().await;
+        r.engine.observe(&ask(&s, "req-1", Some("permission"), &["Allow", "Deny"]));
+        let first = r
+            .engine
+            .wait(CHANNEL, "m1", &id, Duration::from_secs(30), None)
+            .await
+            .unwrap();
+        assert_eq!(first.state["state"], "awaiting_approval", "a new approval returns at once");
+        let engine = r.engine.clone();
+        let task = id.clone();
+        let waiting = tokio::spawn(async move {
+            engine
+                .wait(CHANNEL, "m1", &task, Duration::from_secs(30), None)
+                .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        settle().await;
+        (s, waiting)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_approval_already_returned_does_not_end_the_next_wait_early() {
+        let r = rig();
+        let (_s, waiting) = blocked_on_a_shown_approval(&r).await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        settle().await;
+        assert!(!waiting.is_finished(), "the same open approval is not news");
+        tokio::time::advance(Duration::from_secs(20)).await;
+        let w = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("returned at its timeout")
+            .unwrap()
+            .unwrap();
+        assert_eq!(w.state["state"], "awaiting_approval");
+        assert_eq!(w.state["approvals"][0]["approval_id"], "req-1", "still listed");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_new_approval_ends_a_wait_blocked_on_a_returned_one() {
+        let r = rig();
+        let (s, waiting) = blocked_on_a_shown_approval(&r).await;
+        assert!(!waiting.is_finished());
+        r.engine.observe(&ask(&s, "req-2", Some("permission"), &["Allow", "Deny"]));
+        settle().await;
+        let w = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("woken by the new approval")
+            .unwrap()
+            .unwrap();
+        assert_eq!(w.state["approvals"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_approval_resolved_ends_a_wait_blocked_on_it() {
+        let r = rig();
+        let (s, waiting) = blocked_on_a_shown_approval(&r).await;
+        assert!(!waiting.is_finished());
+        r.engine.observe(&resolved(&s, "req-1", None));
+        settle().await;
+        let w = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("woken by the state change")
+            .unwrap()
+            .unwrap();
+        assert_eq!(w.state["state"], "running");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reconnect_gets_the_open_approval_at_once() {
+        let r = rig();
+        let (_s, waiting) = blocked_on_a_shown_approval(&r).await;
+        let task = r.engine.lock().tasks.keys().next().unwrap().clone();
+        let engine = r.engine.clone();
+        let fresh = tokio::spawn(async move {
+            engine
+                .wait(CHANNEL, "m2", &task, Duration::from_secs(30), None)
+                .await
+        });
+        tokio::task::yield_now().await;
+        settle().await;
+        let w = tokio::time::timeout(Duration::from_millis(10), fresh)
+            .await
+            .expect("a new MCP session is told at once")
+            .unwrap()
+            .unwrap();
+        assert_eq!(w.state["approvals"][0]["approval_id"], "req-1");
+        waiting.abort();
     }
 
     #[tokio::test(start_paused = true)]
