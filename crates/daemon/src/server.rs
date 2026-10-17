@@ -2784,14 +2784,8 @@ pub async fn start_server(
                 // A turn parked on a question or a plan polls neither flag
                 // above: settle what it waits on, refused, and tell the
                 // connection showing each dialog that it is gone (M3 §5.1).
-                if !session_id.is_empty() {
-                    for a in process_browser_registry.release_session(session_id) {
-                        let env = DaemonEnvelope::new(&a.proxy_id, Channel::Chat, a.frame);
-                        if let Err(e) = process_response_tx.send((a.client_identity, env)).await {
-                            warn!("Failed to announce a released wait: {}", e);
-                        }
-                    }
-                }
+                release_and_announce(&process_browser_registry, session_id, &process_response_tx)
+                    .await;
 
                 // Send acknowledgment
                 let response_payload = serde_json::json!({
@@ -5581,6 +5575,27 @@ fn current_container(tab_id: Option<i64>, tab_ids: &[nevoflux_builtin_wasm::TabI
         .unwrap_or_else(|| nevoflux_protocol::chat::DEFAULT_COOKIE_STORE_ID.to_string())
 }
 
+/// Settle what `session_id`'s stopped turn waits on — each question refused,
+/// its plan cancelled — and tell the connection showing each dialog that it is
+/// gone (M3 §5.1). A turn parked on a question or a plan polls neither the
+/// interrupt flag nor the stream token, so this is what ends its wait. Shared
+/// by `stop_generation` and `/clear`.
+async fn release_and_announce(
+    registry: &crate::pending::Pending,
+    session_id: &str,
+    response_tx: &mpsc::Sender<(Vec<u8>, DaemonEnvelope)>,
+) {
+    if session_id.is_empty() {
+        return;
+    }
+    for a in registry.release_session(session_id) {
+        let env = DaemonEnvelope::new(&a.proxy_id, Channel::Chat, a.frame);
+        if let Err(e) = response_tx.send((a.client_identity, env)).await {
+            warn!("Failed to announce a released wait: {}", e);
+        }
+    }
+}
+
 /// The metadata map a change is merged into: the session's own, or an empty
 /// one for a session not stored yet. `None` when the session could not be
 /// read — `update_session_metadata` replaces the whole map, so writing then
@@ -6647,6 +6662,8 @@ async fn handle_chat_message_streaming(
                 token.cancel();
             }
         }
+        // And, as the stop does, settle a question or plan it is parked on.
+        release_and_announce(&plan_registry, &session_id, &response_tx).await;
 
         let payload =
             match crate::session::clear::clear_session_contents(session_manager, &session_id).await
@@ -14917,6 +14934,33 @@ mod usage_frame_tests {
 mod tests {
     use super::*;
     use nevoflux_protocol::PlanStep;
+
+    #[tokio::test]
+    async fn a_released_session_settles_its_question_and_tells_the_dialog() {
+        let registry = crate::pending::Pending::new();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        registry.insert_browser(
+            "req-1".to_string(),
+            crate::pending::PendingBrowserRequest {
+                session_id: "s1".to_string(),
+                proxy_id: "sidebar".to_string(),
+                client_identity: b"sidebar".to_vec(),
+                deadline: std::time::Instant::now() + std::time::Duration::from_secs(60),
+                sender: tx,
+            },
+        );
+        let (out_tx, mut out_rx) = mpsc::channel(4);
+        super::release_and_announce(&registry, "", &out_tx).await;
+        assert!(out_rx.try_recv().is_err(), "no session, nothing released");
+        super::release_and_announce(&registry, "s1", &out_tx).await;
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .expect("the waiting turn was answered")
+            .unwrap();
+        assert!(!answer.success, "refused");
+        let (identity, _env) = out_rx.try_recv().expect("the dialog's connection was told");
+        assert_eq!(identity, b"sidebar".to_vec());
+    }
 
     #[test]
     fn a_session_that_could_not_be_read_gets_no_metadata_write() {
