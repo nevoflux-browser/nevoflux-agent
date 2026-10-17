@@ -21,9 +21,6 @@ pub struct ScheduleToolContext {
     pub is_unattended: bool,
 }
 
-/// Dispatch one of the seven `schedule_*` tools. `args` is the tool call's
-/// JSON arguments (already parsed — callers on the direct-API surface parse
-/// the args string once before calling this).
 /// Whether the creating session's tier may create a schedule (M3 §4.3).
 ///
 /// A scheduled run approves its own tools with nobody there to confirm them,
@@ -39,6 +36,9 @@ pub(crate) fn guard_schedule_create(tier: nevoflux_protocol::ExecutionTier) -> R
     ))
 }
 
+/// Dispatch one of the seven `schedule_*` tools. `args` is the tool call's
+/// JSON arguments (already parsed — callers on the direct-API surface parse
+/// the args string once before calling this).
 pub async fn execute_schedule_tool(
     name: &str,
     args: &Value,
