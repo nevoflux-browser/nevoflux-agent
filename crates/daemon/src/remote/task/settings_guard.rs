@@ -11,9 +11,13 @@
 //! are deliberately not restricted: full-auto is full access, and the
 //! contract says so; this closes the obvious door, not every door.
 //!
-//! Paths are compared after resolving them component by component — each
-//! existing prefix canonicalised (symlinks, junctions, 8.3 names) before the
-//! next `..` is applied — and, on Windows, without regard to case.
+//! Paths are resolved the way the OS that will open them does, then compared
+//! (on Windows without regard to case). On Windows `..` is applied to the
+//! path as written, before any link is followed (`GetFullPathNameW`), so the
+//! path is first made absolute and collapsed lexically, and only then is each
+//! existing prefix canonicalised (junctions, symlinks, 8.3 names). On POSIX
+//! the kernel follows a link before applying the `..` after it, so there each
+//! existing prefix is canonicalised before the next `..` is applied.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -58,11 +62,15 @@ pub fn is_inside_any(path: &Path, dirs: &[PathBuf]) -> bool {
         .any(|dir| target.starts_with(comparable(&resolve(dir))))
 }
 
-/// `path` made absolute and resolved: every existing prefix canonicalised
-/// before the next component is applied, so `link/..` means what the OS
-/// means by it; the part that does not exist yet is applied lexically.
+/// `path` made absolute and resolved as the OS resolves it (module docs):
+/// every existing prefix canonicalised, `..` applied where the OS applies it
+/// (lexically first on Windows, after the link on POSIX); the part that does
+/// not exist yet is applied lexically.
 fn resolve(path: &Path) -> PathBuf {
-    let absolute = if path.is_absolute() {
+    let absolute = if cfg!(windows) {
+        // Absolute with `.` and `..` already collapsed, as Windows does.
+        std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+    } else if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir().unwrap_or_default().join(path)
@@ -199,5 +207,41 @@ mod tests {
             &link.join("agent-pairings.json"),
             &[data.path().to_path_buf()]
         ));
+    }
+
+    /// Windows applies `..` to the path as written, before any junction is
+    /// followed: `<junction>\..\cfg` is the `cfg` next to the junction.
+    #[cfg(windows)]
+    #[test]
+    fn junction_dot_dot_is_applied_as_windows_applies_it() {
+        let root = tempfile::tempdir().unwrap();
+        let protected = root.path().join("cfg");
+        std::fs::create_dir_all(&protected).unwrap();
+        let far = tempfile::tempdir().unwrap();
+        let target = far.path().join("deep");
+        std::fs::create_dir_all(&target).unwrap();
+        let link = root.path().join("link");
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{made:?}");
+        let sneaky = link.join("..").join("cfg").join("agent-pairings.json");
+        assert!(is_inside_any(&sneaky, &[protected.clone()]), "{sneaky:?}");
+        // And the junction's own target's sibling is not mistaken for it.
+        assert!(!is_inside_any(&sneaky, &[far.path().join("cfg")]));
+    }
+
+    #[test]
+    fn a_plain_dot_dot_into_the_directory_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let protected = root.path().join("cfg");
+        let sub = root.path().join("sub");
+        std::fs::create_dir_all(&protected).unwrap();
+        std::fs::create_dir_all(&sub).unwrap();
+        let path = sub.join("..").join("cfg").join("config.toml");
+        assert!(is_inside_any(&path, &[protected]), "{path:?}");
     }
 }
