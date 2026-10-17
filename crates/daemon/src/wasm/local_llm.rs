@@ -427,6 +427,7 @@ pub async fn stream_local(request: LlmChatRequest, tx: mpsc::Sender<LlmStreamChu
                                                 done: false,
                                                 reasoning: None,
                                                 images: vec![],
+                                                error: None,
                                             })
                                             .await;
                                     }
@@ -439,6 +440,7 @@ pub async fn stream_local(request: LlmChatRequest, tx: mpsc::Sender<LlmStreamChu
                                                 done: false,
                                                 reasoning: Some(reasoning),
                                                 images: vec![],
+                                                error: None,
                                             })
                                             .await;
                                     }
@@ -465,6 +467,7 @@ pub async fn stream_local(request: LlmChatRequest, tx: mpsc::Sender<LlmStreamChu
                         done: false,
                         reasoning: None,
                         images: vec![],
+                        error: None,
                     })
                     .await;
             }
@@ -477,6 +480,7 @@ pub async fn stream_local(request: LlmChatRequest, tx: mpsc::Sender<LlmStreamChu
                     done: true,
                     reasoning: None,
                     images: vec![],
+                    error: None,
                 })
                 .await;
 

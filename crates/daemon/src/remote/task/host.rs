@@ -100,11 +100,7 @@ impl TaskHost for DaemonTaskHost {
         // parsed exactly as the turn parses it (`ProviderType: FromStr`).
         // Read now, never cached: config.llm.set swaps the inner Arc.
         let config = self.shared_config.read().ok()?.clone();
-        let id = config.llm.active_provider()?;
-        if !crate::config::is_acp_provider(id) {
-            return None;
-        }
-        let key = format!("{:?}", id.parse::<nevoflux_llm::ProviderType>().ok()?);
+        let key = crate::wasm::acp_lease::key_for(&config.llm, config.llm.active_provider()?)?;
         (crate::wasm::acp_lease::holder_count(&key) > 0).then_some(key)
     }
 

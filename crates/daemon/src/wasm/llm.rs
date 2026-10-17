@@ -2587,6 +2587,11 @@ pub struct LlmStreamChunk {
     /// Generated images in this chunk.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<LlmGeneratedImage>,
+    /// The stream failed before any model output (an ACP lease refusal, R38).
+    /// `llm_stream_next` turns it into a host error so the run fails instead of
+    /// a text reply carrying the message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     /// Usage totals for the whole call, reported by the provider. Only ever
     /// set on the final (`done: true`) chunk, and only on paths that surface
     /// real usage (rig streaming via `GetTokenUsage`, emulated streaming via
@@ -2728,6 +2733,7 @@ pub async fn start_llm_stream(
                     done: true,
                     reasoning: None,
                     images: vec![],
+                    error: None,
                 })
                 .await;
         }
@@ -2771,6 +2777,9 @@ pub async fn execute_llm_text(
 
     let mut out = String::new();
     while let Some(chunk) = rx.recv().await {
+        if let Some(refusal) = chunk.error {
+            return Err(DaemonError::InternalError(refusal));
+        }
         if let Some(text) = chunk.text {
             out.push_str(&text);
         }
@@ -2964,6 +2973,7 @@ async fn stream_openrouter(
                     done: false,
                     reasoning: None,
                     images: vec![],
+                    error: None,
                 })
                 .await;
         }
@@ -2978,6 +2988,7 @@ async fn stream_openrouter(
                     done: false,
                     reasoning: None,
                     images: response.images,
+                    error: None,
                 })
                 .await;
         }
@@ -2991,6 +3002,7 @@ async fn stream_openrouter(
                 done: true,
                 reasoning: None,
                 images: vec![],
+                error: None,
             })
             .await;
 
@@ -3150,6 +3162,7 @@ async fn stream_qwen(
                                         done: false,
                                         reasoning: None,
                                         images: vec![],
+                                        error: None,
                                     })
                                     .await;
                             }
@@ -3162,6 +3175,7 @@ async fn stream_qwen(
                                         done: false,
                                         reasoning: Some(reasoning),
                                         images: vec![],
+                                        error: None,
                                     })
                                     .await;
                             }
@@ -3188,6 +3202,7 @@ async fn stream_qwen(
                 done: false,
                 reasoning: None,
                 images: vec![],
+                error: None,
             })
             .await;
     }
@@ -3201,6 +3216,7 @@ async fn stream_qwen(
             done: true,
             reasoning: None,
             images: vec![],
+            error: None,
         })
         .await;
 
@@ -3296,6 +3312,7 @@ async fn stream_deepseek_raw(
                                         done: false,
                                         reasoning: None,
                                         images: vec![],
+                                        error: None,
                                     })
                                     .await;
                             }
@@ -3308,6 +3325,7 @@ async fn stream_deepseek_raw(
                                         done: false,
                                         reasoning: Some(reasoning),
                                         images: vec![],
+                                        error: None,
                                     })
                                     .await;
                             }
@@ -3335,6 +3353,7 @@ async fn stream_deepseek_raw(
                 done: false,
                 reasoning: None,
                 images: vec![],
+                error: None,
             })
             .await;
     }
@@ -3347,6 +3366,7 @@ async fn stream_deepseek_raw(
             done: true,
             reasoning: None,
             images: vec![],
+            error: None,
         })
         .await;
 
@@ -3501,6 +3521,7 @@ async fn send_stream_error_text(tx: &mpsc::Sender<LlmStreamChunk>, text: String)
             done: false,
             reasoning: None,
             images: vec![],
+            error: None,
         })
         .await;
 }
@@ -3630,6 +3651,7 @@ where
                                                     done: false,
                                                     reasoning: None,
                                                     images: vec![],
+                                                    error: None,
                                                 })
                                                 .await;
                                         }
@@ -3646,6 +3668,7 @@ where
                                                     done: false,
                                                     reasoning: Some(thinking.to_string()),
                                                     images: vec![],
+                                                    error: None,
                                                 })
                                                 .await;
                                         }
@@ -3724,6 +3747,7 @@ where
                 done: false,
                 reasoning: None,
                 images: vec![],
+                error: None,
             })
             .await;
     }
@@ -3736,6 +3760,7 @@ where
             done: true,
             reasoning: None,
             images: vec![],
+            error: None,
         })
         .await;
 
@@ -4021,6 +4046,7 @@ async fn stream_kimi_agent(
                         done: false,
                         reasoning: None,
                         images: vec![],
+                        error: None,
                     })
                     .await;
             }
@@ -4058,6 +4084,7 @@ async fn stream_kimi_agent(
                         done: false,
                         reasoning: Some(text),
                         images: vec![],
+                        error: None,
                     })
                     .await;
             }
@@ -4071,6 +4098,7 @@ async fn stream_kimi_agent(
                         done: false,
                         reasoning: None,
                         images: vec![],
+                        error: None,
                     })
                     .await;
                 break;
@@ -4091,6 +4119,7 @@ async fn stream_kimi_agent(
             done: true,
             reasoning: None,
             images: vec![],
+            error: None,
         })
         .await;
 
@@ -4144,8 +4173,25 @@ async fn stream_acp_completion(
         })
         .unwrap_or_default();
     let _acp_lease =
-        crate::wasm::acp_lease::acquire(&provider_key, &lease_session, lease_delegated)
-            .map_err(DaemonError::InternalError)?;
+        match crate::wasm::acp_lease::acquire(&provider_key, &lease_session, lease_delegated) {
+            Ok(lease) => lease,
+            Err(refusal) => {
+                // Not a model reply: a typed failure `llm_stream_next` turns
+                // into a host error, so the run fails (AGENT_ERROR / llm_error).
+                let _ = tx
+                    .send(LlmStreamChunk {
+                        usage: None,
+                        text: None,
+                        tool_calls: vec![],
+                        done: true,
+                        reasoning: None,
+                        images: vec![],
+                        error: Some(refusal),
+                    })
+                    .await;
+                return Ok(());
+            }
+        };
 
     {
         let mut providers = acp_providers().lock().await;
@@ -4735,6 +4781,7 @@ async fn drive_acp_prompt(
                         done: false,
                         reasoning: None,
                         images: vec![],
+                        error: None,
                     })
                     .await;
             }
@@ -4747,6 +4794,7 @@ async fn drive_acp_prompt(
                         done: false,
                         reasoning: Some(thought),
                         images: vec![],
+                        error: None,
                     })
                     .await;
             }
@@ -4779,6 +4827,7 @@ async fn drive_acp_prompt(
                             done: true,
                             reasoning: None,
                             images: vec![],
+                            error: None,
                         })
                         .await;
                 } else {
@@ -4811,6 +4860,7 @@ async fn drive_acp_prompt(
                                 done: true,
                                 reasoning: None,
                                 images: vec![],
+                                error: None,
                             })
                             .await;
                     } else {
@@ -4822,6 +4872,7 @@ async fn drive_acp_prompt(
                                 done: true,
                                 reasoning: None,
                                 images: vec![],
+                                error: None,
                             })
                             .await;
                     }
@@ -6240,6 +6291,7 @@ where
                         done: false,
                         reasoning: None,
                         images: vec![],
+                        error: None,
                     })
                     .await;
                 break;
@@ -6267,6 +6319,7 @@ where
                             done: false,
                             reasoning: None,
                             images: vec![],
+                            error: None,
                         }
                     }
                     StreamedAssistantContent::ToolCall(tc) => {
@@ -6358,6 +6411,7 @@ where
                             done: false,
                             reasoning: Some(reasoning.reasoning.join(" ")),
                             images: vec![],
+                            error: None,
                         }
                     }
                     StreamedAssistantContent::ReasoningDelta { reasoning, .. } => {
@@ -6369,6 +6423,7 @@ where
                             done: false,
                             reasoning: Some(reasoning),
                             images: vec![],
+                            error: None,
                         }
                     }
                     StreamedAssistantContent::Final(final_response) => {
@@ -6415,6 +6470,7 @@ where
                         done: false,
                         reasoning: None,
                         images: vec![],
+                        error: None,
                     })
                     .await;
                 break;
@@ -6463,6 +6519,7 @@ where
             done: true,
             reasoning: None,
             images: vec![],
+            error: None,
         })
         .await;
 
@@ -7955,6 +8012,7 @@ mod tests {
             done: false,
             reasoning: None,
             images: vec![],
+            error: None,
         };
 
         let json = serde_json::to_string(&chunk).unwrap();
@@ -7981,6 +8039,7 @@ mod tests {
             done: false,
             reasoning: None,
             images: vec![],
+            error: None,
         };
 
         let json = serde_json::to_string(&chunk).unwrap();
@@ -7997,6 +8056,7 @@ mod tests {
             done: true,
             reasoning: None,
             images: vec![],
+            error: None,
         };
 
         assert!(chunk.done);
@@ -8036,6 +8096,7 @@ mod tests {
             done: false,
             reasoning: None,
             images: vec![],
+            error: None,
         })
         .await
         .unwrap();
@@ -8069,6 +8130,7 @@ mod tests {
             done: true,
             reasoning: None,
             images: vec![],
+            error: None,
         })
         .await
         .unwrap();

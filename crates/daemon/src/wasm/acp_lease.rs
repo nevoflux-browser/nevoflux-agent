@@ -75,6 +75,16 @@ pub fn acquire(provider: &str, session_id: &str, delegated: bool) -> Result<Leas
     })
 }
 
+/// The lease key of config provider `id`: the `{:?}` of the wire provider
+/// `stream_acp_completion` runs, resolved the way a turn resolves it. `None`
+/// for a non-ACP provider or one that does not resolve.
+pub fn key_for(llm: &crate::config::LlmConfig, id: &str) -> Option<String> {
+    if !crate::config::is_acp_provider(id) {
+        return None;
+    }
+    llm.resolve_wire(id).map(|p| format!("{p:?}"))
+}
+
 /// How many turns hold `provider` now (`task_start`'s pre-check).
 pub fn holder_count(provider: &str) -> usize {
     leases()
@@ -129,6 +139,15 @@ mod tests {
     fn providers_do_not_block_each_other() {
         let _d = acquire("T5", "s-del", true).unwrap();
         assert!(acquire("T6", "s-own", false).is_ok());
+    }
+
+    #[test]
+    fn the_lease_key_is_the_wire_providers_debug_name_for_acp_ids_only() {
+        let llm = crate::config::LlmConfig::default();
+        assert_eq!(key_for(&llm, "claude-code").as_deref(), Some("ClaudeCode"));
+        assert_eq!(key_for(&llm, "openai"), None);
+        assert_eq!(key_for(&llm, "custom:nope"), None);
+        assert_eq!(key_for(&llm, "no-such-provider"), None);
     }
 
     #[test]

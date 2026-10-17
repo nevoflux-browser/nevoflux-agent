@@ -3569,6 +3569,7 @@ impl HostFunctions for DaemonHostFunctions {
                     done: false,
                     reasoning: None,
                     images: vec![],
+                    error: None,
                 });
             }
             // Send images if present
@@ -3580,6 +3581,7 @@ impl HostFunctions for DaemonHostFunctions {
                     done: false,
                     reasoning: None,
                     images: response.images,
+                    error: None,
                 });
             }
             // Send tool calls if present
@@ -3592,6 +3594,7 @@ impl HostFunctions for DaemonHostFunctions {
                         done: false,
                         reasoning: None,
                         images: vec![],
+                        error: None,
                     });
                 }
             }
@@ -3605,6 +3608,7 @@ impl HostFunctions for DaemonHostFunctions {
                 done: true,
                 reasoning: None,
                 images: vec![],
+                error: None,
             });
 
             registry.register(stream_id, rx);
@@ -3682,6 +3686,11 @@ impl HostFunctions for DaemonHostFunctions {
         stream_id: u64,
     ) -> HostResult<Option<nevoflux_builtin_wasm::LlmChunk>> {
         match self.stream_registry.next_chunk(stream_id) {
+            // A refused ACP lease (R38) fails the run; it is not a text reply.
+            Ok(Some(chunk)) if chunk.error.is_some() => Err(HostError {
+                code: 100,
+                message: chunk.error.unwrap_or_default(),
+            }),
             Ok(Some(chunk)) => {
                 // Accumulate for the session event log.
                 if let Ok(mut event_map) = self.stream_event_data.lock() {
@@ -11094,6 +11103,7 @@ message = "not here"
             reasoning: None,
             images: vec![],
             usage: None,
+            error: None,
         }
     }
 
@@ -11105,6 +11115,7 @@ message = "not here"
             reasoning: None,
             images: vec![],
             usage,
+            error: None,
         }
     }
 
@@ -11117,6 +11128,21 @@ message = "not here"
             }
         }
         panic!("stream never delivered a done chunk");
+    }
+
+    #[test]
+    fn an_acp_lease_refusal_chunk_fails_llm_stream_next_with_the_copy() {
+        let refusal = crate::wasm::acp_lease::local_refused("ClaudeCode");
+        let chunk = crate::wasm::llm::LlmStreamChunk {
+            done: true,
+            error: Some(refusal.clone()),
+            ..done_chunk(None)
+        };
+        let (host, _budget, stream_id, _rt) = setup_budgeted_stream(0, vec![chunk]);
+        let err = host
+            .llm_stream_next(stream_id)
+            .expect_err("a refused lease fails the run, it is not a reply");
+        assert_eq!(err.message, refusal);
     }
 
     #[test]
