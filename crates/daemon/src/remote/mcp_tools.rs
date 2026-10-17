@@ -768,6 +768,8 @@ mod tests {
             "remote.agent_resume",
             "remote_agent_pause",
             "remote_agent_resume",
+            "remote.agent_set_guarded_approval",
+            "remote_agent_set_guarded_approval",
         ] {
             assert!(!is_allowed(name), "{name}");
             assert!(agent_tools().iter().all(|t| t.name != name), "{name}");

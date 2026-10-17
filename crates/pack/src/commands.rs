@@ -111,6 +111,11 @@ mod tests {
     }
 
     #[test]
+    fn a_panel_cannot_let_an_agent_approve_sensitive_actions() {
+        assert!(is_forbidden_command("remote.agent_set_guarded_approval"));
+    }
+
+    #[test]
     fn declared_command_problems() {
         assert_eq!(declared_command_problem("schedule.run_now"), None);
         assert!(declared_command_problem("").is_some());

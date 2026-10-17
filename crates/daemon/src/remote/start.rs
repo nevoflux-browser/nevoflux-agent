@@ -995,6 +995,9 @@ pub async fn pair_device(
 /// wrong one is forgotten all the same.
 pub async fn unpair_device(deps: &ControlDeps, control_channel_id: &str) -> bool {
     let closed = close_channel(control_channel_id).await;
+    // Its task, if one is running, is cancelled; anything it left in the
+    // pairing's sessions now runs read-only (`origin::pairing_tier`).
+    crate::remote::task::cancel_for_pairing(control_channel_id).await;
     let mut removed = false;
     for store in [&deps.pairings, &deps.agent_pairings] {
         removed |= store.remove(control_channel_id).unwrap_or_else(|e| {
@@ -1124,6 +1127,8 @@ where
 {
     write_paused(deps, control_channel_id, true)?;
     close(control_channel_id.to_string()).await;
+    // A paused agent's task ends with its session (M3 §2, §5.1).
+    crate::remote::task::cancel_for_pairing(control_channel_id).await;
     deps.agent_status.set_pairings(&all_pairings(deps));
     tracing::info!(target: "remote", channel = %control_channel_id, "agent paused");
     Ok(())
@@ -1181,6 +1186,77 @@ where
     deps.agent_status.set_pairings(&all_pairings(deps));
     tracing::info!(target: "remote", channel = %control_channel_id, opened, "agent resumed");
     Ok(opened)
+}
+
+/// Let one agent answer its delegated tasks' must-approve approvals, or stop
+/// it (`remote.agent_set_guarded_approval`). The file first, then the
+/// snapshot: the task engine reads the file at every answer, and the
+/// sidebar's toggle shows the snapshot.
+pub fn set_guarded_approval(
+    deps: &ControlDeps,
+    control_channel_id: &str,
+    enabled: bool,
+) -> Result<(), AgentSwitchError> {
+    match deps
+        .agent_pairings
+        .set_muse_may_approve_guarded(control_channel_id, enabled)
+    {
+        Ok(true) => {}
+        Ok(false) => return Err(AgentSwitchError::NotFound),
+        Err(e) => return Err(AgentSwitchError::Store(e.to_string())),
+    }
+    deps.agent_status.set_pairings(&all_pairings(deps));
+    tracing::info!(
+        target: "remote",
+        channel = %super::agent_backend::short_id(control_channel_id),
+        enabled,
+        "agent may approve sensitive actions changed"
+    );
+    Ok(())
+}
+
+/// The `system_response` for `remote.agent_set_guarded_approval`. Local only,
+/// like `remote.agent_pause`: absent from `PORTAL_QUERIES` and the agent
+/// whitelist, and refused to Canvas by the `remote.` prefix (M3-0).
+pub fn guarded_approval_command(
+    deps: Option<&ControlDeps>,
+    params: &serde_json::Value,
+    request_id: &str,
+) -> serde_json::Value {
+    const COMMAND: &str = "remote.agent_set_guarded_approval";
+    let fail = |code: &str, message: String| {
+        serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": COMMAND,
+                "success": false,
+                "error": { "code": code, "message": message }
+            }
+        })
+    };
+    let Some(deps) = deps else {
+        return fail("NOT_READY", "the daemon is still starting".into());
+    };
+    let channel = params
+        .get("control_channel_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let Some(enabled) = params.get("enabled").and_then(|v| v.as_bool()) else {
+        return fail("INVALID_PARAMS", "enabled must be true or false".into());
+    };
+    match set_guarded_approval(deps, channel, enabled) {
+        Err(e) => fail(e.code(), e.to_string()),
+        Ok(()) => serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": COMMAND,
+                "success": true,
+                "data": { "enabled": enabled }
+            }
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -2239,5 +2315,65 @@ mod tests {
             seen.statuses().last().unwrap(),
             &serde_json::json!({ "agents": [] })
         );
+    }
+
+    #[test]
+    fn the_guarded_approval_toggle_is_stored_then_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, seen) = watched_deps(dir.path());
+        store_pairing(&deps, &agent("a1")).unwrap();
+        set_guarded_approval(&deps, "a1", true).unwrap();
+        assert!(deps.agent_pairings.load().unwrap()[0].muse_may_approve_guarded);
+        assert_eq!(seen.statuses().last().unwrap()["agents"][0]["muse_may_approve_guarded"], true);
+        set_guarded_approval(&deps, "a1", false).unwrap();
+        assert!(!deps.agent_pairings.load().unwrap()[0].muse_may_approve_guarded);
+        assert_eq!(seen.statuses().last().unwrap()["agents"][0]["muse_may_approve_guarded"], false);
+    }
+
+    #[test]
+    fn the_guarded_approval_toggle_refuses_an_unknown_channel_or_a_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, seen) = watched_deps(dir.path());
+        store_pairing(&deps, &device("d1")).unwrap();
+        let before = seen.statuses().len();
+        assert!(matches!(set_guarded_approval(&deps, "d1", true), Err(AgentSwitchError::NotFound)));
+        assert!(matches!(set_guarded_approval(&deps, "nobody", true), Err(AgentSwitchError::NotFound)));
+        assert_eq!(seen.statuses().len(), before, "nothing changed, nothing published");
+    }
+
+    #[test]
+    fn a_toggle_that_cannot_be_stored_is_not_published() {
+        // File first, then the snapshot: a failed write never shows a toggle
+        // the next answer would not honour.
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, seen) = watched_deps(dir.path());
+        std::fs::write(dir.path().join("agent-pairings.json"), "{ nope").unwrap();
+        let before = seen.statuses().len();
+        assert!(matches!(set_guarded_approval(&deps, "a1", true), Err(AgentSwitchError::Store(_))));
+        assert_eq!(seen.statuses().len(), before);
+    }
+
+    #[test]
+    fn the_guarded_approval_command_answers_like_pause() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps(dir.path());
+        store_pairing(&deps, &agent("a1")).unwrap();
+        let cmd = "remote.agent_set_guarded_approval";
+        assert_eq!(
+            guarded_approval_command(Some(&deps), &json!({"control_channel_id": "a1", "enabled": true}), "r1"),
+            json!({"type": "system_response", "payload": {"request_id": "r1", "command": cmd,
+                   "success": true, "data": {"enabled": true}}})
+        );
+        let code = |v: serde_json::Value| v["payload"]["error"]["code"].as_str().unwrap().to_string();
+        assert_eq!(code(guarded_approval_command(Some(&deps),
+            &json!({"control_channel_id": "nobody", "enabled": true}), "r2")), "NOT_FOUND");
+        assert_eq!(code(guarded_approval_command(Some(&deps),
+            &json!({"control_channel_id": "a1", "enabled": "yes"}), "r3")), "INVALID_PARAMS");
+        assert_eq!(code(guarded_approval_command(Some(&deps),
+            &json!({"control_channel_id": "a1"}), "r4")), "INVALID_PARAMS");
+        assert_eq!(code(guarded_approval_command(None,
+            &json!({"control_channel_id": "a1", "enabled": true}), "r5")), "NOT_READY");
+        assert!(deps.agent_pairings.load().unwrap()[0].muse_may_approve_guarded, "only r1 changed it");
     }
 }

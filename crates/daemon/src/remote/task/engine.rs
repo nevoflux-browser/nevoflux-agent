@@ -56,7 +56,8 @@ pub trait TaskHost: Send + Sync {
     /// comes back through the tap.
     async fn send(&self, proxy_id: &str, payload: Value);
     /// Put a message into the daemon's message loop as if `proxy_id` sent it.
-    async fn inject(&self, proxy_id: &str, payload: Value);
+    /// `false` when the loop is gone and nothing will ever run it.
+    async fn inject(&self, proxy_id: &str, payload: Value) -> bool;
     /// Send a browser request and wait for its answer; `None` when it could
     /// not be sent or nothing came back. The engine bounds the wait itself
     /// (`SCREENSHOT_WAIT`).
@@ -297,7 +298,7 @@ impl TaskEngine {
             }
         };
         let task_id = uuid::Uuid::new_v4().to_string();
-        {
+        let previous = {
             let mut inner = self.lock();
             // Again, under the lock that files the task: two starts racing
             // past the first check must not both run. (The loser may leave an
@@ -317,22 +318,53 @@ impl TaskEngine {
                 .entry(pairing.to_string())
                 .or_default()
                 .push_back(now);
-            inner.by_session.insert(session_id.clone(), task_id.clone());
+            let previous = inner.by_session.insert(session_id.clone(), task_id.clone());
             inner.turn_pending.insert(task_id.clone());
             inner.tasks.insert(
                 task_id.clone(),
                 TaskRecord::new(&task_id, pairing, &session_id, prompt, &proxy, now),
             );
-        }
+            previous
+        };
         self.publish_status(pairing);
         // Before the turn: the sidebar must know the session is delegated by
         // the time its first frame (a Canvas, even) arrives (R19).
         self.host
             .send(&proxy, session_origin_frame(&session_id, pairing))
             .await;
-        self.host
+        if !self
+            .host
             .inject(&proxy, chat_frame(&session_id, prompt))
-            .await;
+            .await
+        {
+            // No turn will ever run: the task must not hold the pairing's
+            // busy slot, its hourly window or the status bar. The new session
+            // stays behind empty (`session.list` hides empty sessions).
+            {
+                let mut inner = self.lock();
+                inner.tasks.remove(&task_id);
+                inner.turn_pending.remove(&task_id);
+                if inner.by_session.get(&session_id) == Some(&task_id) {
+                    // A continued session is its previous task's again.
+                    match previous {
+                        Some(previous) => inner.by_session.insert(session_id.clone(), previous),
+                        None => inner.by_session.remove(&session_id),
+                    };
+                }
+                if let Some(window) = inner.starts.get_mut(pairing) {
+                    if let Some(i) = window.iter().rposition(|t| *t == now) {
+                        window.remove(i);
+                    }
+                }
+            }
+            self.publish_status(pairing);
+            tracing::warn!(
+                target: "remote",
+                channel = %crate::remote::agent_backend::short_id(pairing),
+                "a delegated task could not reach the message loop"
+            );
+            return Err(AgentError::BrowserUnavailable);
+        }
         tracing::info!(
             target: "remote",
             task = %task_id,
@@ -702,7 +734,9 @@ impl TaskEngine {
             )
         };
         let proxy = self.host.sidebar().unwrap_or(proxy);
-        self.host.inject(&proxy, stop_frame(&session)).await;
+        if !self.host.inject(&proxy, stop_frame(&session)).await {
+            tracing::warn!(target: "remote", task = %task_id, "a task's stop could not reach the message loop");
+        }
         self.settled(task_id);
         self.publish_status(&owner);
         self.bump();
@@ -842,7 +876,11 @@ impl TaskEngine {
     fn spawn_inject(&self, proxy: String, payload: Value) {
         let host = self.host.clone();
         if let Ok(rt) = tokio::runtime::Handle::try_current() {
-            rt.spawn(async move { host.inject(&proxy, payload).await });
+            rt.spawn(async move {
+                if !host.inject(&proxy, payload).await {
+                    tracing::warn!(target: "remote", "a task's stop could not reach the message loop");
+                }
+            });
         }
     }
 
@@ -1020,6 +1058,8 @@ pub(crate) mod testing {
         /// Where `send` hands every frame, as the daemon's chat tap does:
         /// the engine itself, unless a test cuts it.
         pub(crate) tap: Mutex<Option<std::sync::Weak<TaskEngine>>>,
+        /// The message loop is gone: `inject` reports it was not delivered.
+        pub(crate) inject_fails: Mutex<bool>,
     }
 
     impl FakeHost {
@@ -1077,11 +1117,15 @@ pub(crate) mod testing {
                 engine.observe(&payload);
             }
         }
-        async fn inject(&self, proxy_id: &str, payload: Value) {
+        async fn inject(&self, proxy_id: &str, payload: Value) -> bool {
+            if *self.inject_fails.lock().unwrap() {
+                return false;
+            }
             self.log
                 .lock()
                 .unwrap()
                 .push(("inject", proxy_id.to_string(), payload));
+            true
         }
         async fn browser(&self, request: BrowserRequest) -> Option<BrowserResponse> {
             self.shots.lock().unwrap().push(request);
@@ -1111,6 +1155,7 @@ pub(crate) mod testing {
             gone_on_shot: Mutex::new(false),
             pending: Arc::new(Pending::new()),
             tap: Mutex::new(None),
+            inject_fails: Mutex::new(false),
         });
         let (status, seen, _status_clock) = status_testing::watched(T0);
         status.set_pairings(&[status_testing::agent(CHANNEL, 1)]);
@@ -1272,6 +1317,29 @@ mod tests {
         assert_eq!(chat["payload"]["session_id"], session.as_str());
         assert_eq!(chat["payload"]["mode"], "agent");
         assert_eq!(chat["payload"]["content"], "Generate a calculator Canvas");
+    }
+
+    #[tokio::test]
+    async fn a_turn_the_message_loop_never_took_leaves_no_task_behind() {
+        let r = rig();
+        *r.host.inject_fails.lock().unwrap() = true;
+        for _ in 0..20 {
+            assert_eq!(
+                r.engine.start(CHANNEL, "Generate a calculator Canvas", None).await.unwrap_err(),
+                AgentError::BrowserUnavailable
+            );
+        }
+        assert_eq!(
+            r.seen.statuses().last().unwrap()["agents"][0]["task"],
+            Value::Null,
+            "nothing shown as running"
+        );
+        assert!(r.seen.notifications().is_empty(), "nothing ran, nothing ended");
+        *r.host.inject_fails.lock().unwrap() = false;
+        // Neither the busy slot nor the hourly window kept the failed starts.
+        let (id, session) = r.start().await;
+        assert_eq!(r.engine.hold_for(&session), Some(DELEGATED_HOLD));
+        assert!(r.engine.cancel(Some(CHANNEL), &id).await.is_ok());
     }
 
     #[tokio::test]

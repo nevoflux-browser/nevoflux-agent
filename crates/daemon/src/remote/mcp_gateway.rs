@@ -49,10 +49,18 @@ pub struct McpGateway {
     channel: String,
     /// Where this channel's sessions are shown (M2b §2.3).
     status: Arc<AgentStatus>,
-    /// The task engine its sessions offer delegation through. `None` reads
-    /// the daemon's own at each session start — channels restored at
+    /// The task engine its sessions offer delegation through. `Daemon`
+    /// reads the daemon's own at each session start — channels restored at
     /// startup are built before the engine is installed.
-    tasks: Option<Arc<TaskEngine>>,
+    tasks: Tasks,
+}
+
+/// Where a channel's sessions find the task engine.
+enum Tasks {
+    /// The one the daemon installed, if any, read at each session start.
+    Daemon,
+    /// Exactly this one, or none at all.
+    Given(Option<Arc<TaskEngine>>),
 }
 
 impl McpGateway {
@@ -71,7 +79,7 @@ impl McpGateway {
             peers: Mutex::new(0),
             channel: channel_id.to_string(),
             status: super::agent_status::shared(),
-            tasks: None,
+            tasks: Tasks::Daemon,
         }
     }
 
@@ -81,9 +89,10 @@ impl McpGateway {
         self
     }
 
-    /// Answer the task tools with `tasks` instead of the daemon's engine.
+    /// Answer the task tools with `tasks` instead of the daemon's engine;
+    /// `None` offers no task tools, whatever the daemon installed.
     pub fn with_tasks(mut self, tasks: Option<Arc<TaskEngine>>) -> Self {
-        self.tasks = tasks;
+        self.tasks = Tasks::Given(tasks);
         self
     }
 
@@ -230,14 +239,14 @@ impl McpGateway {
         }
         {
             let (backend, cancel, id) = (self.backend.clone(), cancel.clone(), self.id.clone());
-            let tasks = self
-                .tasks
-                .clone()
-                .or_else(crate::remote::task::engine)
-                .map(|engine| super::mcp_server::TaskChannel {
-                    engine,
-                    pairing: self.channel.clone(),
-                });
+            let tasks = match &self.tasks {
+                Tasks::Daemon => crate::remote::task::engine(),
+                Tasks::Given(tasks) => tasks.clone(),
+            }
+            .map(|engine| super::mcp_server::TaskChannel {
+                engine,
+                pairing: self.channel.clone(),
+            });
             tokio::spawn(async move {
                 match AgentMcpServer::new(backend)
                     .with_tasks(tasks)
@@ -323,7 +332,9 @@ mod tests {
             sink.clone(),
             Arc::new(StubBrowserBackend),
             "chan-1",
-        ));
+        )
+        // No task engine, whatever the process installed.
+        .with_tasks(None));
         (gw, sink)
     }
 

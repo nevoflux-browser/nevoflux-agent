@@ -2298,4 +2298,36 @@ mod pause_is_local_only {
             }
         }
     }
+
+    #[test]
+    fn answering_and_stopping_a_task_are_never_portal_queries() {
+        for name in ["remote.task_answer", "remote.task_cancel"] {
+            assert!(!PORTAL_QUERIES.contains(&name), "{name}");
+            for frame in [
+                json!({ "kind": "query", "id": "q", "name": name, "params": { "task_id": "t" } }),
+                json!({ "kind": "system_command", "command": name, "params": { "task_id": "t" } }),
+                json!({ "type": "system_command",
+                        "payload": { "request_id": "r", "command": name, "params": { "task_id": "t" } } }),
+            ] {
+                assert!(uplink(&frame, "s", "m", None, &[]).is_none(), "{frame}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_guarded_approval_toggle_is_never_a_portal_query() {
+        let name = "remote.agent_set_guarded_approval";
+        assert!(!PORTAL_QUERIES.contains(&name));
+        for frame in [
+            json!({ "kind": "query", "id": "q", "name": name,
+                    "params": { "control_channel_id": "c", "enabled": true } }),
+            json!({ "kind": "system_command", "command": name,
+                    "params": { "control_channel_id": "c", "enabled": true } }),
+            json!({ "type": "system_command",
+                    "payload": { "request_id": "r", "command": name,
+                                 "params": { "control_channel_id": "c", "enabled": true } } }),
+        ] {
+            assert!(uplink(&frame, "s", "m", None, &[]).is_none(), "{frame}");
+        }
+    }
 }

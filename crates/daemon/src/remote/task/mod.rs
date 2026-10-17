@@ -8,7 +8,9 @@
 
 pub mod answer;
 pub mod ceiling;
+pub mod desktop;
 pub mod engine;
+pub mod host;
 pub mod limits;
 pub mod origin;
 pub mod record;

@@ -2181,6 +2181,7 @@ pub async fn start_server(
                 // is built from this, so a daemon that has been running alone
                 // all day still has something true to show.
                 tap_tracker.observe(&response.payload);
+                crate::remote::task::observe(&response.payload);
                 let reg = tap_registry.lock().await;
                 if !reg.is_empty() {
                     tracing::info!(
@@ -2616,6 +2617,22 @@ pub async fn start_server(
     // Agent channels clone their per-call services from this, the fully wired
     // copy (asset server and recorder included) — M2a §2.3.
     let services_template = crate::remote::agent_backend::set_services_template(services.clone());
+    // Delegation mode (M3): one task engine for the daemon. It reaches the
+    // sidebar through the same pipes a local turn uses — the message loop to
+    // start and stop a turn, the response writer to send a frame, the
+    // browser request handler for the result screenshot.
+    crate::remote::task::install(std::sync::Arc::new(
+        crate::remote::task::engine::TaskEngine::new(
+            std::sync::Arc::new(crate::remote::task::host::DaemonTaskHost::new(
+                services.database.clone(),
+                remote_msg_tx.clone(),
+                response_tx.clone(),
+                services.browser_sender.clone(),
+                agent_config.clone(),
+            )),
+            crate::remote::agent_status::shared(),
+        ),
+    ));
     let process_available_browsers = available_browsers.clone();
     let process_runtime = tokio::runtime::Handle::current();
     let process_browser_registry = browser_registry.clone();
@@ -2858,6 +2875,12 @@ pub async fn start_server(
                     >(payload.clone())
                     {
                         let request_id = response.request_id.clone();
+                        // Where a delegated task's turn acted, and the tab it
+                        // opened, for its result screenshot.
+                        crate::remote::task::observe_browser_response(
+                            &response.session_id,
+                            response.result.as_ref(),
+                        );
                         info!(
                             "Received browser tool response: id={}, success={}",
                             request_id, response.success
@@ -6431,6 +6454,30 @@ async fn handle_chat_message_streaming(
         .unwrap_or("default")
         .to_string();
 
+    // A turn of a task a paired agent delegated is watched until it ends, so
+    // the task can report how it went (M3 §2); `_task_turn` is dropped when
+    // this function returns, however it returns. A task cancelled before its
+    // turn began never runs it.
+    let _task_turn = match crate::remote::task::begin_turn(&session_id) {
+        crate::remote::task::engine::TurnStart::Run(guard) => guard,
+        crate::remote::task::engine::TurnStart::Skip => {
+            let idle = serde_json::json!({
+                "type": "agent_state",
+                "payload": {
+                    "session_id": session_id,
+                    "state": "idle",
+                    "message": "Task cancelled",
+                    "done": true
+                }
+            });
+            let response = DaemonEnvelope::new(&proxy_id, channel, idle).with_request_id(&request_id);
+            if let Err(e) = response_tx.send((identity, response)).await {
+                error!("Failed to queue response: {}", e);
+            }
+            return;
+        }
+    };
+
     // Record session→proxy mapping so /loop iterations spawned in this
     // session can borrow this sidebar's proxy_id/client_identity for
     // browser_* tool calls.
@@ -6599,6 +6646,7 @@ async fn handle_chat_message_streaming(
                     serde_json::json!({
                         "type": "error",
                         "payload": {
+                            "session_id": session_id.as_str(),
                             "code": "CLEAR_FAILED",
                             "message": e.to_string(),
                             "recoverable": true
@@ -6646,6 +6694,7 @@ async fn handle_chat_message_streaming(
                         let response_payload = serde_json::json!({
                             "type": "error",
                             "payload": {
+                                "session_id": session_id.as_str(),
                                 "code": "SKILL_TOOLS_UNAVAILABLE",
                                 "message": message,
                                 "recoverable": true,
@@ -6716,6 +6765,7 @@ async fn handle_chat_message_streaming(
                 let response_payload = serde_json::json!({
                     "type": "error",
                     "payload": {
+                        "session_id": session_id.as_str(),
                         "code": "SKILL_NOT_FOUND",
                         "message": format!("Skill '{}' not found. Type / to see available skills.", skill_name),
                         "recoverable": true
@@ -7972,6 +8022,7 @@ async fn handle_chat_message_streaming(
                                 let error_payload = serde_json::json!({
                                     "type": "error",
                                     "payload": {
+                                        "session_id": session_id.as_str(),
                                         "code": "PLAN_EXECUTION_ERROR",
                                         "message": format!("Plan execution error: {}", e)
                                     }
@@ -7988,6 +8039,7 @@ async fn handle_chat_message_streaming(
                                 let error_payload = serde_json::json!({
                                     "type": "error",
                                     "payload": {
+                                        "session_id": session_id.as_str(),
                                         "code": "PLAN_EXECUTION_PANIC",
                                         "message": format!("Plan execution task failed: {}", e)
                                     }
@@ -8349,6 +8401,7 @@ async fn handle_chat_message_streaming(
             let error_payload = serde_json::json!({
                 "type": "error",
                 "payload": {
+                    "session_id": session_id.as_str(),
                     "code": "AGENT_ERROR",
                     "message": format!("Agent error: {}", e)
                 }
@@ -8380,6 +8433,7 @@ async fn handle_chat_message_streaming(
             let error_payload = serde_json::json!({
                 "type": "error",
                 "payload": {
+                    "session_id": session_id.as_str(),
                     "code": "AGENT_PANIC",
                     "message": format!("Agent task failed: {}", e)
                 }
@@ -9777,6 +9831,33 @@ async fn handle_chat_message(
                         },
                     }
                 }
+
+                // --- Let one agent answer its tasks' must-approve approvals
+                //     (M3 contract v1.2 R39). Local only, like pause.
+                "remote.agent_set_guarded_approval" => crate::remote::start::guarded_approval_command(
+                    crate::remote::start::control_deps(),
+                    &params,
+                    &request_id,
+                ),
+
+                // --- A delegated task, answered or stopped from the desktop
+                //     status bar (M3 contract §8). Local only, like the pause
+                //     commands: absent from `PORTAL_QUERIES` and the agent
+                //     whitelist, and refused to Canvas by the `remote.` prefix.
+                "remote.task_answer" | "remote.task_cancel" => match crate::remote::task::engine() {
+                    Some(engine) => {
+                        crate::remote::task::desktop::handle(&engine, command, &params, &request_id).await
+                    }
+                    None => serde_json::json!({
+                        "type": "system_response",
+                        "payload": {
+                            "request_id": request_id,
+                            "command": command,
+                            "success": false,
+                            "error": { "code": "NOT_READY", "message": "the daemon is still starting" }
+                        }
+                    }),
+                },
 
                 // --- Remote-gateway S5: start a portal session. Mints a DO JWT
                 // from the stored account token, generates a channel id + a
