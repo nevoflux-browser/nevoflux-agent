@@ -2676,42 +2676,11 @@ pub async fn start_server(
             // remote-control portal has none to attach, so a browser-mode turn
             // from a phone would otherwise have nothing to act on and die at
             // its first tool call. Done here, before dispatch, so the rest of
-            // the pipeline sees an ordinary message either way.
+            // the pipeline sees an ordinary message either way. A delegated turn
+            // (M3 task engine) is skipped both ways: see `carry_tab_context` (R41).
             if envelope.payload.get("type").and_then(|v| v.as_str()) == Some("chat_message") {
-                if let Some(p) = envelope.payload.get("payload") {
-                    let sid = p
-                        .get("session_id")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    let has_tabs = p
-                        .get("tab_ids")
-                        .and_then(|t| t.as_array())
-                        .is_some_and(|a| !a.is_empty());
-                    if !sid.is_empty() {
-                        if has_tabs {
-                            let seen = (
-                                p.get("tab_id").and_then(|t| t.as_i64()),
-                                p.get("tab_ids").cloned().unwrap_or(serde_json::Value::Null),
-                            );
-                            process_tab_context_registry.lock().await.insert(sid, seen);
-                        } else if let Some((tab_id, tab_ids)) =
-                            process_tab_context_registry.lock().await.get(&sid).cloned()
-                        {
-                            if let Some(p) = envelope
-                                .payload
-                                .get_mut("payload")
-                                .and_then(|p| p.as_object_mut())
-                            {
-                                if let Some(t) = tab_id {
-                                    p.insert("tab_id".into(), serde_json::json!(t));
-                                }
-                                p.insert("tab_ids".into(), tab_ids);
-                                info!("Applied the session's last known tab context to a turn that carried none");
-                            }
-                        }
-                    }
-                }
+                let mut registry = process_tab_context_registry.lock().await;
+                carry_tab_context(&mut envelope.payload, &mut registry);
             }
 
             // Log all incoming messages
@@ -14930,6 +14899,66 @@ mod usage_frame_tests {
     }
 }
 
+/// What the message loop keeps per session: the last turn's active tab and its
+/// tab list, as the sidebar sent them.
+type TabContextRegistry = HashMap<String, (Option<i64>, serde_json::Value)>;
+
+/// Carries the session's browser tab context onto a `chat_message` frame that
+/// arrives without it, and remembers the context of one that has it.
+///
+/// The sidebar attaches its tabs to every message; a remote-control portal has
+/// none to attach, so a browser-mode turn from a phone would otherwise have
+/// nothing to act on and die at its first tool call.
+///
+/// A delegated turn (the task engine's, marked with
+/// [`crate::remote::task::engine::DELEGATED_TURN_FIELD`]) is left alone both
+/// ways (contract R41): it must not inherit the person's tabs, which would put
+/// their current page into a task a paired agent controls, and it must not
+/// overwrite what the person last used.
+///
+/// Returns whether context was applied to the frame.
+fn carry_tab_context(frame: &mut serde_json::Value, registry: &mut TabContextRegistry) -> bool {
+    let Some(p) = frame.get_mut("payload").and_then(|p| p.as_object_mut()) else {
+        return false;
+    };
+    let delegated = p
+        .get(crate::remote::task::engine::DELEGATED_TURN_FIELD)
+        .and_then(|d| d.as_bool())
+        .unwrap_or(false);
+    if delegated {
+        return false;
+    }
+    let sid = p
+        .get("session_id")
+        .and_then(|s| s.as_str())
+        .unwrap_or_default()
+        .to_string();
+    if sid.is_empty() {
+        return false;
+    }
+    let has_tabs = p
+        .get("tab_ids")
+        .and_then(|t| t.as_array())
+        .is_some_and(|a| !a.is_empty());
+    if has_tabs {
+        let seen = (
+            p.get("tab_id").and_then(|t| t.as_i64()),
+            p.get("tab_ids").cloned().unwrap_or(serde_json::Value::Null),
+        );
+        registry.insert(sid, seen);
+        return false;
+    }
+    let Some((tab_id, tab_ids)) = registry.get(&sid).cloned() else {
+        return false;
+    };
+    if let Some(t) = tab_id {
+        p.insert("tab_id".into(), serde_json::json!(t));
+    }
+    p.insert("tab_ids".into(), tab_ids);
+    info!("Applied the session's last known tab context to a turn that carried none");
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -16656,5 +16685,70 @@ mod tests {
         assert_eq!(find("s-own")["origin"], serde_json::Value::Null);
         // No runtime map in a unit test: idle reads as null, never absent.
         assert!(find("s-own").get("runtime").is_some_and(|r| r.is_null()));
+    }
+
+    fn turn(
+        session: &str,
+        tabs: Option<(i64, serde_json::Value)>,
+        delegated: bool,
+    ) -> serde_json::Value {
+        let mut p =
+            serde_json::json!({ "session_id": session, "message_id": "m", "content": "hi" });
+        if let Some((tab_id, tab_ids)) = tabs {
+            p["tab_id"] = serde_json::json!(tab_id);
+            p["tab_ids"] = tab_ids;
+        }
+        if delegated {
+            p[crate::remote::task::engine::DELEGATED_TURN_FIELD] = serde_json::json!(true);
+        }
+        serde_json::json!({ "type": "chat_message", "payload": p })
+    }
+
+    fn person_tabs() -> serde_json::Value {
+        serde_json::json!([{
+            "space": "firefox-default",
+            "tab_id": 2,
+            "tab_title": "Mine",
+            "url": "https://example.com/"
+        }])
+    }
+
+    #[test]
+    fn a_sidebar_turn_with_tabs_is_remembered_and_left_as_sent() {
+        let mut registry = TabContextRegistry::new();
+        let mut frame = turn("s1", Some((2, person_tabs())), false);
+        let sent = frame.clone();
+        assert!(!carry_tab_context(&mut frame, &mut registry));
+        assert_eq!(frame, sent);
+        assert_eq!(registry.get("s1"), Some(&(Some(2), person_tabs())));
+    }
+
+    #[test]
+    fn a_portal_turn_without_tabs_inherits_the_sessions_last_context() {
+        let mut registry = TabContextRegistry::new();
+        carry_tab_context(&mut turn("s1", Some((2, person_tabs())), false), &mut registry);
+        let mut frame = turn("s1", None, false);
+        assert!(carry_tab_context(&mut frame, &mut registry));
+        assert_eq!(frame["payload"]["tab_id"], 2);
+        assert_eq!(frame["payload"]["tab_ids"], person_tabs());
+    }
+
+    #[test]
+    fn a_delegated_turn_neither_inherits_nor_overwrites_tab_context() {
+        let mut registry = TabContextRegistry::new();
+        carry_tab_context(&mut turn("s1", Some((2, person_tabs())), false), &mut registry);
+
+        // The task engine's own frame, exactly as injected.
+        let mut frame = crate::remote::task::engine::chat_frame("s1", "do it");
+        let sent = frame.clone();
+        assert!(!carry_tab_context(&mut frame, &mut registry));
+        assert_eq!(frame, sent, "a delegated turn must not inherit the person's tabs");
+
+        // Even one that somehow carried tabs is not written into the registry.
+        let other = serde_json::json!([{ "tab_id": 9 }]);
+        carry_tab_context(&mut turn("s1", Some((9, other.clone())), true), &mut registry);
+        carry_tab_context(&mut turn("s2", Some((9, other)), true), &mut registry);
+        assert_eq!(registry.get("s1"), Some(&(Some(2), person_tabs())));
+        assert!(registry.get("s2").is_none());
     }
 }

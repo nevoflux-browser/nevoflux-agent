@@ -1003,9 +1003,19 @@ pub fn session_origin_frame(session_id: &str, pairing: &str) -> Value {
     })
 }
 
-/// The turn itself: an Agent-mode chat message (decision C5).
+/// Marks a chat frame as a delegated turn (contract R41).
+///
+/// Daemon-internal: the frame is injected straight into the daemon's own
+/// message loop and never leaves the daemon. `ChatMessage` ignores unknown
+/// fields, so nothing downstream rejects it. The message loop reads it to keep
+/// the session's last known browser tab context off a delegated turn: such a
+/// turn neither inherits the person's tabs nor overwrites what they last used.
+pub const DELEGATED_TURN_FIELD: &str = "delegated_turn";
+
+/// The turn itself: an Agent-mode chat message (decision C5), carrying no tab
+/// context and marked as delegated (R41, [`DELEGATED_TURN_FIELD`]).
 pub fn chat_frame(session_id: &str, prompt: &str) -> Value {
-    serde_json::to_value(SidebarMessage::ChatMessage(ChatMessage {
+    let mut frame = serde_json::to_value(SidebarMessage::ChatMessage(ChatMessage {
         session_id: session_id.to_string(),
         message_id: uuid::Uuid::new_v4().to_string(),
         text: prompt.to_string(),
@@ -1014,7 +1024,11 @@ pub fn chat_frame(session_id: &str, prompt: &str) -> Value {
         tab_id: None,
         tab_ids: Vec::new(),
     }))
-    .unwrap_or_default()
+    .unwrap_or_default();
+    if let Some(p) = frame.get_mut("payload").and_then(|p| p.as_object_mut()) {
+        p.insert(DELEGATED_TURN_FIELD.into(), Value::Bool(true));
+    }
+    frame
 }
 
 /// The stop button's own message.
@@ -2552,5 +2566,22 @@ mod tests {
             r.engine.approve(Answerer::Agent(CHANNEL.into()), &id, "req-u", Choice::Allow, None).await,
             Err(ApproveError::DesktopOnly)
         );
+    }
+
+    /// R41: the injected turn carries no tab context and says it is delegated,
+    /// and the marker survives the trip through `ChatMessage` untouched.
+    #[test]
+    fn the_chat_frame_is_marked_delegated_and_carries_no_tabs() {
+        let frame = chat_frame("s-task", "do it");
+        assert_eq!(frame["type"], "chat_message");
+        let p = &frame["payload"];
+        assert_eq!(p[DELEGATED_TURN_FIELD], Value::Bool(true));
+        assert!(p["tab_id"].is_null());
+        assert!(p
+            .get("tab_ids")
+            .is_none_or(|t| t.as_array().is_some_and(|a| a.is_empty())));
+        // Unknown to the protocol struct, and still accepted by it.
+        let back: SidebarMessage = serde_json::from_value(frame).unwrap();
+        assert!(matches!(back, SidebarMessage::ChatMessage(m) if m.session_id == "s-task"));
     }
 }
