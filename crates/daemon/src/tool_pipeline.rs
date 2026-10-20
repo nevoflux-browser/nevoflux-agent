@@ -67,6 +67,27 @@ fn shared_hooks() -> &'static pack_hook_stage::HookRegistry {
     HOOKS.get_or_init(Default::default)
 }
 
+/// The installed and active site rules whose deny or ask list names `tool`.
+///
+/// A call that carries no URL is judged on the URL of the tab it runs in, and
+/// the native loop does not know that URL: its caller asks the browser, which
+/// is only worth a round trip when one of these rules exists.
+pub fn site_rules_naming(
+    packs_dir: &std::path::Path,
+    active_packs: &[String],
+    tool: &str,
+) -> Vec<site_policy::SiteRule> {
+    let mut rules = shared_rules().get(packs_dir);
+    rules.extend(site_policy::load_active_rules(packs_dir, active_packs));
+    rules.retain(|r| {
+        r.deny
+            .iter()
+            .chain(&r.ask)
+            .any(|p| site_policy::glob_match(p, tool))
+    });
+    rules
+}
+
 /// The kernel's gate, in the one order it has (design spec 4.1).
 ///
 /// Entry points call this instead of listing stages themselves. Two lists are
@@ -686,5 +707,21 @@ mod tests {
         assert!(!default_pipeline(no_packs, &[], false)
             .stage_names()
             .contains(&"delegated_task"));
+    }
+
+    #[test]
+    fn site_rules_naming_finds_the_rules_that_name_the_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = dir.path().join("local-ask");
+        std::fs::create_dir(&pack).unwrap();
+        std::fs::write(
+            pack.join("pack.toml"),
+            "[pack]\nname = \"local-ask\"\nversion = \"1.0.0\"\nprotocol = \"pack-protocol/0.2\"\nmin_nevoflux = \"0.3.0\"\n\n[[components.tool_policy]]\nscope = \"installed\"\nmatch = { url = [\"http://127.0.0.1:8765/*\"] }\ndeny = []\nask = [\"browser_click*\"]\nmessage = \"confirm\"\n",
+        )
+        .unwrap();
+        let found = site_rules_naming(dir.path(), &[], "browser_click_by_id");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].urls, vec!["http://127.0.0.1:8765/*".to_string()]);
+        assert!(site_rules_naming(dir.path(), &[], "browser_snapshot").is_empty());
     }
 }

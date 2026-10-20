@@ -1599,11 +1599,54 @@ Do you want to allow it?",
         // answer it is decided at each answer (R39).
         let must_approve =
             crate::tool_pipeline::delegated::must_approve_call(delegated.is_some(), call);
+        // The loop leaves `tab_url` empty ("the daemon knows the tab"): fill it
+        // here, or a site rule never sees where a click or a fill happens.
+        let resolved;
+        let ctx = match self.call_tab_url(call, ctx, &packs_dir, &active) {
+            Some(url) => {
+                resolved = nevoflux_builtin_wasm::ToolContext {
+                    tab_url: Some(url),
+                    ..ctx.clone()
+                };
+                &resolved
+            }
+            None => ctx,
+        };
         crate::tool_pipeline::default_pipeline_for(&packs_dir, &active, policy_on, delegated).run(
             call,
             ctx,
             &|prompt: &str| self.ask_user_allow_as(prompt, must_approve),
         )
+    }
+
+    /// The URL of the tab a call will run in, for the site rules to judge.
+    ///
+    /// `None` when the call already says where it goes (its own `url`, which
+    /// the rules prefer), when no site rule names this tool or every rule that
+    /// does applies everywhere (the answer cannot change), or when the browser
+    /// does not say. The tab is the one the call names, else the active tab.
+    fn call_tab_url(
+        &self,
+        call: &nevoflux_builtin_wasm::ToolCall,
+        ctx: &nevoflux_builtin_wasm::ToolContext,
+        packs_dir: &std::path::Path,
+        active: &[String],
+    ) -> Option<String> {
+        let carries_url = call
+            .arguments
+            .get("url")
+            .and_then(|u| u.as_str())
+            .is_some_and(|u| !u.is_empty());
+        if ctx.tab_url.is_some() || carries_url {
+            return None;
+        }
+        let rules = crate::tool_pipeline::site_rules_naming(packs_dir, active, &call.name);
+        if rules.iter().all(|r| r.urls.is_empty()) {
+            return None;
+        }
+        let tabs = self.list_tabs_quietly()?;
+        let candidates = crate::jev::visibility::candidate_urls(&tabs, &call.arguments)?;
+        crate::tool_pipeline::site_policy::judged_tab_url(&rules, &candidates)
     }
 
     /// Put a yes/no question to the user and wait for the answer.

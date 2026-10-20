@@ -205,6 +205,25 @@ pub fn target_url(call: &ToolCall, ctx: &ToolContext) -> Option<String> {
     ctx.tab_url.as_deref().map(canonical_url)
 }
 
+/// Which of a call's candidate tab URLs to judge it on.
+///
+/// `candidates` are the URLs the call may run in: the tab it names, or every
+/// active tab when it names none (one per window, and the browser picks). A
+/// rule restricts, so when they differ the URL a rule covers is the one that
+/// counts; with none covered the first stands in. `None` without candidates.
+pub fn judged_tab_url(rules: &[SiteRule], candidates: &[String]) -> Option<String> {
+    let canonical: Vec<String> = candidates.iter().map(|u| canonical_url(u)).collect();
+    canonical
+        .iter()
+        .find(|u| {
+            rules
+                .iter()
+                .any(|r| r.urls.iter().any(|p| glob_match(p, u)))
+        })
+        .or_else(|| canonical.first())
+        .cloned()
+}
+
 /// Load the `installed`-scope rules every installed pack contributes.
 ///
 /// Only `installed` scope is read here. An `active` rule belongs to a pack the
@@ -426,6 +445,54 @@ mod tests {
             ask: vec!["browser_get_content".into()],
             message: "no automation on banking sites".into(),
         }
+    }
+
+    fn local_ask_rule() -> SiteRule {
+        SiteRule {
+            pack: "m3-smoke-ask".into(),
+            urls: vec!["http://127.0.0.1:8765/*".into()],
+            deny: vec![],
+            ask: vec!["browser_click*".into(), "browser_fill*".into()],
+            message: "confirm first".into(),
+        }
+    }
+
+    #[test]
+    fn a_click_is_judged_on_the_tab_url_the_daemon_resolved() {
+        // Smoke 2026-10-20: the native loop sends `tab_url: None`, so a click
+        // on a page a rule covers ran without the question.
+        let s = SitePolicyStage::new(vec![local_ask_rule()]);
+        let click = call_with(
+            "browser_click_by_id",
+            serde_json::json!({"tab_id": 7, "id": "go"}),
+        );
+        assert!(matches!(s.check(&click, &ctx(None)), Verdict::Allow));
+        let url = judged_tab_url(&[local_ask_rule()], &["http://127.0.0.1:8765/".into()]);
+        assert_eq!(url.as_deref(), Some("http://127.0.0.1:8765/"));
+        assert!(matches!(
+            s.check(&click, &ctx(url.as_deref())),
+            Verdict::Ask { .. }
+        ));
+    }
+
+    #[test]
+    fn of_several_active_tabs_the_one_a_rule_covers_is_judged() {
+        let rules = [local_ask_rule()];
+        let tabs: Vec<String> = vec![
+            "https://example.com/".into(),
+            "http://127.0.0.1:8765/form#top".into(),
+        ];
+        // Canonical form: the fragment goes, as for every judged URL.
+        assert_eq!(
+            judged_tab_url(&rules, &tabs).as_deref(),
+            Some("http://127.0.0.1:8765/form")
+        );
+        let elsewhere: Vec<String> = vec!["https://a.example/".into(), "https://b.example/".into()];
+        assert_eq!(
+            judged_tab_url(&rules, &elsewhere).as_deref(),
+            Some("https://a.example/")
+        );
+        assert_eq!(judged_tab_url(&rules, &[]), None);
     }
 
     #[test]
