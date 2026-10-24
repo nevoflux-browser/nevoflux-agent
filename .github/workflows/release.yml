@@ -78,10 +78,12 @@ jobs:
                       real = os.path.realpath(fpath)
                       os.remove(fpath)
                       shutil.copy2(real, fpath)
-          blobs = os.path.join(model_dir, 'blobs')
-          if os.path.isdir(blobs):
-              shutil.rmtree(blobs)
-              print(f'Removed {blobs}, kept resolved files in snapshots/')
+          # Older huggingface_hub keeps blobs/ per model; newer ones share a
+          # sharded blobs/ store at the cache root. Drop both.
+          for blobs in (os.path.join(model_dir, 'blobs'), os.path.join(cache_dir, 'blobs')):
+              if os.path.isdir(blobs):
+                  shutil.rmtree(blobs)
+                  print(f'Removed {blobs}, kept resolved files in snapshots/')
           "
 
       - name: Upload model artifact
