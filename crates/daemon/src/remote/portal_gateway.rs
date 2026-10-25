@@ -1300,7 +1300,21 @@ impl PortalGateway {
         match routed {
             Inbound::Upload(frame) => self.apply_upload(&frame).await,
             Inbound::AssetPull(frame) => self.apply_asset_pull(&frame).await,
-            Inbound::Uplink(payload) => {
+            Inbound::Speech(payload) => {
+                injector.inject_as(&self.voice_identity(), payload).await
+            }
+            Inbound::Uplink(mut payload) => {
+                // A device that asked for a spoken answer gets it addressed to
+                // this gateway — not to the sidebar, which would otherwise be
+                // the one playing it (see `voice_reply_to` in server.rs).
+                if let Some(p) = payload.get_mut("payload").and_then(|p| p.as_object_mut()) {
+                    if p.remove("voice_reply").and_then(|v| v.as_bool()) == Some(true) {
+                        p.insert(
+                            "voice_reply_to".into(),
+                            serde_json::Value::String(self.voice_identity()),
+                        );
+                    }
+                }
                 // Remember what we asked, so the reply can be recognised as
                 // ours when it comes back without a session id.
                 if payload.get("type").and_then(|v| v.as_str()) == Some("system_command") {
@@ -1318,6 +1332,16 @@ impl PortalGateway {
             Inbound::RtcSignal(frame) => self.apply_rtc_signal(&frame).await,
             Inbound::Ignore => {}
         }
+    }
+
+    /// The identity this gateway's voice frames are injected under, and that
+    /// the daemon addresses their answers to.
+    ///
+    /// Nothing writes to it locally — there is no sidebar connection by that
+    /// name — so the answers reach this gateway through the M2 tap and nowhere
+    /// else.
+    pub fn voice_identity(&self) -> String {
+        format!("remote:{}", self.id)
     }
 
     /// True if this envelope is the reply to a system command this gateway
@@ -1457,6 +1481,23 @@ impl RemoteGateway for PortalGateway {
                 .get("payload")
                 .and_then(|p| p.get("session_id"))
                 .and_then(|s| s.as_str());
+            // A transcript or a spoken answer belongs to the one device that
+            // spoke, not to every screen showing the conversation: a phone on
+            // the same session must not be sent a pendant's audio, and the
+            // relay bills each copy.
+            if let Some(frame) = super::translate::speech_downlink(&env.payload) {
+                if env.proxy_id != self.voice_identity() {
+                    return;
+                }
+                let slot = self.binding.read().await;
+                let Some(b) = slot.as_ref() else { return };
+                // Live only: a sentence of audio replayed after a reconnect
+                // would be heard twice, and at ~200 KB apiece these would push
+                // the whole transcript out of the resume buffer.
+                let wire = b.session.lock().await.downlink_signal(frame);
+                self.sink.send(wire).await;
+                return;
+            }
             if sid != Some(bound.as_str())
                 && !self.is_our_reply(env).await
                 && !is_user_notification(env)
@@ -2417,11 +2458,18 @@ mod tests {
     #[derive(Default)]
     struct CollectInjector {
         injected: Mutex<Vec<serde_json::Value>>,
+        injected_as: Mutex<Vec<(String, serde_json::Value)>>,
     }
     #[async_trait]
     impl Injector for CollectInjector {
         async fn inject(&self, payload: serde_json::Value) {
             self.injected.lock().await.push(payload);
+        }
+        async fn inject_as(&self, proxy_id: &str, payload: serde_json::Value) {
+            self.injected_as
+                .lock()
+                .await
+                .push((proxy_id.to_string(), payload));
         }
     }
 
@@ -2447,6 +2495,82 @@ mod tests {
         let injected = inj.injected.lock().await;
         assert_eq!(injected.len(), 1);
         assert_eq!(injected[0]["type"], "chat_message");
+    }
+
+    #[tokio::test]
+    async fn a_device_speaking_is_injected_under_the_gateways_own_identity() {
+        let gw = Arc::new(PortalGateway::new(
+            None,
+            Arc::new(CollectSink::default()),
+            "sess",
+            None,
+            None,
+            "chan",
+        ));
+        let inj = CollectInjector::default();
+        gw.on_wire_in(
+            frame_wire(serde_json::json!({
+                "kind": "speech_chunk", "utterance_id": "u1", "seq": 0, "pcm": "AAA="
+            })),
+            &inj,
+        )
+        .await;
+        assert!(inj.injected.lock().await.is_empty(), "not as the sidebar");
+        let got = inj.injected_as.lock().await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, "remote:portal:chan");
+        assert_eq!(got[0].1["type"], "speech_chunk");
+        assert_eq!(got[0].1["payload"]["session_id"], "sess");
+    }
+
+    #[tokio::test]
+    async fn asking_for_a_spoken_answer_names_this_gateway_as_the_listener() {
+        let gw = Arc::new(PortalGateway::new(
+            None,
+            Arc::new(CollectSink::default()),
+            "sess",
+            None,
+            None,
+            "chan",
+        ));
+        let inj = CollectInjector::default();
+        gw.on_wire_in(
+            frame_wire(serde_json::json!({ "kind": "user_message", "text": "hi", "voice": true })),
+            &inj,
+        )
+        .await;
+        let injected = inj.injected.lock().await;
+        assert_eq!(injected.len(), 1);
+        assert_eq!(injected[0]["payload"]["voice_reply_to"], "remote:portal:chan");
+        assert!(injected[0]["payload"].get("voice_reply").is_none());
+    }
+
+    #[tokio::test]
+    async fn spoken_answers_reach_only_the_gateway_they_are_addressed_to() {
+        let sink = Arc::new(CollectSink::default());
+        let gw = PortalGateway::new(None, sink.clone(), "sess", None, None, "chan");
+        let voice = |proxy: &str| {
+            OutboundEvent::Chat(DaemonEnvelope::new(
+                proxy,
+                Channel::Chat,
+                serde_json::json!({
+                    "type": "voice_audio",
+                    "payload": {"session_id": "sess", "turn_id": "t", "seq": 0,
+                                "sample_rate": 24000, "wav": "AAA="}
+                }),
+            ))
+        };
+        // The sidebar's own voice turn, on the same session: not this device's.
+        gw.project(&voice("local-proxy")).await;
+        assert!(sink.sent.lock().await.is_empty());
+        gw.project(&voice("remote:portal:chan")).await;
+        let sent = sink.sent.lock().await;
+        assert_eq!(sent.len(), 1);
+        let Wire::Text(t) = &sent[0] else {
+            panic!("a plaintext gateway sends text")
+        };
+        assert!(t.contains("\"kind\":\"voice_audio\""), "got {t}");
+        assert!(!t.contains("session_id"), "got {t}");
     }
 
     #[tokio::test]

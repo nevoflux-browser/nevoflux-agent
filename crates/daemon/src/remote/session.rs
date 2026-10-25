@@ -52,6 +52,11 @@ pub enum Inbound {
     /// that it is *dropped* rather than handed to the chat translator, which
     /// would read an SDP as something the user typed.
     RtcSignal(Value),
+    /// A voice frame (`speech_*`, `voice_barge_in`) as the `{type, payload}`
+    /// the daemon reads. Separate from [`Inbound::Uplink`] because the gateway
+    /// injects it under its own identity rather than the local sidebar's, so
+    /// the transcript and the spoken answer come back to the device.
+    Speech(Value),
     /// Nothing to do (unknown frame, decode failure, or a downlink-only variant).
     Ignore,
 }
@@ -248,6 +253,12 @@ impl PortalSession {
                 // typed, and an SDP injected into the conversation is a
                 // spectacular way to fail.
                 Some(k) if super::rtc::is_signal_kind(k) => Inbound::RtcSignal(frame),
+                Some(k) if translate::SPEECH_UPLINK_KINDS.contains(&k) => {
+                    match translate::speech_uplink(&frame, session_id) {
+                        Some(v) => Inbound::Speech(v),
+                        None => Inbound::Ignore,
+                    }
+                }
                 _ => match translate::uplink(
                     &frame,
                     session_id,

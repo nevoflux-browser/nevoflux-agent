@@ -263,6 +263,7 @@ tempfile = "3"
 # past PAGE_IDLE_TIMEOUT. The codecs we enable cover what
 # canvas_attach_asset is likely to receive over HTTP / data_b64.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+mdns-sd = "0.21.6"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["signal", "process"] }

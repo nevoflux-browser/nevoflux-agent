@@ -2263,6 +2263,10 @@ pub async fn start_server(
                         map.remove(&proxy_id);
                     }
                 }
+            } else if proxy_id.starts_with("remote:") {
+                // A remote gateway's identity: the M2 tap above already carried
+                // it to the device, and there is no local connection by that name.
+                debug!("remote-addressed frame {} delivered via tap only", msg_type);
             } else {
                 warn!("No writer for proxy {}, dropping message", proxy_id);
             }
@@ -3238,6 +3242,7 @@ pub async fn start_server(
                                 // utterance, so nothing process-level has to know
                                 // which connection a transcript belongs to.
                                 let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
+                                let sid_for_errors = session_id.clone();
                                 let tx = process_response_tx.clone();
                                 let ident = identity.clone();
                                 let pid = proxy_id.clone();
@@ -3258,6 +3263,8 @@ pub async fn start_server(
                                             } => (
                                                 "speech_error",
                                                 serde_json::json!({
+                                                    // 远程网关按 session 过滤,没有它这条错误到不了吊坠。
+                                                    "session_id": sid_for_errors,
                                                     "utterance_id": utterance_id,
                                                     "message": message,
                                                 }),
@@ -7018,8 +7025,18 @@ async fn handle_chat_message_streaming(
     // 两个条件,不是一个:麦克风开着(voice_mode)**而且**用户要求把回答念出来。
     // 从前只看前者,于是「我想说话给它听」和「我想听它说」被绑成一个决定,开麦
     // 就一定出声。默认不念 —— 出声是打扰,没要求过就不该发生。
-    let voice_on = crate::speech::conversation().voice_mode(&session_id).await
-        && crate::tts::moss::speak_replies(&services.database);
+    //
+    // 第三种:远程设备(吊坠)说完话发来的这一轮,自带 `voice_reply_to` —— 它
+    // 本身就是「念给我听」的请求,听众也写明了是那个网关,不是侧栏。
+    let voice_reply_to: Option<String> = payload
+        .get("payload")
+        .and_then(|p| p.get("voice_reply_to"))
+        .and_then(|v| v.as_str())
+        .filter(|s| s.starts_with("remote:"))
+        .map(str::to_string);
+    let voice_on = voice_reply_to.is_some()
+        || (crate::speech::conversation().voice_mode(&session_id).await
+            && crate::tts::moss::speak_replies(&services.database));
 
     // 用户对 GPU 的表态,在引擎建起来之前告诉后端选择那一层。放在这里是因为
     // 探测发生在第一次真的要说话的时刻,而那就在下面几行。
@@ -7239,10 +7256,14 @@ async fn handle_chat_message_streaming(
                 let turn_id = format!("vt_{}", uuid::Uuid::new_v4());
                 let sid = session_id.clone();
 
-                // 出口:VoiceOut → envelope。听众是这条连接,显式传入(ADR-0001)。
+                // 出口:VoiceOut → envelope。听众是这条连接,显式传入(ADR-0001);
+                // 远程设备要的回答,听众是它的网关。
                 let tx = response_tx.clone();
-                let ident = identity.clone();
-                let pid = proxy_id.clone();
+                let ident = voice_reply_to
+                    .as_ref()
+                    .map(|r| r.as_bytes().to_vec())
+                    .unwrap_or_else(|| identity.clone());
+                let pid = voice_reply_to.clone().unwrap_or_else(|| proxy_id.clone());
                 let ch = channel;
                 tokio::spawn(async move {
                     while let Some(out) = vrx.recv().await {

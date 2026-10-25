@@ -15,6 +15,17 @@ use nevoflux_protocol::{Channel, ProxyEnvelope};
 #[async_trait]
 pub trait Injector: Send + Sync {
     async fn inject(&self, payload: serde_json::Value);
+
+    /// Inject under another connection's identity, so whatever the daemon
+    /// answers is addressed there instead of to the local sidebar.
+    ///
+    /// For a device's voice frames: the M2 tap still fans the answers out, and
+    /// the gateway picks out the ones addressed to it, while the sidebar —
+    /// which has no writer under that identity — never sees them.
+    async fn inject_as(&self, proxy_id: &str, payload: serde_json::Value) {
+        let _ = proxy_id;
+        self.inject(payload).await
+    }
 }
 
 /// The live injector: forwards into the daemon's message channel using the
@@ -49,6 +60,18 @@ impl Injector for ChannelInjector {
         // The daemon side owns backpressure/lifecycle; a closed channel means
         // the daemon is shutting down — dropping the message is correct then.
         let _ = self.msg_tx.send((identity, envelope)).await;
+    }
+    async fn inject_as(&self, proxy_id: &str, payload: serde_json::Value) {
+        let envelope = ProxyEnvelope::new(
+            proxy_id.to_string(),
+            uuid::Uuid::new_v4().to_string(),
+            Channel::Chat,
+            payload,
+        );
+        let _ = self
+            .msg_tx
+            .send((proxy_id.as_bytes().to_vec(), envelope))
+            .await;
     }
 }
 

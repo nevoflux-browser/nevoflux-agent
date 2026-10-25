@@ -35,12 +35,65 @@ type WsRead = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 /// them, and the portal's `resume{from}` after it reconnects triggers a resend.
 pub struct WsSink {
     write: Mutex<Option<WsWrite>>,
+    /// A device attached over the LAN (`super::lan`). While it is there,
+    /// frames go to it instead of the relay. Tagged with a connection number
+    /// so a socket that is replaced cannot clear its successor on the way out.
+    lan: std::sync::Mutex<Option<(u64, tokio::sync::mpsc::Sender<Message>)>>,
+    lan_next: std::sync::atomic::AtomicU64,
 }
 
 impl WsSink {
     pub fn new() -> Self {
         Self {
             write: Mutex::new(None),
+            lan: std::sync::Mutex::new(None),
+            lan_next: std::sync::atomic::AtomicU64::new(1),
+        }
+    }
+
+    /// Route this channel's frames to a LAN socket. Returns its number.
+    pub fn set_lan(&self, tx: tokio::sync::mpsc::Sender<Message>) -> u64 {
+        let n = self
+            .lan_next
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *self.lan.lock().expect("lan slot") = Some((n, tx));
+        n
+    }
+
+    /// Detach LAN socket `n`, if it is still the one attached.
+    pub fn clear_lan(&self, n: u64) {
+        let mut slot = self.lan.lock().expect("lan slot");
+        if slot.as_ref().map(|(m, _)| *m) == Some(n) {
+            *slot = None;
+        }
+    }
+
+    /// Detach whatever LAN socket is attached.
+    pub fn clear_lan_any(&self) {
+        *self.lan.lock().expect("lan slot") = None;
+    }
+
+    /// Whether a LAN peer is carrying this channel right now.
+    pub fn has_lan(&self) -> bool {
+        self.lan.lock().expect("lan slot").is_some()
+    }
+
+    /// Hand `msg` to the LAN socket. `Err` gives it back when there is none,
+    /// or when the one there cannot take it (it is detached then: a device too
+    /// slow to drain 256 frames is as good as gone, and the relay may still
+    /// reach it).
+    fn try_lan(&self, msg: Message) -> Result<(), Message> {
+        let mut slot = self.lan.lock().expect("lan slot");
+        let Some((_, tx)) = slot.as_ref() else {
+            return Err(msg);
+        };
+        match tx.try_send(msg) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                tracing::warn!(target: "remote", "WsSink: LAN peer stalled; falling back to the relay");
+                *slot = None;
+                Err(e.into_inner())
+            }
         }
     }
     async fn set(&self, w: WsWrite) {
@@ -82,11 +135,14 @@ impl Default for WsSink {
 #[async_trait]
 impl WireSink for WsSink {
     async fn is_connected(&self) -> bool {
-        self.write.lock().await.is_some()
+        self.has_lan() || self.write.lock().await.is_some()
     }
 
     async fn send(&self, wire: Wire) {
-        let msg = wire_to_message(wire);
+        let msg = match self.try_lan(wire_to_message(wire)) {
+            Ok(()) => return,
+            Err(msg) => msg,
+        };
         let mut guard = self.write.lock().await;
         match guard.as_mut() {
             Some(w) => {
@@ -316,6 +372,15 @@ pub async fn run_gateway(
     cancel: CancellationToken,
 ) {
     let gateway_id = super::gateway::RemoteGateway::id(gateway.as_ref()).to_string();
+    super::lan::register(
+        channel_id,
+        Arc::new(super::lan::DataEndpoint {
+            sink: sink.clone(),
+            gateway: gateway.clone(),
+            injector: injector.clone(),
+            registry: registry.clone(),
+        }),
+    );
 
     let dial = async {
         let mut policy = ReconnectPolicy::new();
@@ -324,7 +389,7 @@ pub async fn run_gateway(
         loop {
             // Re-mint per attempt; a cached JWT expires after 15 minutes.
             let Some(token) = next_jwt(&account_base, &tokens, &mut waiting, "relay").await else {
-                back_off(&mut policy, &registry, &gateway_id).await;
+                back_off(&mut policy, &registry, &gateway_id, sink.has_lan()).await;
                 continue;
             };
             // channel_id (alphanumeric+dash) and the JWT (base64url + dots) are URL-safe.
@@ -365,12 +430,12 @@ pub async fn run_gateway(
                             lasted_ms = lasted.as_millis() as u64,
                             "the relay took this socket and dropped it; backing off"
                         );
-                        back_off(&mut policy, &registry, &gateway_id).await;
+                        back_off(&mut policy, &registry, &gateway_id, sink.has_lan()).await;
                     }
                 }
                 Err(e) => {
                     tracing::warn!(target: "remote", "relay connect failed: {e}");
-                    back_off(&mut policy, &registry, &gateway_id).await;
+                    back_off(&mut policy, &registry, &gateway_id, sink.has_lan()).await;
                 }
             }
         }
@@ -389,6 +454,7 @@ pub async fn run_gateway(
     // However this ended, the gateway has to stop receiving. The M2 tap fans
     // every chat frame to whatever is registered, and this one can no longer
     // carry any of them.
+    super::lan::unregister(channel_id);
     sink.clear().await;
     registry.lock().await.unregister(&gateway_id);
 }
@@ -474,6 +540,14 @@ pub async fn run_control_socket(
     on_command: Arc<dyn ControlCommandSink>,
     cancel: CancellationToken,
 ) {
+    super::lan::register(
+        channel_id,
+        Arc::new(super::lan::ControlEndpoint {
+            sink: sink.clone(),
+            gateway: gateway.clone(),
+            on_command: on_command.clone(),
+        }),
+    );
     let dial = async {
         let mut policy = ReconnectPolicy::new();
         // Logged once per outage, not once per attempt.
@@ -522,6 +596,7 @@ pub async fn run_control_socket(
         }
         _ = dial => {}
     }
+    super::lan::unregister(channel_id);
     sink.clear().await;
 }
 
@@ -847,9 +922,12 @@ async fn back_off(
     policy: &mut ReconnectPolicy,
     registry: &Arc<tokio::sync::Mutex<super::gateway::GatewayRegistry>>,
     gateway_id: &str,
+    lan_up: bool,
 ) {
     let step = policy.on_failure();
-    if step.detach {
+    // A device on the LAN is still being served through this gateway; taking
+    // it out of the registry would silence it because the internet is down.
+    if step.detach && !lan_up {
         tracing::warn!(
             target: "remote",
             "relay unreachable; detaching {gateway_id} from the registry until it is back"

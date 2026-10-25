@@ -82,6 +82,11 @@ impl GatewayRegistry {
         self.gateways.push(gateway);
     }
 
+    /// Whether a gateway with this id is registered.
+    pub fn contains(&self, id: &str) -> bool {
+        self.gateways.iter().any(|g| g.id() == id)
+    }
+
     /// Remove a gateway by id. Gateways whose transport has died must be taken
     /// out, or the M2 tap keeps fanning every chat frame into a dead socket.
     pub fn unregister(&mut self, id: &str) -> bool {

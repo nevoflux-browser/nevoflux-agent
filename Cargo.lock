@@ -2608,9 +2608,9 @@ dependencies = [
 
 [[package]]
 name = "fastrand"
-version = "2.3.0"
+version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
+checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "fd-lock"
@@ -2709,6 +2709,17 @@ dependencies = [
  "num-traits",
  "rand 0.9.2",
  "rand_distr",
+]
+
+[[package]]
+name = "flume"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e139bc46ca777eb5efaf62df0ab8cc5fd400866427e56c68b22e414e53bd3be"
+dependencies = [
+ "futures-core",
+ "futures-sink",
+ "spin",
 ]
 
 [[package]]
@@ -3821,6 +3832,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "if-addrs"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0a05c691e1fae256cf7013d99dad472dc52d5543322761f83ec8d47eab40d2b"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "if_chain"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4506,6 +4527,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "490cc448043f947bae3cbee9c203358d62dbee0db12107a74be5c30ccfd09771"
 
 [[package]]
+name = "mdns-sd"
+version = "0.21.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8562654710f72a9cbce4b0d5b7c366a2f94330ba1ce3740f15e932ea2d37b161"
+dependencies = [
+ "fastrand",
+ "flume",
+ "if-addrs",
+ "log",
+ "mio 1.2.2",
+ "socket-pktinfo",
+ "socket2",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4590,6 +4626,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "30d65c71f1ce40ab09135ce117d742b9f8a19ff91a41a8b57ed50bc2de59c427"
 dependencies = [
  "libc",
+ "log",
  "wasi",
  "windows-sys 0.61.2",
 ]
@@ -4913,6 +4950,7 @@ dependencies = [
  "ignore",
  "image",
  "libc",
+ "mdns-sd",
  "monty",
  "monty-types",
  "nevoflux-a2a",
@@ -7612,6 +7650,7 @@ checksum = "b2aa850e253778c88a04c3d7323b043aeda9d3e30d5971937c1855769763678e"
 [[package]]
 name = "skiff"
 version = "0.1.0"
+source = "git+https://github.com/nevoflux-browser/nevoflux-skiff.git?tag=v0.1.0#cd7923706fadfa3d37ea9c44401fe37facadc2ad"
 dependencies = [
  "flate2",
  "skiff-core",
@@ -7625,6 +7664,7 @@ dependencies = [
 [[package]]
 name = "skiff-core"
 version = "0.1.0"
+source = "git+https://github.com/nevoflux-browser/nevoflux-skiff.git?tag=v0.1.0#cd7923706fadfa3d37ea9c44401fe37facadc2ad"
 dependencies = [
  "cssparser",
  "flate2",
@@ -7639,6 +7679,7 @@ dependencies = [
 [[package]]
 name = "skiff-js"
 version = "0.1.0"
+source = "git+https://github.com/nevoflux-browser/nevoflux-skiff.git?tag=v0.1.0#cd7923706fadfa3d37ea9c44401fe37facadc2ad"
 dependencies = [
  "deno_core",
  "deno_error",
@@ -7651,6 +7692,7 @@ dependencies = [
 [[package]]
 name = "skiff-layout"
 version = "0.1.0"
+source = "git+https://github.com/nevoflux-browser/nevoflux-skiff.git?tag=v0.1.0#cd7923706fadfa3d37ea9c44401fe37facadc2ad"
 dependencies = [
  "markup5ever_rcdom",
  "skiff-core",
@@ -7660,6 +7702,7 @@ dependencies = [
 [[package]]
 name = "skiff-net"
 version = "0.1.0"
+source = "git+https://github.com/nevoflux-browser/nevoflux-skiff.git?tag=v0.1.0#cd7923706fadfa3d37ea9c44401fe37facadc2ad"
 dependencies = [
  "reqwest 0.12.28",
  "skiff-core",
@@ -7669,6 +7712,7 @@ dependencies = [
 [[package]]
 name = "skiff-paint"
 version = "0.1.0"
+source = "git+https://github.com/nevoflux-browser/nevoflux-skiff.git?tag=v0.1.0#cd7923706fadfa3d37ea9c44401fe37facadc2ad"
 dependencies = [
  "jpeg-decoder",
  "png 0.17.16",
@@ -7716,6 +7760,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "socket-pktinfo"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "612942246d0cc239cfd83af1dfd39be47f649208a3524e5e9da651910128e0ac"
+dependencies = [
+ "libc",
+ "socket2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

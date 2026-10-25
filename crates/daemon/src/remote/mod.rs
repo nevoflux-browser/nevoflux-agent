@@ -23,6 +23,7 @@ pub mod gateway;
 pub mod history;
 pub mod identity;
 pub mod inject;
+pub mod lan;
 pub mod local_media;
 pub mod mcp_gateway;
 pub mod mcp_server;

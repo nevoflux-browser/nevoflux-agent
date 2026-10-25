@@ -1012,6 +1012,14 @@ pub fn uplink(
                     );
                 }
             }
+            // A device that speaks (the pendant) wants the answer spoken back
+            // to *it*. Only the flag rides from here: who "it" is, is the
+            // gateway's to say, and it swaps this for its own identity.
+            if frame.get("voice").and_then(Value::as_bool) == Some(true) {
+                if let Some(p) = v.get_mut("payload").and_then(|p| p.as_object_mut()) {
+                    p.insert("voice_reply".into(), Value::Bool(true));
+                }
+            }
             Some(v)
         }
         // The permission dialog is a `browser_tool_request`/`browser_tool_response`
@@ -1087,6 +1095,119 @@ pub fn uplink(
             }))
         }
         _ => None,
+    }
+}
+
+/// Voice frames a device sends up, under the names `server.rs` already handles
+/// for the local sidebar (`crates/protocol/src/speech.rs`).
+///
+/// Kept out of [`uplink`] because they must not be injected as the local
+/// sidebar: the replies (`speech_final`, `voice_audio`) go back to whoever sent
+/// them, and the sidebar answering a pendant's `speech_final` with its own
+/// auto-submit would put every utterance into the conversation twice.
+pub const SPEECH_UPLINK_KINDS: [&str; 5] = [
+    "speech_start",
+    "speech_chunk",
+    "speech_end",
+    "speech_cancel",
+    "voice_barge_in",
+];
+
+/// The speech/voice replies a device that spoke is sent back.
+pub const SPEECH_DOWNLINK_TYPES: [&str; 6] = [
+    "speech_partial",
+    "speech_final",
+    "speech_error",
+    "voice_audio",
+    "voice_done",
+    "voice_failed",
+];
+
+/// One uplink voice frame as the `{type, payload}` the daemon reads, or `None`
+/// if it is not one (or lacks the id every one of them is checked against).
+///
+/// The session is the gateway's, never the frame's: a device speaks into the
+/// conversation it is attached to, the same rule `user_message` follows.
+pub fn speech_uplink(frame: &Value, session_id: &str) -> Option<Value> {
+    let kind = frame.get("kind")?.as_str()?;
+    if !SPEECH_UPLINK_KINDS.contains(&kind) {
+        return None;
+    }
+    let id_field = if kind == "voice_barge_in" {
+        "turn_id"
+    } else {
+        "utterance_id"
+    };
+    frame.get(id_field)?.as_str()?;
+    let mut body = frame.as_object()?.clone();
+    body.remove("kind");
+    body.insert("session_id".into(), Value::String(session_id.to_string()));
+    Some(json!({ "type": kind, "payload": Value::Object(body) }))
+}
+
+/// A daemon speech/voice payload as the device's frame: the same fields, with
+/// `kind` for `type` and without the session id the device never chose.
+pub fn speech_downlink(payload: &Value) -> Option<Value> {
+    let kind = payload.get("type")?.as_str()?;
+    if !SPEECH_DOWNLINK_TYPES.contains(&kind) {
+        return None;
+    }
+    let mut body = payload
+        .get("payload")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    body.remove("session_id");
+    body.insert("kind".into(), Value::String(kind.to_string()));
+    Some(Value::Object(body))
+}
+
+#[cfg(test)]
+mod speech_tests {
+    use super::*;
+
+    #[test]
+    fn a_chunk_goes_up_under_the_gateways_session() {
+        let v = speech_uplink(
+            &json!({"kind": "speech_chunk", "session_id": "spoofed", "utterance_id": "u1",
+                    "seq": 2, "pcm": "AAA="}),
+            "s1",
+        )
+        .unwrap();
+        assert_eq!(v["type"], "speech_chunk");
+        assert_eq!(v["payload"]["session_id"], "s1");
+        assert_eq!(v["payload"]["utterance_id"], "u1");
+        assert_eq!(v["payload"]["seq"], 2);
+        assert_eq!(v["payload"]["pcm"], "AAA=");
+        assert!(v["payload"].get("kind").is_none());
+    }
+
+    #[test]
+    fn a_voice_frame_without_its_id_is_refused() {
+        assert!(speech_uplink(&json!({"kind": "speech_start", "sample_rate": 16000}), "s").is_none());
+        assert!(speech_uplink(&json!({"kind": "voice_barge_in", "played": 1}), "s").is_none());
+        assert!(speech_uplink(&json!({"kind": "user_message", "text": "hi"}), "s").is_none());
+    }
+
+    #[test]
+    fn a_final_comes_down_as_a_frame_without_the_session() {
+        let f = speech_downlink(&json!({"type": "speech_final", "payload": {
+            "session_id": "s1", "utterance_id": "u1", "text": "你好", "accepted": true}}))
+        .unwrap();
+        assert_eq!(f["kind"], "speech_final");
+        assert_eq!(f["text"], "你好");
+        assert!(f.get("session_id").is_none());
+        assert!(speech_downlink(&json!({"type": "stream_chunk", "payload": {}})).is_none());
+    }
+
+    #[test]
+    fn asking_for_a_spoken_answer_is_carried_as_a_flag() {
+        let frame = json!({"kind": "user_message", "text": "hi", "voice": true});
+        let v = uplink(&frame, "s", "m", None, &[]).unwrap();
+        assert_eq!(v["payload"]["voice_reply"], true);
+        let plain = json!({"kind": "user_message", "text": "hi"});
+        let v = uplink(&plain, "s", "m", None, &[]).unwrap();
+        assert!(v["payload"].get("voice_reply").is_none());
     }
 }
 
