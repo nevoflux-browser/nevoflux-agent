@@ -349,6 +349,11 @@ impl LanEndpoint for ControlEndpoint {
         &self.sink
     }
     async fn deliver(&self, wire: Wire) {
+        // The only plaintext the listener hands over is its own arrival notice,
+        // and a LAN peer is a new socket that has not been sent the list.
+        if matches!(wire, Wire::Text(_)) {
+            self.gateway.forget_audience();
+        }
         if let Some(cmd) = self.gateway.on_wire_in(&wire).await {
             self.on_command.handle(cmd).await;
         }

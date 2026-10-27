@@ -571,6 +571,7 @@ pub async fn run_control_socket(
                     // would reach whoever happens to be attached this instant
                     // and no one else. The presence notice is what says there
                     // is an audience, and `on_wire_in` answers it.
+                    gateway.forget_audience();
                     let up = Instant::now();
                     serve_control(read, &sink, &gateway, on_command.as_ref()).await;
                     sink.clear().await;

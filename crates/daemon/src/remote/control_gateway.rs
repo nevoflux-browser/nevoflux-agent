@@ -21,6 +21,7 @@
 //!   only the latest value and wakes on genuine change, which is the same
 //!   semantics the snapshot model already wanted.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -66,6 +67,12 @@ pub struct ControlGateway {
     vapid_public: Option<String>,
     /// The channel conversations arrive on for this pairing.
     data_channel_id: Option<String>,
+    /// How many others the last presence notice counted on this socket.
+    ///
+    /// A list is owed to somebody new, not to every notice: the relay can say
+    /// the same count again with nobody having arrived, and answering each one
+    /// is a message that can provoke the next.
+    audience: AtomicU64,
 }
 
 impl ControlGateway {
@@ -85,6 +92,7 @@ impl ControlGateway {
             sessions,
             vapid_public: None,
             data_channel_id: None,
+            audience: AtomicU64::new(0),
         }
     }
 
@@ -124,6 +132,11 @@ impl ControlGateway {
             self.sessions.by_ids(&missing).await
         };
         session_list::build(page, extra, &snapshot)
+    }
+
+    /// A new socket is carrying this channel: nobody on it has the list yet.
+    pub fn forget_audience(&self) {
+        self.audience.store(0, Ordering::Relaxed);
     }
 
     /// Put the current list on the wire.
@@ -212,7 +225,10 @@ impl ControlGateway {
                     peers = n,
                     "control channel presence"
                 );
-                if n > 0 {
+                // Only a count larger than the last one means someone arrived
+                // who has not been sent the list.
+                let before = self.audience.swap(n, Ordering::Relaxed);
+                if n > before {
                     self.sync().await;
                 }
                 return None;
@@ -632,6 +648,48 @@ mod tests {
             None
         );
         assert_eq!(sink.frames().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_same_audience_announced_again_is_not_answered_again() {
+        // The relay re-announced an unchanged roster on every message it
+        // relayed, and the list sent in answer was itself a message: the two
+        // ends drove each other at round-trip speed while a portal was open.
+        let (gw, sink, _) = build(vec![stored("s1", 1)]);
+        let peers = |n: u32| Wire::Text(format!(r#"{{"k":"peers","n":{n}}}"#));
+        gw.on_wire_in(&peers(1)).await;
+        gw.on_wire_in(&peers(1)).await;
+        gw.on_wire_in(&peers(1)).await;
+        assert_eq!(sink.frames().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn only_a_larger_audience_is_somebody_new() {
+        let (gw, sink, _) = build(vec![stored("s1", 1)]);
+        let peers = |n: u32| Wire::Text(format!(r#"{{"k":"peers","n":{n}}}"#));
+        gw.on_wire_in(&peers(1)).await;
+        // A second device joined: it has not seen the list.
+        gw.on_wire_in(&peers(2)).await;
+        assert_eq!(sink.frames().len(), 2);
+        // One left: whoever stayed already has it.
+        gw.on_wire_in(&peers(1)).await;
+        assert_eq!(sink.frames().len(), 2);
+        // Everyone left and somebody came back.
+        gw.on_wire_in(&peers(0)).await;
+        gw.on_wire_in(&peers(1)).await;
+        assert_eq!(sink.frames().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_new_socket_starts_with_nobody_known() {
+        // The head's own reconnect, or a LAN peer taking over the sink: the
+        // count it hears next describes a channel nobody has sent this list to.
+        let (gw, sink, _) = build(vec![stored("s1", 1)]);
+        let peers = Wire::Text(r#"{"k":"peers","n":1}"#.into());
+        gw.on_wire_in(&peers).await;
+        gw.forget_audience();
+        gw.on_wire_in(&peers).await;
+        assert_eq!(sink.frames().len(), 2);
     }
 
     #[tokio::test]
