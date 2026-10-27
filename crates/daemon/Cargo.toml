@@ -264,6 +264,9 @@ tempfile = "3"
 # canvas_attach_asset is likely to receive over HTTP / data_b64.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 mdns-sd = "0.21.6"
+# Opus encoder for a remote device's spoken replies; libopus 1.3.1 transpiled to Rust
+# (no C toolchain on any platform).
+unsafe-libopus = "0.2.0"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["signal", "process"] }

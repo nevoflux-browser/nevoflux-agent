@@ -46,5 +46,6 @@ pub mod task;
 pub mod translate;
 pub mod turn_creds;
 pub mod upload;
+pub mod voice_codec;
 pub mod web_push;
 pub mod ws;

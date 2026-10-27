@@ -1018,6 +1018,11 @@ pub fn uplink(
             if frame.get("voice").and_then(Value::as_bool) == Some(true) {
                 if let Some(p) = v.get_mut("payload").and_then(|p| p.as_object_mut()) {
                     p.insert("voice_reply".into(), Value::Bool(true));
+                    // …and may say it would rather have it as Opus than WAV
+                    // (see `voice_codec.rs`); the gateway keeps that, too.
+                    if frame.get("voice_codec").and_then(Value::as_str) == Some("opus") {
+                        p.insert("voice_codec".into(), Value::String("opus".into()));
+                    }
                 }
             }
             Some(v)

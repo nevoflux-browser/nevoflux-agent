@@ -94,6 +94,10 @@ pub struct PortalGateway {
     /// those frames again, and the phone shows an empty conversation under a log
     /// line that says the transcript was replayed.
     sent_to_an_empty_channel: std::sync::atomic::AtomicBool,
+    /// The far end decodes Opus, so its spoken replies are re-encoded from WAV
+    /// (`voice_codec.rs`). Said on its `user_message`; a device that never says
+    /// it gets the WAV the synthesiser made.
+    voice_opus: std::sync::atomic::AtomicBool,
     /// This session's second socket, carrying media only.
     ///
     /// `None` where none was opened (tests, and any caller that did not ask for
@@ -302,6 +306,7 @@ impl PortalGateway {
             #[cfg(feature = "webrtc")]
             gave_up_on_peer: std::sync::atomic::AtomicBool::new(false),
             sent_to_an_empty_channel: std::sync::atomic::AtomicBool::new(false),
+            voice_opus: std::sync::atomic::AtomicBool::new(false),
             media_sink: None,
             channel_id: channel_id.to_string(),
         }
@@ -1314,6 +1319,12 @@ impl PortalGateway {
                             serde_json::Value::String(self.voice_identity()),
                         );
                     }
+                    if let Some(codec) = p.remove("voice_codec") {
+                        self.voice_opus.store(
+                            codec.as_str() == Some("opus"),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
                 }
                 // Remember what we asked, so the reply can be recognised as
                 // ours when it comes back without a session id.
@@ -1485,9 +1496,22 @@ impl RemoteGateway for PortalGateway {
             // spoke, not to every screen showing the conversation: a phone on
             // the same session must not be sent a pendant's audio, and the
             // relay bills each copy.
-            if let Some(frame) = super::translate::speech_downlink(&env.payload) {
+            if let Some(mut frame) = super::translate::speech_downlink(&env.payload) {
                 if env.proxy_id != self.voice_identity() {
                     return;
+                }
+                // ~200 KB of WAV a sentence is slower than real time over a
+                // phone hotspot and the relay; Opus is a sixteenth of it.
+                if self.voice_opus.load(std::sync::atomic::Ordering::Relaxed)
+                    && frame.get("kind").and_then(|k| k.as_str()) == Some("voice_audio")
+                {
+                    let wav = frame.clone();
+                    frame = tokio::task::spawn_blocking(move || {
+                        super::voice_codec::transcode_voice_audio(&mut frame);
+                        frame
+                    })
+                    .await
+                    .unwrap_or(wav);
                 }
                 let slot = self.binding.read().await;
                 let Some(b) = slot.as_ref() else { return };
@@ -2571,6 +2595,62 @@ mod tests {
         };
         assert!(t.contains("\"kind\":\"voice_audio\""), "got {t}");
         assert!(!t.contains("session_id"), "got {t}");
+    }
+
+    #[tokio::test]
+    async fn a_device_that_decodes_opus_gets_its_spoken_answers_as_opus() {
+        use base64::Engine;
+        let sink = Arc::new(CollectSink::default());
+        let gw = Arc::new(PortalGateway::new(None, sink.clone(), "sess", None, None, "chan"));
+        let inj = CollectInjector::default();
+        gw.on_wire_in(
+            frame_wire(serde_json::json!({
+                "kind": "user_message", "text": "hi", "voice": true, "voice_codec": "opus"
+            })),
+            &inj,
+        )
+        .await;
+        // The preference is the gateway's to keep, not the daemon's to see.
+        assert!(inj.injected.lock().await[0]["payload"].get("voice_codec").is_none());
+
+        // 0.1 s of 24 kHz mono 16-bit silence.
+        let samples = 2400u32;
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + samples * 2).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        for v in [16u32] {
+            wav.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [1u16, 1u16] {
+            wav.extend_from_slice(&v.to_le_bytes());
+        }
+        wav.extend_from_slice(&24_000u32.to_le_bytes());
+        wav.extend_from_slice(&48_000u32.to_le_bytes());
+        for v in [2u16, 16u16] {
+            wav.extend_from_slice(&v.to_le_bytes());
+        }
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(samples * 2).to_le_bytes());
+        wav.resize(wav.len() + samples as usize * 2, 0);
+        gw.project(&OutboundEvent::Chat(DaemonEnvelope::new(
+            "remote:portal:chan",
+            Channel::Chat,
+            serde_json::json!({
+                "type": "voice_audio",
+                "payload": {"session_id": "sess", "turn_id": "t", "seq": 0, "sample_rate": 24000,
+                            "wav": base64::engine::general_purpose::STANDARD.encode(&wav)}
+            }),
+        )))
+        .await;
+        let sent = sink.sent.lock().await;
+        assert_eq!(sent.len(), 1);
+        let Wire::Text(t) = &sent[0] else {
+            panic!("a plaintext gateway sends text")
+        };
+        assert!(t.contains("\"codec\":\"opus\""), "got {t}");
+        assert!(t.contains("\"sample_rate\":16000"), "got {t}");
+        assert!(!t.contains("\"wav\""), "got {t}");
     }
 
     #[tokio::test]
