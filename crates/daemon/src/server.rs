@@ -7212,6 +7212,10 @@ async fn handle_chat_message_streaming(
     //
     // 谁在发声,「整轮没什么可念」那句要按它挑语言 —— Kokoro 只会英文。
     let mut voice_engine: Option<&'static str> = None;
+    // Why a turn that asked to be spoken is going out text-only. Told to the
+    // device that asked once the text is through, so it stops waiting for a
+    // voice that is not coming instead of guessing from a timer.
+    let mut voice_off_reason: Option<String> = None;
     // 引擎还没决定好时,**这一轮不出声**,而不是让所有人等它。
     //
     // 决定一次要几十秒(加载 717 MB、探测合成、跟 CPU 比一次),而这段代码在
@@ -7237,6 +7241,7 @@ async fn handle_chat_message_streaming(
             }
         });
         info!("voice: engine not ready yet — this reply is text only, the next one will speak");
+        voice_off_reason = Some("voice engine warming up".into());
         false
     } else {
         voice_on
@@ -7316,6 +7321,7 @@ async fn handle_chat_message_streaming(
             }
             Err(e) => {
                 warn!("voice mode on but no synthesizer: {}", e);
+                voice_off_reason = Some(format!("no synthesizer: {e}"));
                 None
             }
         }
@@ -7578,6 +7584,32 @@ async fn handle_chat_message_streaming(
             (String::new(), false)
         }
     };
+
+    // A device that spoke this turn waits for a terminal voice frame. When
+    // there was never going to be one, say so after the text, so it lands
+    // behind the reply's last frame rather than ahead of it.
+    if let (Some(reply_to), Some(message)) = (voice_reply_to.as_ref(), voice_off_reason) {
+        let failed = nevoflux_protocol::speech::VoiceFailed {
+            session_id: session_id.clone(),
+            turn_id: format!("vt_{}", uuid::Uuid::new_v4()),
+            message,
+        };
+        let env = DaemonEnvelope::new(
+            reply_to,
+            channel,
+            serde_json::json!({
+                "type": "voice_failed",
+                "payload": serde_json::to_value(failed).unwrap_or_default(),
+            }),
+        );
+        if response_tx
+            .send((reply_to.as_bytes().to_vec(), env))
+            .await
+            .is_err()
+        {
+            debug!("voice: no route left to say this turn is text only");
+        }
+    }
 
     // Cleanup cancellation token and interrupt flag from registries
     {
