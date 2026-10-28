@@ -17,6 +17,13 @@
 //! `opus` is the sentence's packets back to back, each prefixed by its length
 //! as a little-endian u16. Every sentence is encoded by a fresh encoder, so a
 //! player can decode one without having heard the one before.
+//!
+//! The other way, the pendant's microphone goes up as Opus too (PCM is about
+//! 43 KB/s base64'd, more than a hotspot to the relay reliably carries). Its
+//! `speech_start` says `codec: "opus"`, and every `speech_chunk` then carries
+//! `opus` in the same framing instead of `pcm`. [`UplinkDecoders`] turns those
+//! back into the PCM the recogniser reads, one decoder per utterance, so the
+//! daemon never knows the difference.
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::Value;
@@ -211,6 +218,151 @@ pub fn encode_opus(pcm: &[f32]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// The largest frame Opus packs into one packet (120 ms) at 16 kHz.
+const MAX_FRAME_SAMPLES: usize = (OPUS_SAMPLE_RATE as usize) * 120 / 1000;
+
+/// One utterance's Opus decoder. Kept for the whole utterance: Opus packets
+/// lean on the ones before them, so a fresh decoder per chunk would click.
+pub struct OpusStreamDecoder(*mut unsafe_libopus::OpusDecoder);
+
+// SAFETY: the decoder is plain owned state with no thread affinity; it is only
+// ever used through `&mut self`.
+unsafe impl Send for OpusStreamDecoder {}
+
+impl OpusStreamDecoder {
+    pub fn new() -> Option<Self> {
+        let mut err = 0i32;
+        // SAFETY: creates an owned decoder, released in `Drop`.
+        let dec = unsafe {
+            unsafe_libopus::opus_decoder_create(OPUS_SAMPLE_RATE as i32, 1, &mut err)
+        };
+        if dec.is_null() || err != unsafe_libopus::OPUS_OK {
+            return None;
+        }
+        Some(Self(dec))
+    }
+
+    /// Length-prefixed packets as 16 kHz mono PCM16 LE. A packet that fails
+    /// to decode is skipped; `None` only if the framing itself is broken.
+    pub fn decode(&mut self, framed: &[u8]) -> Option<Vec<u8>> {
+        let mut out = Vec::with_capacity(framed.len() * 20);
+        let mut pcm = [0i16; MAX_FRAME_SAMPLES];
+        let mut at = 0usize;
+        while at < framed.len() {
+            if at + 2 > framed.len() {
+                return None;
+            }
+            let len = u16::from_le_bytes([framed[at], framed[at + 1]]) as usize;
+            at += 2;
+            if len == 0 || at + len > framed.len() {
+                return None;
+            }
+            // SAFETY: the packet slice and `pcm` are valid for the lengths given.
+            let n = unsafe {
+                unsafe_libopus::opus_decode(
+                    self.0,
+                    framed[at..].as_ptr(),
+                    len as i32,
+                    pcm.as_mut_ptr(),
+                    MAX_FRAME_SAMPLES as i32,
+                    0,
+                )
+            };
+            at += len;
+            if n > 0 {
+                for s in &pcm[..n as usize] {
+                    out.extend_from_slice(&s.to_le_bytes());
+                }
+            }
+        }
+        Some(out)
+    }
+}
+
+impl Drop for OpusStreamDecoder {
+    fn drop(&mut self) {
+        // SAFETY: created by `opus_decoder_create`, dropped once.
+        unsafe { unsafe_libopus::opus_decoder_destroy(self.0) }
+    }
+}
+
+/// A device rarely has more than one utterance open; this bounds what one that
+/// never says `speech_end` can leave behind.
+const MAX_OPEN_UTTERANCES: usize = 4;
+
+/// Opus speech uplink → the PCM `speech_*` payloads the daemon reads.
+#[derive(Default)]
+pub struct UplinkDecoders {
+    open: Vec<(String, OpusStreamDecoder)>,
+}
+
+impl UplinkDecoders {
+    /// Rewrite one `{type, payload}` speech envelope in place. False if it
+    /// should be dropped (an Opus chunk that cannot be read); the recogniser
+    /// then sees the hole in `seq`, as it would for a lost frame.
+    pub fn apply(&mut self, envelope: &mut Value) -> bool {
+        let kind = envelope
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let Some(p) = envelope.get_mut("payload").and_then(Value::as_object_mut) else {
+            return true;
+        };
+        let id = p
+            .get("utterance_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        match kind.as_str() {
+            "speech_start" => {
+                p.remove("frame_ms");
+                if p.remove("codec").and_then(|c| c.as_str().map(|c| c == "opus")) == Some(true) {
+                    self.open.retain(|(u, _)| *u != id);
+                    if self.open.len() >= MAX_OPEN_UTTERANCES {
+                        self.open.remove(0);
+                    }
+                    if let Some(dec) = OpusStreamDecoder::new() {
+                        self.open.push((id, dec));
+                    }
+                }
+                true
+            }
+            "speech_chunk" => {
+                let Some(opus) = p.remove("opus") else {
+                    return true; // raw PCM already
+                };
+                let Some(bytes) = opus.as_str().and_then(|b| STANDARD.decode(b).ok()) else {
+                    return false;
+                };
+                // A chunk whose `speech_start` went missing still gets heard.
+                if !self.open.iter().any(|(u, _)| *u == id) {
+                    if self.open.len() >= MAX_OPEN_UTTERANCES {
+                        self.open.remove(0);
+                    }
+                    let Some(dec) = OpusStreamDecoder::new() else {
+                        return false;
+                    };
+                    self.open.push((id.clone(), dec));
+                }
+                let dec = &mut self.open.iter_mut().find(|(u, _)| *u == id).expect("just added").1;
+                match dec.decode(&bytes) {
+                    Some(pcm) => {
+                        p.insert("pcm".into(), STANDARD.encode(pcm).into());
+                        true
+                    }
+                    None => false,
+                }
+            }
+            "speech_end" | "speech_cancel" => {
+                self.open.retain(|(u, _)| *u != id);
+                true
+            }
+            _ => true,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,6 +491,66 @@ mod tests {
         assert_eq!(rate, 16_000);
         assert_eq!(mono.len(), 2);
         assert!(mono.iter().all(|s| s.abs() < 1e-3));
+    }
+
+    #[test]
+    fn an_opus_utterance_reaches_the_recogniser_as_the_pcm_it_was() {
+        // 1 s of 16 kHz speech, encoded the way the pendant does: 20 ms
+        // packets, one encoder for the whole utterance, sent 10 to a chunk.
+        let speech = tone(300.0, 16_000, 1.0);
+        let framed = encode_opus(&speech).unwrap();
+        let mut packets = Vec::new();
+        let mut at = 0;
+        while at < framed.len() {
+            let len = u16::from_le_bytes([framed[at], framed[at + 1]]) as usize;
+            packets.push(framed[at..at + 2 + len].to_vec());
+            at += 2 + len;
+        }
+
+        let mut dec = UplinkDecoders::default();
+        let mut start = json!({ "type": "speech_start", "payload": {
+            "session_id": "s", "utterance_id": "u1", "sample_rate": 16000,
+            "codec": "opus", "frame_ms": 20 }});
+        assert!(dec.apply(&mut start));
+        assert!(start["payload"].get("codec").is_none());
+        assert!(start["payload"].get("frame_ms").is_none());
+
+        let mut pcm = Vec::new();
+        for (seq, chunk) in packets.chunks(10).enumerate() {
+            let opus = STANDARD.encode(chunk.concat());
+            let mut env = json!({ "type": "speech_chunk", "payload": {
+                "session_id": "s", "utterance_id": "u1", "seq": seq, "opus": opus }});
+            assert!(dec.apply(&mut env));
+            assert!(env["payload"].get("opus").is_none());
+            let bytes = STANDARD.decode(env["payload"]["pcm"].as_str().unwrap()).unwrap();
+            pcm.extend(
+                bytes
+                    .chunks_exact(2)
+                    .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0),
+            );
+        }
+        assert_eq!(pcm.len(), (50 + 1) * FRAME_SAMPLES);
+        let a = amplitude_at(&pcm[1600..14400], 300.0, 16_000);
+        assert!((a - 0.5).abs() < 0.1, "decoded amplitude {a}");
+
+        let mut end = json!({ "type": "speech_end", "payload": { "utterance_id": "u1" }});
+        assert!(dec.apply(&mut end));
+        assert!(dec.open.is_empty());
+    }
+
+    #[test]
+    fn pcm_chunks_pass_and_broken_opus_is_dropped() {
+        let mut dec = UplinkDecoders::default();
+        let mut raw = json!({ "type": "speech_chunk", "payload": {
+            "utterance_id": "u", "seq": 0, "pcm": "AAA=" }});
+        let before = raw.clone();
+        assert!(dec.apply(&mut raw));
+        assert_eq!(raw, before);
+
+        // A length that runs past the end.
+        let mut bad = json!({ "type": "speech_chunk", "payload": {
+            "utterance_id": "u", "seq": 1, "opus": STANDARD.encode([9u8, 0, 1]) }});
+        assert!(!dec.apply(&mut bad));
     }
 
     #[test]

@@ -98,6 +98,8 @@ pub struct PortalGateway {
     /// (`voice_codec.rs`). Said on its `user_message`; a device that never says
     /// it gets the WAV the synthesiser made.
     voice_opus: std::sync::atomic::AtomicBool,
+    /// A device that speaks Opus: its utterances' decoders, back to PCM.
+    uplink_opus: std::sync::Mutex<super::voice_codec::UplinkDecoders>,
     /// This session's second socket, carrying media only.
     ///
     /// `None` where none was opened (tests, and any caller that did not ask for
@@ -307,6 +309,7 @@ impl PortalGateway {
             gave_up_on_peer: std::sync::atomic::AtomicBool::new(false),
             sent_to_an_empty_channel: std::sync::atomic::AtomicBool::new(false),
             voice_opus: std::sync::atomic::AtomicBool::new(false),
+            uplink_opus: std::sync::Mutex::new(Default::default()),
             media_sink: None,
             channel_id: channel_id.to_string(),
         }
@@ -1305,8 +1308,18 @@ impl PortalGateway {
         match routed {
             Inbound::Upload(frame) => self.apply_upload(&frame).await,
             Inbound::AssetPull(frame) => self.apply_asset_pull(&frame).await,
-            Inbound::Speech(payload) => {
-                injector.inject_as(&self.voice_identity(), payload).await
+            Inbound::Speech(mut payload) => {
+                // Microseconds of work per 200 ms chunk; no need to leave the task.
+                let keep = self
+                    .uplink_opus
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .apply(&mut payload);
+                if keep {
+                    injector.inject_as(&self.voice_identity(), payload).await
+                } else {
+                    tracing::debug!(target: "remote", "dropped an unreadable Opus speech chunk");
+                }
             }
             Inbound::Uplink(mut payload) => {
                 // A device that asked for a spoken answer gets it addressed to
@@ -2545,6 +2558,38 @@ mod tests {
         assert_eq!(got[0].0, "remote:portal:chan");
         assert_eq!(got[0].1["type"], "speech_chunk");
         assert_eq!(got[0].1["payload"]["session_id"], "sess");
+    }
+
+    #[tokio::test]
+    async fn a_device_speaking_opus_is_heard_as_pcm() {
+        use base64::Engine as _;
+        let gw = Arc::new(PortalGateway::new(
+            None,
+            Arc::new(CollectSink::default()),
+            "sess",
+            None,
+            None,
+            "chan",
+        ));
+        let inj = CollectInjector::default();
+        let silence = vec![0.0f32; 3200]; // 200 ms
+        let opus = super::super::voice_codec::encode_opus(&silence).unwrap();
+        for frame in [
+            serde_json::json!({ "kind": "speech_start", "utterance_id": "u1",
+                "sample_rate": 16000, "codec": "opus", "frame_ms": 20 }),
+            serde_json::json!({ "kind": "speech_chunk", "utterance_id": "u1", "seq": 0,
+                "opus": base64::engine::general_purpose::STANDARD.encode(&opus) }),
+        ] {
+            gw.on_wire_in(frame_wire(frame), &inj).await;
+        }
+        let got = inj.injected_as.lock().await;
+        assert_eq!(got.len(), 2);
+        assert!(got[0].1["payload"].get("codec").is_none());
+        let pcm = got[1].1["payload"]["pcm"].as_str().expect("decoded to pcm");
+        // 10 frames + the encoder's flush frame, 320 samples of 2 bytes each.
+        let bytes = base64::engine::general_purpose::STANDARD.decode(pcm).unwrap();
+        assert_eq!(bytes.len(), 11 * 320 * 2);
+        assert!(got[1].1["payload"].get("opus").is_none());
     }
 
     #[tokio::test]
