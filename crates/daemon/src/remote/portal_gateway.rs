@@ -394,6 +394,25 @@ impl PortalGateway {
         }
     }
 
+    /// The session's stored mode changed; carry it on the next remote turn.
+    ///
+    /// `attach` returns early for the session already shown, so without this
+    /// a changed mode would wait for a rebind that never comes. Ignored unless
+    /// `session_id` is the one bound here. Says the new state either way it
+    /// lands, so the display cannot keep showing the old grant.
+    pub async fn set_mode(&self, session_id: &str, mode: &str) -> bool {
+        {
+            let slot = self.binding.read().await;
+            let Some(b) = slot.as_ref() else { return false };
+            if b.session_id != session_id {
+                return false;
+            }
+            b.session.lock().await.set_mode(mode.to_string());
+        }
+        self.announce().await;
+        true
+    }
+
     /// Put a replayed conversation on the wire, after the resync that emptied
     /// the far end and before anything live arrives.
     ///
@@ -1918,6 +1937,31 @@ mod tests {
             }
             other => panic!("expected Frame, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_changed_mode_reaches_the_bound_session_and_is_announced() {
+        let sink = Arc::new(CollectSink::default());
+        let gw = PortalGateway::new(None, sink.clone(), "sess", Some("chat".into()), None, "chan");
+        assert!(!gw.set_mode("other", "agent").await, "not the bound session");
+        assert!(sink.sent.lock().await.is_empty());
+
+        assert!(gw.set_mode("sess", "agent").await);
+        let sent = sink.sent.lock().await;
+        let Wire::Text(t) = &sent[0] else { panic!("plaintext") };
+        let WireMessage::Frame { frame, .. } = serde_json::from_str(t).unwrap() else {
+            panic!("expected Frame")
+        };
+        assert_eq!(frame["kind"], "session_state");
+        assert_eq!(frame["mode"], "agent");
+    }
+
+    #[tokio::test]
+    async fn a_mode_on_an_unbound_channel_goes_nowhere() {
+        let sink = Arc::new(CollectSink::default());
+        let gw = PortalGateway::unbound(None, sink.clone(), "chan");
+        assert!(!gw.set_mode("sess", "agent").await);
+        assert!(sink.sent.lock().await.is_empty());
     }
 
     /// With nothing reported, the portal must not be told "agent": defaulting to

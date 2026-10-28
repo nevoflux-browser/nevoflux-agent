@@ -340,6 +340,36 @@ impl ControlGateway {
                 }
                 Some(ControlCommand::Attach { session })
             }
+            // Change what a conversation is allowed to do.
+            //
+            // Bounded the same way as `attach`: only a session this pairing
+            // could have been shown. The mode is checked against the domain the
+            // session table stores, so an unknown word is refused here rather
+            // than landing as `chat` somewhere downstream and looking accepted.
+            "set_mode" => {
+                let session = frame.get("sessionId").and_then(|v| v.as_str())?.to_string();
+                let mode = frame.get("mode").and_then(|v| v.as_str())?;
+                if !matches!(mode, "chat" | "agent") {
+                    tracing::warn!(
+                        target: "remote",
+                        %session, mode,
+                        "a device asked for a mode a session cannot be in"
+                    );
+                    return None;
+                }
+                if !self.rows().await.iter().any(|r| r.session_id == session) {
+                    tracing::warn!(
+                        target: "remote",
+                        %session,
+                        "a device asked to change a session that is not on its list"
+                    );
+                    return None;
+                }
+                Some(ControlCommand::SetMode {
+                    session,
+                    mode: mode.to_string(),
+                })
+            }
             "detach" => Some(ControlCommand::Detach),
             // The device says it has no usable subscription any more — cleared
             // permissions, or a key that no longer matches. Better than leaving
@@ -363,6 +393,13 @@ pub enum ControlCommand {
     },
     /// Stop showing a conversation.
     Detach,
+    /// Persist a session's chat mode.
+    SetMode {
+        /// Checked against the list before it gets this far.
+        session: String,
+        /// `chat` or `agent` — the domain `sessions.mode` stores.
+        mode: String,
+    },
     /// Remember where to wake this device.
     Subscribe(super::web_push::Subscription),
     /// Forget where to wake this device.
@@ -825,6 +862,36 @@ mod tests {
             None,
             "a session this device was never shown"
         );
+    }
+
+    #[tokio::test]
+    async fn setting_a_mode_is_bounded_by_the_list_and_the_stored_domain() {
+        let (gw, _, _) = build(vec![stored("s1", 1)]);
+        let ask = |session: &str, mode: &str| {
+            Wire::Text(
+                serde_json::to_string(&WireMessage::Frame {
+                    seq: None,
+                    frame: json!({"kind": "set_mode", "sessionId": session, "mode": mode}),
+                })
+                .unwrap(),
+            )
+        };
+        assert_eq!(
+            gw.on_wire_in(&ask("s1", "agent")).await,
+            Some(ControlCommand::SetMode {
+                session: "s1".into(),
+                mode: "agent".into()
+            })
+        );
+        assert_eq!(
+            gw.on_wire_in(&ask("not-on-the-list", "agent")).await,
+            None,
+            "a session this device was never shown"
+        );
+        // `browser` is a sidebar mode, not one a session row can hold.
+        for mode in ["browser", "AGENT", "", "root"] {
+            assert_eq!(gw.on_wire_in(&ask("s1", mode)).await, None, "{mode}");
+        }
     }
 
     #[tokio::test]

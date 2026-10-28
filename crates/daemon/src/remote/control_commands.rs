@@ -56,6 +56,10 @@ pub trait SessionAuthority: Send + Sync {
     /// same words the desktop shows but with none of the context — which is
     /// what makes reading it worth a rebind at all.
     async fn history(&self, session_id: &str) -> Vec<serde_json::Value>;
+
+    /// Persist `mode` as the session's own. `false` if it was not stored, in
+    /// which case nothing downstream may act as though it had been.
+    async fn set_mode(&self, session_id: &str, mode: &str) -> bool;
 }
 
 /// The live authority, over the daemon's database.
@@ -108,6 +112,22 @@ impl SessionAuthority for StorageAuthority {
             .unwrap_or_default();
         messages.reverse();
         super::history::replay(&messages)
+    }
+
+    async fn set_mode(&self, session_id: &str, mode: &str) -> bool {
+        use nevoflux_storage::{SessionMode, SessionRepository, UpdateSessionParams};
+        let Ok(mode) = mode.parse::<SessionMode>() else {
+            return false;
+        };
+        match SessionRepository::new(&self.db)
+            .update(session_id, UpdateSessionParams::new().with_mode(mode))
+        {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(target: "remote", %session_id, "could not store a session mode: {e}");
+                false
+            }
+        }
     }
 }
 
@@ -228,6 +248,25 @@ impl super::ws::ControlCommandSink for ControlCommands {
                 let history = authority.history(&session).await;
                 data.attach(session, mode, tier, history).await;
             }
+            ControlCommand::SetMode { session, mode } => {
+                let Some(authority) = &self.authority else {
+                    tracing::warn!(
+                        target: "remote",
+                        "a device asked to change a mode on a pairing with no data channel"
+                    );
+                    return;
+                };
+                // Stored first, and the binding only follows what was stored:
+                // the session row is where a mode is a grant, so the channel
+                // must never hold one the row does not.
+                if !authority.set_mode(&session, &mode).await {
+                    return;
+                }
+                tracing::info!(target: "remote", %session, %mode, "a device changed a session's mode");
+                if let Some(data) = &self.data {
+                    data.set_mode(&session, &mode).await;
+                }
+            }
             ControlCommand::Detach => {
                 if let Some(data) = &self.data {
                     data.detach().await;
@@ -245,6 +284,138 @@ impl super::ws::ControlCommandSink for ControlCommands {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::portal_gateway::{PortalGateway, WireSink};
+    use super::super::relay_protocol::WireMessage;
+    use super::super::session::Wire;
+    use tokio::sync::Mutex;
+
+    struct NoInject;
+    #[async_trait]
+    impl Injector for NoInject {
+        async fn inject(&self, _: serde_json::Value) {}
+    }
+
+    #[derive(Default)]
+    struct CollectSink {
+        sent: Mutex<Vec<Wire>>,
+    }
+    #[async_trait]
+    impl WireSink for CollectSink {
+        async fn send(&self, wire: Wire) {
+            self.sent.lock().await.push(wire);
+        }
+    }
+
+    /// Stores whatever it is told, unless told to refuse.
+    struct Recording {
+        refuse: bool,
+        stored: Mutex<Vec<(String, String)>>,
+    }
+    #[async_trait]
+    impl SessionAuthority for Recording {
+        async fn authorization(&self, _: &str) -> (Option<String>, Option<String>) {
+            (Some("chat".into()), None)
+        }
+        async fn history(&self, _: &str) -> Vec<serde_json::Value> {
+            Vec::new()
+        }
+        async fn set_mode(&self, session_id: &str, mode: &str) -> bool {
+            if self.refuse {
+                return false;
+            }
+            self.stored
+                .lock()
+                .await
+                .push((session_id.into(), mode.into()));
+            true
+        }
+    }
+
+    fn commands(refuse: bool) -> (ControlCommands, Arc<Recording>, Arc<CollectSink>) {
+        let sink = Arc::new(CollectSink::default());
+        let data = Arc::new(PortalGateway::new(
+            None,
+            sink.clone(),
+            "s1",
+            Some("chat".into()),
+            None,
+            "chan",
+        ));
+        let authority = Arc::new(Recording {
+            refuse,
+            stored: Mutex::new(Vec::new()),
+        });
+        let cmds = ControlCommands::new(
+            Arc::new(NoInject),
+            Arc::new(super::super::pairing::PairingStore::new("/nonexistent/pairings.json")),
+            "ctl",
+        )
+        .with_data_channel(data, authority.clone());
+        (cmds, authority, sink)
+    }
+
+    fn announced_modes(sent: &[Wire]) -> Vec<String> {
+        sent.iter()
+            .filter_map(|w| match w {
+                Wire::Text(t) => serde_json::from_str::<WireMessage>(t).ok(),
+                _ => None,
+            })
+            .filter_map(|m| match m {
+                WireMessage::Frame { frame, .. } if frame["kind"] == "session_state" => {
+                    frame["mode"].as_str().map(str::to_string)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_mode_is_stored_then_carried_by_the_conversation_on_show() {
+        use super::super::ws::ControlCommandSink;
+        let (cmds, authority, sink) = commands(false);
+        cmds.handle(ControlCommand::SetMode {
+            session: "s1".into(),
+            mode: "agent".into(),
+        })
+        .await;
+        assert_eq!(
+            *authority.stored.lock().await,
+            vec![("s1".to_string(), "agent".to_string())]
+        );
+        assert_eq!(announced_modes(&sink.sent.lock().await), vec!["agent"]);
+    }
+
+    #[tokio::test]
+    async fn the_stored_mode_is_the_one_the_next_attach_reads() {
+        use nevoflux_storage::{CreateSessionParams, Database, SessionRepository};
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        SessionRepository::new(&db)
+            .create(CreateSessionParams::new().with_id("s1"))
+            .unwrap();
+        let authority = StorageAuthority::new(db);
+        assert_eq!(authority.authorization("s1").await.0.as_deref(), Some("chat"));
+
+        assert!(authority.set_mode("s1", "agent").await);
+        assert_eq!(authority.authorization("s1").await.0.as_deref(), Some("agent"));
+
+        assert!(!authority.set_mode("s1", "browser").await, "not a stored mode");
+        assert!(!authority.set_mode("gone", "agent").await, "no such session");
+    }
+
+    #[tokio::test]
+    async fn a_mode_that_was_not_stored_is_not_granted_on_the_channel() {
+        // The session row is where a mode is a grant. A channel holding one
+        // the row does not would be the privilege the attach rule exists to
+        // stop.
+        use super::super::ws::ControlCommandSink;
+        let (cmds, _, sink) = commands(true);
+        cmds.handle(ControlCommand::SetMode {
+            session: "s1".into(),
+            mode: "agent".into(),
+        })
+        .await;
+        assert!(announced_modes(&sink.sent.lock().await).is_empty());
+    }
 
     #[test]
     fn a_gate_is_answered_on_the_path_that_unblocks_the_turn() {

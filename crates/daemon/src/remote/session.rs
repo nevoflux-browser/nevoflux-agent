@@ -91,6 +91,12 @@ impl PortalSession {
         }
     }
 
+    /// Take a mode the session itself now holds. Only for one read back from
+    /// storage: this is the grant every later remote turn carries.
+    pub fn set_mode(&mut self, mode: String) {
+        self.mode = Some(mode);
+    }
+
     /// Announce the remote head's settings so the portal can show what this
     /// session would actually do. The portal cannot see the local sidebar's
     /// controls, so without this it can only guess — and guessing wrong about
