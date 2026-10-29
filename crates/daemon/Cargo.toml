@@ -20,6 +20,10 @@ webrtc = ["dep:nevoflux-rtc-transport"]
 # find it should still build rather than failing for a backend nobody asked
 # for.
 skiff-backend = ["dep:skiff", "dep:skiff-net"]
+# The BLE link to a pendant (`remote::ble`) on Linux. Windows and macOS always
+# have it; on Linux btleplug talks to BlueZ over D-Bus, which needs libdbus-1
+# to build, so it is opt-in there.
+ble-linux = ["dep:btleplug"]
 embedding = ["nevoflux-llm/embedding", "nevoflux-llm-gateway/embedding"]
 # Local Kokoro speech. On by default: without it `tts_synthesize_local`
 # has no backend and the tool can only report that it is absent.
@@ -270,6 +274,12 @@ unsafe-libopus = "0.2.0"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["signal", "process"] }
+
+# BLE central for a pendant out of Wi-Fi (`remote::ble`); see the `ble-linux` feature.
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+btleplug = "0.11"
+[target.'cfg(target_os = "linux")'.dependencies]
+btleplug = { version = "0.11", optional = true }
 
 # Tests only, and only on Unix: `local_e2e` asserts the engine-guard pipe is
 # CLOEXEC, which v3 §16.2 mandates as an assertion rather than a defaulted

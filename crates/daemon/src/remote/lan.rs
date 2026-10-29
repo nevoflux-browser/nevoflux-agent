@@ -63,22 +63,30 @@ pub trait LanEndpoint: Send + Sync {
     fn is_data(&self) -> bool;
 }
 
-fn endpoints() -> &'static StdMutex<HashMap<String, Arc<dyn LanEndpoint>>> {
+/// Every channel this head serves directly, by id; the BLE transport looks here too.
+pub(crate) fn endpoints() -> &'static StdMutex<HashMap<String, Arc<dyn LanEndpoint>>> {
     static E: OnceLock<StdMutex<HashMap<String, Arc<dyn LanEndpoint>>>> = OnceLock::new();
     E.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
-/// Offer `channel_id` on the LAN. Starts the listener on first use.
+/// Offer `channel_id` on the LAN (and to a pendant over BLE). Starts the
+/// listener on first use.
 pub fn register(channel_id: &str, endpoint: Arc<dyn LanEndpoint>) {
-    if !enabled() {
+    let (lan, ble) = (enabled(), super::ble::enabled());
+    if !lan && !ble {
         return;
     }
     endpoints()
         .lock()
         .expect("lan endpoints")
         .insert(channel_id.to_string(), endpoint);
-    ensure_started();
-    readvertise();
+    if lan {
+        ensure_started();
+        readvertise();
+    }
+    if ble {
+        super::ble::ensure_started();
+    }
 }
 
 /// Stop offering `channel_id`; a LAN peer on it is dropped with it.
@@ -89,7 +97,9 @@ pub fn unregister(channel_id: &str) {
         .remove(channel_id);
     if let Some(ep) = gone {
         ep.sink().clear_lan_any();
-        readvertise();
+        if enabled() {
+            readvertise();
+        }
     }
 }
 

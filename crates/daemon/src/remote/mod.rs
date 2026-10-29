@@ -10,6 +10,7 @@ pub mod agent_backend;
 pub mod agent_status;
 pub mod agent_tabs;
 pub mod asset;
+pub mod ble;
 pub mod channel_codec;
 pub mod connect_block;
 pub mod control_commands;
