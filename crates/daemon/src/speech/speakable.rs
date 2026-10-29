@@ -20,6 +20,25 @@
 /// 句末标点。与 `nevoflux-tts` 的切分点一致,免得同一句话在两处被切成不同的形状。
 const SENTENCE_ENDS: [char; 8] = ['。', '！', '？', '.', '!', '?', '；', ';'];
 
+/// 一句话的长度上限,按 [`speech_weight`] 计。
+///
+/// Kokoro 一次最多吃 510 个音素 token,超过的句子 `nevoflux-tts` 整句拒收
+/// (它不肯在半句处下刀),于是这一句就哑了。真实经过:一句没有句号的英文长句
+/// 542 token,吊坠在第一句就报「语音合成失败」。
+///
+/// 用真 G2P 量过:中文每字 3.1–3.6 个音素,英文正文每字符约 1.1,夹着数字和
+/// 网址时到 2.1。所以 200 意味着中文最多 50 字(约 180 音素)、英文最多 200
+/// 字符(最坏约 420),都给 510 留着余量。
+const MAX_SENTENCE_WEIGHT: usize = 200;
+
+/// 超长时优先在这些地方切 —— 念出来本来就是一个停顿。
+const SOFT_BREAKS: [char; 6] = ['，', ',', '、', '：', ':', '—'];
+
+/// 一个字大致要几个音素。中文一个字是一个音节,三四个音素;其余按一个算。
+fn speech_weight(s: &str) -> usize {
+    s.chars().map(|c| if is_cjk(c) { 4 } else { 1 }).sum()
+}
+
 /// 整轮下来一句都念不出来时说的话 —— 回答通篇是代码时会这样。
 ///
 /// 存在的理由是「没什么可念」与「坏了」在用户耳朵里长得一模一样。
@@ -372,7 +391,25 @@ impl Speakable {
         self.buf.push(ch);
         if SENTENCE_ENDS.contains(&ch) {
             self.flush(out);
+        } else if speech_weight(&self.buf) > MAX_SENTENCE_WEIGHT {
+            self.split_long(out);
         }
+    }
+
+    /// 一句长到引擎吃不下了,还没等到句末标点:先把前半句发出去。
+    ///
+    /// 切点依次退让:最后一个逗号类停顿,其次最后一个空格(不把英文单词劈开),
+    /// 都没有才整段发 —— 那是一长串没有空格的中文,在字与字之间切念出来也还是字。
+    fn split_long(&mut self, out: &mut Vec<String>) {
+        let cut = self
+            .buf
+            .rfind(SOFT_BREAKS)
+            .map(|i| i + self.buf[i..].chars().next().map_or(0, char::len_utf8))
+            .or_else(|| self.buf.rfind(' '))
+            .unwrap_or(self.buf.len());
+        let rest = self.buf.split_off(cut);
+        self.flush(out);
+        self.buf = rest.trim_start().to_string();
     }
 
     fn flush(&mut self, out: &mut Vec<String>) {
@@ -513,6 +550,60 @@ mod tests {
         sp.push("```py\n# 打印一下\nprint(1)\n```\n");
         assert!(!sp.said_anything());
         assert!(sp.saw_cjk(), "语言判定不该只看念出来的那部分");
+    }
+
+    /// 引擎会整句拒收的长句,在句末标点到来之前就得切开 —— 否则这一句是哑的。
+    #[test]
+    fn a_sentence_too_long_to_speak_is_cut_at_its_pauses() {
+        let clause = "the next video is a long documentary about the history of Rome";
+        let text = format!("{}.", vec![clause; 6].join(", "));
+        let out = one(&text);
+        assert!(out.len() > 1, "never cut: {out:?}");
+        for s in &out {
+            assert!(speech_weight(s) <= MAX_SENTENCE_WEIGHT, "too long: {s:?}");
+            assert!(
+                s.ends_with(',') || s.ends_with('.'),
+                "cut off a pause: {s:?}"
+            );
+        }
+        // 切开不丢字。
+        assert_eq!(out.join(" "), text);
+    }
+
+    #[test]
+    fn without_pauses_a_long_sentence_is_cut_between_words() {
+        let text = vec!["word"; 80].join(" ");
+        let out = one(&text);
+        assert!(out.len() > 1);
+        for s in &out {
+            assert!(speech_weight(s) <= MAX_SENTENCE_WEIGHT);
+            assert!(s.split(' ').all(|w| w == "word"), "split a word: {s:?}");
+        }
+        assert_eq!(out.join(" "), text);
+    }
+
+    /// 中文一个字要三四个音素,按字数切就会放过一句超长的中文。
+    #[test]
+    fn chinese_is_weighed_by_syllable_not_by_character() {
+        let text = "我们今天先去公园散步，".repeat(10);
+        let out = one(&text);
+        assert!(out.len() > 1);
+        for s in &out {
+            assert!(speech_weight(s) <= MAX_SENTENCE_WEIGHT, "too long: {s:?}");
+        }
+        assert_eq!(out.concat(), text);
+
+        // 连逗号都没有的中文:只能在字与字之间切,但仍然要切。
+        let text = "好".repeat(120);
+        let out = one(&text);
+        assert!(out.len() > 1);
+        assert_eq!(out.concat(), text);
+    }
+
+    #[test]
+    fn an_ordinary_sentence_is_not_cut() {
+        let s = "The first two recommended videos are cooking tutorials, then a documentary.";
+        assert_eq!(one(s), vec![s]);
     }
 
     /// 逐字喂与整段喂必须得到同一串句子。
