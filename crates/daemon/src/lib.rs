@@ -65,6 +65,7 @@ pub mod openclaw_setup;
 pub mod pack;
 pub mod pack_hooks;
 pub mod paths;
+pub mod pendant;
 pub mod pending;
 pub mod permission;
 pub mod profile;

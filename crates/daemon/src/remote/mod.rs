@@ -32,6 +32,7 @@ pub mod mcp_tools;
 pub mod media_frame;
 pub mod pairing;
 pub mod portal_gateway;
+pub mod presence;
 pub mod push;
 pub mod relay_protocol;
 pub mod rtc;

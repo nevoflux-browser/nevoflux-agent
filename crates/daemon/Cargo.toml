@@ -286,6 +286,13 @@ btleplug = { version = "0.11", optional = true }
 # property. `nix` is already here but its `fcntl` module needs the `fs`
 # feature this crate does not enable, and libc is already in the lockfile
 # transitively, so this adds nothing to the build graph.
+# A pendant plugged in over USB is provisioned from nevoflux://settings
+# (`pendant/`). libudev is left out: Linux enumerates /dev/ttyACM* through sysfs,
+# and a build host without libudev-dev still builds.
+[dependencies.serialport]
+version = "4"
+default-features = false
+
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
 

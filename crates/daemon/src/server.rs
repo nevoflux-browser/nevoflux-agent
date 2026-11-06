@@ -9515,6 +9515,13 @@ async fn handle_chat_message(
                 | "meeting.set_speaker"
                 | "meeting.settings.get"
                 | "meeting.settings.set") => crate::meeting::rpc::handle(cmd, &params).await,
+                cmd @ ("pendant.ports"
+                | "pendant.wifi"
+                | "pendant.pair"
+                | "pendant.set_wifi"
+                | "pendant.cancel"
+                | "pendant.list"
+                | "pendant.unpair") => crate::pendant::handle(cmd, &params).await,
                 "kb.wizard.status" => crate::kb_wizard::handle_status(&params).await,
                 "kb.wizard.install_bun" => crate::kb_wizard::handle_install_bun(&params).await,
                 "kb.wizard.install_gbrain" => {

@@ -1254,6 +1254,7 @@ impl PortalGateway {
         // is read before anything tries to decrypt it.
         if let Wire::Text(text) = &wire {
             if let Some(n) = super::relay_protocol::peer_count(text) {
+                super::presence::relay_peers(&self.channel_id, n as u32);
                 if n > 0 {
                     // Whoever just arrived miscounted nothing: they may have
                     // missed the announce this end sent into an empty channel.

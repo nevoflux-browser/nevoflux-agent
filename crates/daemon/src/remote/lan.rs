@@ -189,6 +189,7 @@ async fn serve(stream: TcpStream) -> Result<(), String> {
     let (mut write, mut read) = ws.split();
     let (tx, mut rx) = mpsc::channel::<Message>(OUTBOUND_DEPTH);
     let conn = endpoint.sink().set_lan(tx.clone());
+    super::presence::attached(&channel, super::presence::Link::Lan, conn);
     tracing::info!(target: "remote", "LAN peer attached to channel {channel}");
 
     let writer = tokio::spawn(async move {
@@ -239,6 +240,7 @@ async fn serve(stream: TcpStream) -> Result<(), String> {
     }
 
     endpoint.sink().clear_lan(conn);
+    super::presence::detached(&channel, conn);
     drop(tx);
     let _ = writer.await;
     tracing::info!(target: "remote", "LAN peer left channel {channel}");

@@ -244,9 +244,10 @@ mod central {
         // Both channels' gateways write into one record stream to the pendant.
         let (out_tx, mut out_rx) = mpsc::channel::<(u8, Vec<u8>)>(OUTBOUND_DEPTH);
         let mut attached = Vec::new();
-        for (kind, ep) in [(REC_CTL, ctl.clone()), (REC_DATA, data.clone())] {
+        for (kind, ep, ch) in [(REC_CTL, ctl.clone(), ctl_id.clone()), (REC_DATA, data.clone(), data_id.clone())] {
             let (tx_msg, mut rx_msg) = mpsc::channel::<Message>(OUTBOUND_DEPTH);
             let conn = ep.sink().set_lan(tx_msg);
+            crate::remote::presence::attached(&ch, crate::remote::presence::Link::Ble, conn);
             let out = out_tx.clone();
             let fwd = tokio::spawn(async move {
                 while let Some(msg) = rx_msg.recv().await {
@@ -258,7 +259,7 @@ mod central {
                     }
                 }
             });
-            attached.push((ep, conn, fwd));
+            attached.push((ep, conn, fwd, ch));
         }
         drop(out_tx);
         let writer_peer = p.clone();
@@ -329,8 +330,9 @@ mod central {
             }
         };
 
-        for (ep, conn, fwd) in attached {
+        for (ep, conn, fwd, ch) in attached {
             ep.sink().clear_lan(conn);
+            crate::remote::presence::detached(&ch, conn);
             fwd.abort();
         }
         writer.abort();

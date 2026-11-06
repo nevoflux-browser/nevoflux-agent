@@ -223,6 +223,17 @@ impl PairingStore {
         self.write(&all)
     }
 
+    /// Name a device (what the device list shows). Reports whether it existed.
+    pub fn set_label(&self, control_channel_id: &str, label: &str) -> Result<bool, PairingError> {
+        let mut all = self.load()?;
+        let Some(entry) = all.iter_mut().find(|p| p.control_channel_id == control_channel_id) else {
+            return Ok(false);
+        };
+        entry.label = Some(label.to_string());
+        self.write(&all)?;
+        Ok(true)
+    }
+
     /// Record where to wake this device, or forget it (`None`).
     ///
     /// Reports whether the pairing existed. A subscription for a pairing that
