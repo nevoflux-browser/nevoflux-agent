@@ -2014,6 +2014,9 @@ pub async fn start_server(
     // loop further down, and `--remote-control` needs a sender of its own to
     // build an injector with.
     let remote_msg_tx = msg_tx.clone();
+    // A meeting question's answer is spoken by sending `voice_say` back into
+    // the message loop under the asking device's identity.
+    let process_msg_tx = msg_tx.clone();
     let (response_tx, mut response_rx) = mpsc::channel::<(Vec<u8>, DaemonEnvelope)>(100);
 
     // Portal remote-gateway registry (§2.D M2 tap target). The `remote.start`
@@ -3052,6 +3055,102 @@ pub async fn start_server(
                 continue;
             }
 
+            // ---------------------------------------------------------------
+            // Meetings (`meeting/`). A pendant marks a meeting's start and end
+            // and adds its own notes and questions; what is said in it comes
+            // as ordinary `speech_*` utterances tagged with the meeting id.
+            // ---------------------------------------------------------------
+            if let Some(rest) = msg_type.strip_prefix("meeting_") {
+                let payload = envelope.payload.get("payload").cloned().unwrap_or_default();
+                let s = |k: &str| {
+                    payload
+                        .get(k)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                let meeting_id = s("meeting_id");
+                let session_id = s("session_id");
+                let offset_ms = payload.get("offset_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                let meetings = crate::meeting::global();
+                let downlink: crate::meeting::Downlink = {
+                    let tx = process_response_tx.clone();
+                    let ident = identity.clone();
+                    let pid = proxy_id.clone();
+                    let sid = session_id.clone();
+                    std::sync::Arc::new(move |mut frame: serde_json::Value| {
+                        let Some(obj) = frame.as_object_mut() else { return };
+                        let kind = obj
+                            .remove("kind")
+                            .and_then(|k| k.as_str().map(str::to_string))
+                            .unwrap_or_default();
+                        obj.insert("session_id".into(), serde_json::Value::String(sid.clone()));
+                        let env = DaemonEnvelope::new(
+                            &pid,
+                            channel,
+                            serde_json::json!({ "type": kind, "payload": frame }),
+                        );
+                        let tx = tx.clone();
+                        let ident = ident.clone();
+                        tokio::spawn(async move {
+                            let _ = tx.send((ident, env)).await;
+                        });
+                    })
+                };
+                match rest {
+                    "start" => {
+                        if meetings.start(&meeting_id).await {
+                            meetings.attach_device(&meeting_id, downlink.clone()).await;
+                            downlink(serde_json::json!({
+                                "kind": "meeting_started",
+                                "meeting_id": meeting_id,
+                            }));
+                        }
+                    }
+                    "end" => {
+                        let gaps: Vec<[u64; 2]> = payload
+                            .get("gaps")
+                            .cloned()
+                            .and_then(|g| serde_json::from_value(g).ok())
+                            .unwrap_or_default();
+                        meetings.attach_device(&meeting_id, downlink).await;
+                        meetings.end(&meeting_id, gaps, "ended").await;
+                    }
+                    "note" => {
+                        meetings.note(&meeting_id, &s("text"), offset_ms).await;
+                    }
+                    "ask" => {
+                        let question = s("text");
+                        let turn_id = s("utterance_id");
+                        let msg_tx = process_msg_tx.clone();
+                        let ident = identity.clone();
+                        let pid = proxy_id.clone();
+                        let rid = request_id.clone();
+                        tokio::spawn(async move {
+                            let answer = meetings.ask(&meeting_id, &question, offset_ms).await;
+                            // Spoken like any `voice_say`, to the device that
+                            // asked; its turn id is the question's utterance.
+                            let env = ProxyEnvelope::new(
+                                pid,
+                                rid,
+                                channel,
+                                serde_json::json!({
+                                    "type": "voice_say",
+                                    "payload": {
+                                        "session_id": session_id,
+                                        "turn_id": turn_id,
+                                        "text": answer,
+                                    }
+                                }),
+                            );
+                            let _ = msg_tx.send((ident, env)).await;
+                        });
+                    }
+                    other => warn!("meeting: unknown message meeting_{}", other),
+                }
+                continue;
+            }
+
             if msg_type == "voice_say" || msg_type == "voice_barge_in" {
                 let payload = envelope.payload.get("payload").cloned().unwrap_or_default();
                 let s = |k: &str| {
@@ -3235,6 +3334,21 @@ pub async fn start_server(
                             .unwrap_or(nevoflux_protocol::speech::SPEECH_SAMPLE_RATE as u64)
                             as u32;
                         let tts_cfg = process_config.read().unwrap().tts.clone();
+                        // A meeting's sentence: kept by `meeting/`, and its
+                        // partials go to the meeting page instead of the
+                        // pendant, whose screen does not show them.
+                        let meeting = match payload.get("meeting_id").and_then(|v| v.as_str()) {
+                            Some(mid) if !mid.is_empty() => {
+                                let offset_ms =
+                                    payload.get("offset_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                                let late = payload.get("late").and_then(|v| v.as_bool()).unwrap_or(false);
+                                let m = crate::meeting::global();
+                                m.begin_segment(&utterance_id, mid, offset_ms, late)
+                                    .await
+                                    .then_some(m)
+                            }
+                            _ => None,
+                        };
                         match crate::tts::asr::conversation_transcriber(&tts_cfg) {
                             Ok(transcriber) => {
                                 // One forwarding task per utterance: it owns the
@@ -3249,18 +3363,33 @@ pub async fn start_server(
                                 tokio::spawn(async move {
                                     while let Some(emit) = erx.recv().await {
                                         let (kind, body) = match emit {
-                                            crate::speech::Emit::Partial(p) => (
-                                                "speech_partial",
-                                                serde_json::to_value(p).unwrap_or_default(),
-                                            ),
-                                            crate::speech::Emit::Final(f) => (
-                                                "speech_final",
-                                                serde_json::to_value(f).unwrap_or_default(),
-                                            ),
+                                            crate::speech::Emit::Partial(p) => {
+                                                if let Some(m) = &meeting {
+                                                    m.partial(&p.utterance_id, &p.text).await;
+                                                    continue;
+                                                }
+                                                (
+                                                    "speech_partial",
+                                                    serde_json::to_value(p).unwrap_or_default(),
+                                                )
+                                            }
+                                            crate::speech::Emit::Final(f) => {
+                                                if let Some(m) = &meeting {
+                                                    m.finalize(&f.utterance_id, &f.text, f.accepted).await;
+                                                }
+                                                (
+                                                    "speech_final",
+                                                    serde_json::to_value(f).unwrap_or_default(),
+                                                )
+                                            }
                                             crate::speech::Emit::Failed {
                                                 utterance_id,
                                                 message,
-                                            } => (
+                                            } => {
+                                                if let Some(m) = &meeting {
+                                                    m.cancel_segment(&utterance_id).await;
+                                                }
+                                                (
                                                 "speech_error",
                                                 serde_json::json!({
                                                     // 远程网关按 session 过滤,没有它这条错误到不了吊坠。
@@ -3268,7 +3397,8 @@ pub async fn start_server(
                                                     "utterance_id": utterance_id,
                                                     "message": message,
                                                 }),
-                                            ),
+                                                )
+                                            }
                                         };
                                         let env = DaemonEnvelope::new(
                                             &pid,
@@ -3315,6 +3445,16 @@ pub async fn start_server(
                     }
                     "chunk" => {
                         let seq = payload.get("seq").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                        // A meeting keeps the Opus the gateway decoded this from.
+                        if let Some(opus) = payload.get("opus").and_then(|v| v.as_str()) {
+                            let m = crate::meeting::global();
+                            if m.is_segment(&utterance_id).await {
+                                use base64::Engine as _;
+                                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(opus) {
+                                    m.audio(&utterance_id, bytes).await;
+                                }
+                            }
+                        }
                         let pcm = s("pcm");
                         let routed = process_speech_registry
                             .chunk(&session_id, &utterance_id, seq, pcm)
@@ -3327,11 +3467,14 @@ pub async fn start_server(
                         }
                     }
                     "end" => {
+                        let rms_db = payload.get("rms_db").and_then(|v| v.as_f64()).map(|v| v as f32);
+                        crate::meeting::global().end_segment(&utterance_id, rms_db).await;
                         process_speech_registry
                             .end(&session_id, &utterance_id)
                             .await;
                     }
                     "cancel" => {
+                        crate::meeting::global().cancel_segment(&utterance_id).await;
                         process_speech_registry
                             .cancel(&session_id, &utterance_id)
                             .await;
@@ -9365,6 +9508,13 @@ async fn handle_chat_message(
                 "usage.export_calls" => {
                     crate::jev::export::handle_export(&params, &services.database)
                 }
+                cmd @ ("meeting.list"
+                | "meeting.get"
+                | "meeting.audio"
+                | "meeting.delete"
+                | "meeting.set_speaker"
+                | "meeting.settings.get"
+                | "meeting.settings.set") => crate::meeting::rpc::handle(cmd, &params).await,
                 "kb.wizard.status" => crate::kb_wizard::handle_status(&params).await,
                 "kb.wizard.install_bun" => crate::kb_wizard::handle_install_bun(&params).await,
                 "kb.wizard.install_gbrain" => {

@@ -259,7 +259,10 @@ impl PortalSession {
                 // typed, and an SDP injected into the conversation is a
                 // spectacular way to fail.
                 Some(k) if super::rtc::is_signal_kind(k) => Inbound::RtcSignal(frame),
-                Some(k) if translate::SPEECH_UPLINK_KINDS.contains(&k) => {
+                Some(k)
+                    if translate::SPEECH_UPLINK_KINDS.contains(&k)
+                        || translate::MEETING_UPLINK_KINDS.contains(&k) =>
+                {
                     match translate::speech_uplink(&frame, session_id) {
                         Some(v) => Inbound::Speech(v),
                         None => Inbound::Ignore,

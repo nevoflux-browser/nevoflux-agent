@@ -1118,14 +1118,21 @@ pub const SPEECH_UPLINK_KINDS: [&str; 5] = [
     "voice_barge_in",
 ];
 
+/// A pendant's meeting frames (`meeting/` in the daemon). They ride the voice
+/// path for the same reason the `speech_*` ones do: what comes back for them
+/// is addressed to the device that sent them, not to the sidebar.
+pub const MEETING_UPLINK_KINDS: [&str; 4] = ["meeting_start", "meeting_end", "meeting_note", "meeting_ask"];
+
 /// The speech/voice replies a device that spoke is sent back.
-pub const SPEECH_DOWNLINK_TYPES: [&str; 6] = [
+pub const SPEECH_DOWNLINK_TYPES: [&str; 8] = [
     "speech_partial",
     "speech_final",
     "speech_error",
     "voice_audio",
     "voice_done",
     "voice_failed",
+    "meeting_started",
+    "meeting_summary_ready",
 ];
 
 /// One uplink voice frame as the `{type, payload}` the daemon reads, or `None`
@@ -1135,11 +1142,13 @@ pub const SPEECH_DOWNLINK_TYPES: [&str; 6] = [
 /// conversation it is attached to, the same rule `user_message` follows.
 pub fn speech_uplink(frame: &Value, session_id: &str) -> Option<Value> {
     let kind = frame.get("kind")?.as_str()?;
-    if !SPEECH_UPLINK_KINDS.contains(&kind) {
+    if !SPEECH_UPLINK_KINDS.contains(&kind) && !MEETING_UPLINK_KINDS.contains(&kind) {
         return None;
     }
     let id_field = if kind == "voice_barge_in" {
         "turn_id"
+    } else if kind.starts_with("meeting_") {
+        "meeting_id"
     } else {
         "utterance_id"
     };
@@ -1192,6 +1201,10 @@ mod speech_tests {
         assert!(speech_uplink(&json!({"kind": "speech_start", "sample_rate": 16000}), "s").is_none());
         assert!(speech_uplink(&json!({"kind": "voice_barge_in", "played": 1}), "s").is_none());
         assert!(speech_uplink(&json!({"kind": "user_message", "text": "hi"}), "s").is_none());
+        let m = speech_uplink(&json!({"kind": "meeting_note", "meeting_id": "7", "text": "标记"}), "s").unwrap();
+        assert_eq!(m["type"], "meeting_note");
+        assert_eq!(m["payload"]["meeting_id"], "7");
+        assert!(speech_uplink(&json!({"kind": "meeting_start"}), "s").is_none());
     }
 
     #[test]

@@ -55,7 +55,7 @@ async fn current_engine() -> Option<Arc<dyn BrainEngine>> {
 /// Look up the live supervisor handle. Used by `brain.stats` to dispatch
 /// gbrain MCP tools that the [`BrainEngine`] trait doesn't expose
 /// directly.
-async fn current_supervisor() -> Option<Arc<GbrainSupervisor>> {
+pub(crate) async fn current_supervisor() -> Option<Arc<GbrainSupervisor>> {
     let slot = CURRENT_BRAIN_SLOT.get()?;
     let guard = slot.read().await;
     guard.as_ref().map(|boot| boot.supervisor.clone())

@@ -2633,7 +2633,7 @@ mod tests {
         // 10 frames + the encoder's flush frame, 320 samples of 2 bytes each.
         let bytes = base64::engine::general_purpose::STANDARD.decode(pcm).unwrap();
         assert_eq!(bytes.len(), 11 * 320 * 2);
-        assert!(got[1].1["payload"].get("opus").is_none());
+        assert!(got[1].1["payload"].get("opus").is_some());
     }
 
     #[tokio::test]

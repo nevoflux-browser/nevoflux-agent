@@ -329,7 +329,9 @@ impl UplinkDecoders {
                 true
             }
             "speech_chunk" => {
-                let Some(opus) = p.remove("opus") else {
+                // Left on the payload: a meeting keeps a sentence's audio as
+                // the Opus it came in (`meeting::ogg`), at a tenth of the PCM.
+                let Some(opus) = p.get("opus").cloned() else {
                     return true; // raw PCM already
                 };
                 let Some(bytes) = opus.as_str().and_then(|b| STANDARD.decode(b).ok()) else {
@@ -521,7 +523,7 @@ mod tests {
             let mut env = json!({ "type": "speech_chunk", "payload": {
                 "session_id": "s", "utterance_id": "u1", "seq": seq, "opus": opus }});
             assert!(dec.apply(&mut env));
-            assert!(env["payload"].get("opus").is_none());
+            assert!(env["payload"].get("opus").is_some(), "kept for a meeting's audio");
             let bytes = STANDARD.decode(env["payload"]["pcm"].as_str().unwrap()).unwrap();
             pcm.extend(
                 bytes

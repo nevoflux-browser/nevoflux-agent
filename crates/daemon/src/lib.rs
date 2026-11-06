@@ -51,6 +51,7 @@ pub mod init_brain;
 pub mod interrupt;
 pub mod jev;
 pub mod kb_wizard;
+pub mod meeting;
 pub mod learning;
 pub mod llm_gateway;
 pub mod local;
